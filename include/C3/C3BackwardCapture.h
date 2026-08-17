@@ -48,7 +48,7 @@
 #include "C3Engine.h"
 #include "C3KernelRegistry.h"
 #include "Graph.h"
-#include "../AutoGrad/Node.h"
+#include "AutoGrad/Node.h"
 
 namespace ct {
 namespace c3 {

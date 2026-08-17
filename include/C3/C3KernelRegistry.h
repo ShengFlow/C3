@@ -33,8 +33,8 @@
 #include <unordered_map>
 #include <vector>
 
-#include "../Ctools.h"
-#include "../Tensor.h"
+#include "Ctools.h"
+#include "Tensor.h"
 
 // Forward declaration — CompiledKernel is defined in C3Engine.h
 namespace ct {

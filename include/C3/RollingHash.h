@@ -11,7 +11,7 @@
 #include <vector>
 #include <cstdint>
 #include <cstddef>
-#include "../../include/Ctools.h"
+#include "Ctools.h"
 
 namespace ct {
 namespace c3 {

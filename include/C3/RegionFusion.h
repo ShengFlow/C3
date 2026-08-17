@@ -12,8 +12,8 @@
 #include "C3Engine.h"
 #include "C3KernelRegistry.h"
 #include "FusionCostModel.h"
-#include "../../include/Tensor.h"
-#include "../../include/Ctools.h"
+#include "Tensor.h"
+#include "Ctools.h"
 
 #include <vector>
 #include <unordered_map>

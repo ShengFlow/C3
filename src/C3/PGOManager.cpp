@@ -5,9 +5,9 @@
  * @date 2026/08/02
  */
 
-#include "../../include/C3/PGOManager.h"
-#include "../../include/C3/Graph.h"
-#include "../../include/CtorchError.h"
+#include "C3/PGOManager.h"
+#include "C3/Graph.h"
+#include "CtorchError.h"
 
 #include <algorithm>
 #include <cmath>

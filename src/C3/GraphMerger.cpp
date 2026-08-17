@@ -4,7 +4,7 @@
  * @date 2026/8/2
  */
 
-#include "../../include/C3/GraphMerger.h"
+#include "C3/GraphMerger.h"
 
 #include <sstream>
 #include <stdexcept>

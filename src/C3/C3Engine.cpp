@@ -8,10 +8,10 @@
  * @date 2026/7/31
  */
 
-#include "../../include/C3/C3Engine.h"
-#include "../../include/C3/Graph.h"
-#include "../../include/C3/C3HotPathManager.h"
-#include "../../include/C3/PGOManager.h"
+#include "C3/C3Engine.h"
+#include "C3/Graph.h"
+#include "C3/C3HotPathManager.h"
+#include "C3/PGOManager.h"
 #include "C3/AutoTuner.h"
 #include "C3/TuningState.h"
 #include "ThreadPool.h"

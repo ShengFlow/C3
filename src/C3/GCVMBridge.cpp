@@ -16,8 +16,8 @@
  *   - arch 选项 cuda 命名 vs DCU gfx906 → 实测才知道
  *   - 节点缺 mlir-translate, C3 MLIR → LLVM IR 转换要装 LLVM/MLIR 工具链
  */
-#include "../../include/C3/GCVMBridge.h"
-#include "../../include/CtorchError.h"
+#include "C3/GCVMBridge.h"
+#include "CtorchError.h"
 
 #include <cstring>
 #include <vector>

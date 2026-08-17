@@ -6,7 +6,7 @@
  * @date 2026/7/31
  */
 
-#include "../../include/C3/Graph.h"
+#include "C3/Graph.h"
 
 #include <algorithm>
 #include <cassert>

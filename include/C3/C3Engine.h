@@ -20,8 +20,8 @@
 #include <string>
 #include <vector>
 
-#include "../Ctools.h"
-#include "../Tensor.h"
+#include "Ctools.h"
+#include "Tensor.h"
 #include "C3KernelRegistry.h"
 #include "GraphMerger.h"
 #include "Tracer.h"

@@ -17,9 +17,9 @@
  * @date 2026-08-09
  */
 
-#include "../../include/C3/C3KernelRegistry.h"
-#include "../../include/C3/C3Engine.h"  // CompiledKernel 完整定义
-#include "../../include/CtorchError.h"
+#include "C3/C3KernelRegistry.h"
+#include "C3/C3Engine.h"  // CompiledKernel 完整定义
+#include "CtorchError.h"
 
 namespace ct {
 namespace c3 {

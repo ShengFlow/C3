@@ -17,7 +17,7 @@
 #include <cstddef>
 #include <functional>
 #include <vector>
-#include "../../include/C3/C3KernelRegistry.h"
+#include "C3KernelRegistry.h"
 
 namespace ct {
 namespace c3 {

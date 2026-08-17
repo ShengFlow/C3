@@ -4,10 +4,10 @@
  * @details 真实 API 调用待 probe-dcu-dtk24.sh 探针回来后根据 hip/GCVM 头文件调整
  *          当前实装是 stub 骨架, 标 [TODO: probe-adjust] 的地方需要探针后实装
  */
-#include "../../include/C3/DCUCompiledKernel.h"
-#include "../../include/C3/C3KernelRegistry.h"
-#include "../../include/C3/GCVMBridge.h"
-#include "../../include/CtorchError.h"
+#include "C3/DCUCompiledKernel.h"
+#include "C3/C3KernelRegistry.h"
+#include "C3/GCVMBridge.h"
+#include "CtorchError.h"
 
 #include <iostream>
 #include <cstring>
