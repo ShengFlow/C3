@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+
+# Build dirs
+build/
+build-*/
+cmake-build-*/
+
+# IDE
+.vscode/
+.idea/
+*.swp
