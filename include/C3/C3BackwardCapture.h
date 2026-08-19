@@ -109,6 +109,21 @@ public:
     void compileBackwardAsync(const ::Node* node, const Tensor& grad);
 
     /**
+     * @brief MIMO 统一反向融合执行尝试
+     */
+    std::optional<std::vector<Tensor>> tryExecuteUnifiedMIMOBackward(
+        const ::Node* node, const Tensor& grad,
+        const std::vector<Tensor>& forward_inputs);
+
+    /**
+     * @brief MIMO 统一反向融合异步编译
+     */
+    void compileUnifiedMIMOBackwardAsync(
+        const ::Node* relu_node, const ::Node* add_node, const ::Node* matmul_node,
+        const TensorDesc& grad_desc, const TensorDesc& z_desc,
+        const TensorDesc& x_desc, const TensorDesc& w_desc);
+
+    /**
      * @brief 为指定输入索引异步编译 backward 单输出 kernel
      * @param node 当前 autograd 节点
      * @param grad 下游梯度张量
@@ -412,6 +427,7 @@ private:
      * value = {节点类型名, 对应 upstream grad Tensor}：type 校验防止 raw ptr 地址复用的误命中。
      */
     std::unordered_map<const ::Node*, std::pair<std::string, Tensor>> pending_intercepted_;
+    std::unordered_map<const ::Node*, std::vector<Tensor>> pending_mimo_intercepted_;
     mutable std::shared_mutex intercepted_mutex_; ///< 读写锁：miss 路径只读拿共享锁（大幅降低开销），写入 pending 时才拿独占锁
 
     /**

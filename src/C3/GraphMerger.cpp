@@ -41,17 +41,40 @@ std::string GraphMerger::validate(const std::vector<Graph>& sub_graphs,
     if (sub_graphs.empty()) {
         return "GraphMerger: sub_graphs is empty";
     }
-    if (sub_graphs.size() > 1 && spec.links.size() != sub_graphs.size() - 1) {
+    bool is_any_explicit = false;
+    for (const auto& link : spec.links) {
+        if (link.from_subgraph != SIZE_MAX || link.to_subgraph != SIZE_MAX) {
+            is_any_explicit = true;
+            break;
+        }
+    }
+    if (!is_any_explicit && sub_graphs.size() > 1 && spec.links.size() != sub_graphs.size() - 1) {
         std::ostringstream ss;
         ss << "GraphMerger: links count (" << spec.links.size()
            << ") must be sub_graphs.size() - 1 (" << (sub_graphs.size() - 1) << ")";
         return ss.str();
     }
 
-    for (size_t i = 0; i + 1 < sub_graphs.size(); ++i) {
+    for (size_t i = 0; i < spec.links.size(); ++i) {
         const auto& link = spec.links[i];
-        const auto& g_from = sub_graphs[i];
-        const auto& g_to = sub_graphs[i + 1];
+        size_t src_sub_idx = (link.from_subgraph != SIZE_MAX) ? link.from_subgraph : i;
+        size_t dst_sub_idx = (link.to_subgraph != SIZE_MAX) ? link.to_subgraph : i + 1;
+
+        if (src_sub_idx >= sub_graphs.size()) {
+            std::ostringstream ss;
+            ss << "GraphMerger: link[" << i << "].from_subgraph (" << src_sub_idx
+               << ") out of range (sub_graphs count is " << sub_graphs.size() << ")";
+            return ss.str();
+        }
+        if (dst_sub_idx != SIZE_MAX && dst_sub_idx >= sub_graphs.size()) {
+            std::ostringstream ss;
+            ss << "GraphMerger: link[" << i << "].to_subgraph (" << dst_sub_idx
+               << ") out of range (sub_graphs count is " << sub_graphs.size() << ")";
+            return ss.str();
+        }
+
+        const auto& g_from = sub_graphs[src_sub_idx];
+        const auto* g_to = (dst_sub_idx != SIZE_MAX) ? &sub_graphs[dst_sub_idx] : nullptr;
 
         if (link.from_output >= g_from.outputCount()) {
             std::ostringstream ss;
@@ -60,18 +83,18 @@ std::string GraphMerger::validate(const std::vector<Graph>& sub_graphs,
                << g_from.outputCount() << " outputs)";
             return ss.str();
         }
-        if (link.to_input != SIZE_MAX && link.to_input >= g_to.inputCount()) {
+        if (g_to && link.to_input != SIZE_MAX && link.to_input >= g_to->inputCount()) {
             std::ostringstream ss;
             ss << "GraphMerger: link[" << i << "].to_input ("
                << link.to_input << ") out of range (g_to has "
-               << g_to.inputCount() << " inputs)";
+               << g_to->inputCount() << " inputs)";
             return ss.str();
         }
 
-        if (link.to_input != SIZE_MAX) {
+        if (g_to && link.to_input != SIZE_MAX) {
             // 形状/dtype/device 一致性
             const auto& out_desc = g_from.node(g_from.outputs()[link.from_output]).out_desc;
-            const auto& in_desc = g_to.node(g_to.inputs()[link.to_input]).out_desc;
+            const auto& in_desc = g_to->node(g_to->inputs()[link.to_input]).out_desc;
             if (!descsCompatible(out_desc, in_desc)) {
                 std::ostringstream ss;
                 ss << "GraphMerger: link[" << i << "] desc mismatch: out="
@@ -126,10 +149,12 @@ MergedGraphInfo GraphMerger::merge(const std::vector<Graph>& sub_graphs,
     for (size_t i = 0; i < sub_graphs.size(); ++i) {
         input_source[i].assign(sub_graphs[i].inputCount(), SIZE_MAX);
     }
-    for (size_t i = 0; i + 1 < sub_graphs.size(); ++i) {
+    for (size_t i = 0; i < spec.links.size(); ++i) {
         const auto& link = spec.links[i];
-        if (link.to_input != SIZE_MAX) {
-            input_source[i + 1][link.to_input] = i;
+        size_t src_sub_idx = (link.from_subgraph != SIZE_MAX) ? link.from_subgraph : i;
+        size_t dst_sub_idx = (link.to_subgraph != SIZE_MAX) ? link.to_subgraph : i + 1;
+        if (dst_sub_idx != SIZE_MAX && link.to_input != SIZE_MAX) {
+            input_source[dst_sub_idx][link.to_input] = src_sub_idx;
         }
     }
 
@@ -197,31 +222,75 @@ MergedGraphInfo GraphMerger::merge(const std::vector<Graph>& sub_graphs,
     }
 
     // 4d. Pass 3: 把"链接覆盖"的占位 ID 替换为前驱输出
-    for (size_t i = 0; i + 1 < sub_graphs.size(); ++i) {
+    for (size_t i = 0; i < spec.links.size(); ++i) {
         const auto& link = spec.links[i];
-        if (link.to_input == SIZE_MAX) continue;
-        size_t out_src_id = sub_graphs[i].outputs()[link.from_output];
-        size_t out_fused_id = node_id_remap[i][out_src_id];
-        size_t placeholder_id = info.input_remap[i + 1][link.to_input];
+        size_t src_sub_idx = (link.from_subgraph != SIZE_MAX) ? link.from_subgraph : i;
+        size_t dst_sub_idx = (link.to_subgraph != SIZE_MAX) ? link.to_subgraph : i + 1;
+        if (dst_sub_idx == SIZE_MAX || link.to_input == SIZE_MAX) continue;
+        size_t out_src_id = sub_graphs[src_sub_idx].outputs()[link.from_output];
+        size_t out_fused_id = node_id_remap[src_sub_idx][out_src_id];
+        size_t placeholder_id = info.input_remap[dst_sub_idx][link.to_input];
         g._rewriteInputRefInternal(placeholder_id, out_fused_id);
     }
 
-    // 4e. 标记融合图输出：最后一个子图的所有输出作为最终输出
+    // 4e. 标记融合图输出：处理链接和非链接输出
     for (size_t i = 0; i < sub_graphs.size(); ++i) {
         info.output_remap[i].assign(sub_graphs[i].outputCount(), SIZE_MAX);
     }
-    for (size_t i = 0; i + 1 < sub_graphs.size(); ++i) {
-        const auto& link = spec.links[i];
-        size_t out_src_id = sub_graphs[i].outputs()[link.from_output];
-        info.output_remap[i][link.from_output] = node_id_remap[i][out_src_id];
+    bool is_any_explicit = false;
+    for (const auto& link : spec.links) {
+        if (link.from_subgraph != SIZE_MAX || link.to_subgraph != SIZE_MAX) {
+            is_any_explicit = true;
+            break;
+        }
     }
-    if (!sub_graphs.empty()) {
-        size_t last = sub_graphs.size() - 1;
-        for (size_t k = 0; k < sub_graphs[last].outputCount(); ++k) {
-            size_t out_src_id = sub_graphs[last].outputs()[k];
-            size_t fid = node_id_remap[last][out_src_id];
-            info.output_remap[last][k] = fid;
-            g.markOutput(fid);
+    for (size_t i = 0; i < spec.links.size(); ++i) {
+        const auto& link = spec.links[i];
+        size_t src_sub_idx = (link.from_subgraph != SIZE_MAX) ? link.from_subgraph : i;
+        size_t out_src_id = sub_graphs[src_sub_idx].outputs()[link.from_output];
+        info.output_remap[src_sub_idx][link.from_output] = node_id_remap[src_sub_idx][out_src_id];
+    }
+    if (is_any_explicit) {
+        std::vector<std::vector<bool>> output_is_linked(sub_graphs.size());
+        for (size_t i = 0; i < sub_graphs.size(); ++i) {
+            output_is_linked[i].assign(sub_graphs[i].outputCount(), false);
+        }
+        for (size_t i = 0; i < spec.links.size(); ++i) {
+            const auto& link = spec.links[i];
+            size_t src_sub_idx = (link.from_subgraph != SIZE_MAX) ? link.from_subgraph : i;
+            if (link.to_input != SIZE_MAX) {
+                output_is_linked[src_sub_idx][link.from_output] = true;
+            }
+        }
+        for (size_t i = 0; i < sub_graphs.size(); ++i) {
+            for (size_t k = 0; k < sub_graphs[i].outputCount(); ++k) {
+                if (!output_is_linked[i][k]) {
+                    size_t out_src_id = sub_graphs[i].outputs()[k];
+                    size_t fid = node_id_remap[i][out_src_id];
+                    info.output_remap[i][k] = fid;
+                    g.markOutput(fid);
+                }
+            }
+        }
+        for (size_t i = 0; i < spec.links.size(); ++i) {
+            const auto& link = spec.links[i];
+            size_t src_sub_idx = (link.from_subgraph != SIZE_MAX) ? link.from_subgraph : i;
+            if (link.to_input == SIZE_MAX) {
+                size_t out_src_id = sub_graphs[src_sub_idx].outputs()[link.from_output];
+                size_t fid = node_id_remap[src_sub_idx][out_src_id];
+                info.output_remap[src_sub_idx][link.from_output] = fid;
+                g.markOutput(fid);
+            }
+        }
+    } else {
+        if (!sub_graphs.empty()) {
+            size_t last = sub_graphs.size() - 1;
+            for (size_t k = 0; k < sub_graphs[last].outputCount(); ++k) {
+                size_t out_src_id = sub_graphs[last].outputs()[k];
+                size_t fid = node_id_remap[last][out_src_id];
+                info.output_remap[last][k] = fid;
+                g.markOutput(fid);
+            }
         }
     }
 

@@ -16,6 +16,7 @@
  *  - 区域融合 (Region Fusion) : CT_C3_DISABLE_REGION_FUSION / C3_DISABLE_REGION_FUSION / regionFusionEnabled()
  *  - 后向融合 (Backward)      : CT_C3_DISABLE_BACKWARD       / C3_DISABLE_BACKWARD       / backwardFusionEnabled()
  *  - 热路径检测/编译触发       : CT_C3_DISABLE_HOTPATH        / C3_DISABLE_HOTPATH         / hotPathTrackingEnabled()
+ *  - MatMul CBLAS 加速         : 运行时 C3_MATMUL_NO_CBLAS=1 / matmulNoCblasEnabled()
  *
  * @date 2026/8/7
  */
@@ -84,6 +85,14 @@ inline bool hotPathTrackingEnabled() {
     static const bool enabled = !detail::envFlag("C3_DISABLE_HOTPATH");
     return enabled;
 #endif
+}
+
+// ======================= MatMul CBLAS 加速 =======================
+/// 查询 MatMul 是否禁用 cblas_sgemm（AMX 协处理器）加速
+/// （运行时 C3_MATMUL_NO_CBLAS=1 禁用，回退手写标量循环；默认开启 cblas）
+inline bool matmulNoCblasEnabled() {
+    static const bool disabled = detail::envFlag("C3_MATMUL_NO_CBLAS");
+    return disabled;
 }
 
 } // namespace c3

@@ -12,6 +12,7 @@
 #include "C3/C3Engine.h"
 #include "C3/C3KernelRegistry.h"
 #include "C3/Graph.h"
+#include "C3/GraphMerger.h"
 
 #include "AutoGrad/Nodes/ReLUNode.h"
 #include "AutoGrad/Nodes/SigmoidNode.h"
@@ -57,6 +58,21 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteBackward(
         return !backwardFusionEnabled();
     }();
     if (disabled) return std::nullopt;
+
+    // ===== 统一 MIMO 融合反向 (梯度传导 + 激活求导 + 权重收缩) 🌟 =====
+    {
+        std::unique_lock<std::shared_mutex> lock(intercepted_mutex_);
+        auto it = pending_mimo_intercepted_.find(node);
+        if (it != pending_mimo_intercepted_.end()) {
+            auto grads = std::move(it->second);
+            pending_mimo_intercepted_.erase(it);
+            return grads;
+        }
+    }
+    auto mimo_res = tryExecuteUnifiedMIMOBackward(node, grad, forward_inputs);
+    if (mimo_res.has_value()) {
+        return mimo_res;
+    }
 
     // ===== Phase 2: 先尝试反向融合（整段序列一次性执行） =====
     // 注意：融合 kernel 是单输出的（对应序列首节点 input_index=0 的梯度），
@@ -1710,6 +1726,7 @@ void C3BackwardCapture::clear() {
     recent_input_shapes_.clear();
     recent_forward_inputs_.clear();
     pending_intercepted_.clear();
+    pending_mimo_intercepted_.clear();
     miss_marker_nodes_.clear();
     sequence_counts_.clear();
     pending_compiles_.clear();
@@ -1725,7 +1742,190 @@ void C3BackwardCapture::clearCallScopedState() {
     recent_input_shapes_.clear();
     recent_forward_inputs_.clear();
     pending_intercepted_.clear();
+    pending_mimo_intercepted_.clear();
     miss_marker_nodes_.clear();
+}
+
+std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteUnifiedMIMOBackward(
+    const ::Node* node, const Tensor& grad,
+    const std::vector<Tensor>& forward_inputs)
+{
+    // 检查是否为支持的激活节点
+    std::string current_type = std::string(typeid(*node).name());
+    bool is_act = (current_type.find("ReLUNode") != std::string::npos ||
+                   current_type.find("SigmoidNode") != std::string::npos ||
+                   current_type.find("TanhNode") != std::string::npos);
+    if (!is_act) return std::nullopt;
+
+    // 向上游匹配: Activation -> Add -> MatMul
+    auto ups = node->getUpStreamNodes();
+    if (ups.size() != 1 || !ups[0]) return std::nullopt;
+    const ::Node* add_node = ups[0].get();
+    std::string add_type = typeid(*add_node).name();
+    if (add_type.find("AddNode") == std::string::npos) return std::nullopt;
+
+    auto add_ups = add_node->getUpStreamNodes();
+    if (add_ups.size() != 2 || !add_ups[0] || !add_ups[1]) return std::nullopt;
+    const ::Node* matmul_node = add_ups[0].get();
+    std::string mm_type = typeid(*matmul_node).name();
+    if (mm_type.find("MatMulNode") == std::string::npos) return std::nullopt;
+
+    // 获取相关张量
+    const Tensor& z = forward_inputs.empty() ? node->getInputs()[0] : forward_inputs[0];
+    const Tensor& X = matmul_node->getInputs()[0];
+    const Tensor& W = matmul_node->getInputs()[1];
+
+    // 构建 MIMO cache key
+    std::stringstream ss;
+    ss << "mimo_backward_" << current_type << "|g:";
+    for (auto s : grad.sizes()) ss << s << ",";
+    ss << "|z:";
+    for (auto s : z.sizes()) ss << s << ",";
+    ss << "|x:";
+    for (auto s : X.sizes()) ss << s << ",";
+    ss << "|w:";
+    for (auto s : W.sizes()) ss << s << ",";
+    std::string mimo_key = ss.str();
+
+    // 检查是否有已编译的 JIT kernel
+    auto& registry = C3KernelRegistry::getInstance();
+    if (registry.hasBackwardKey(mimo_key)) {
+        // 收集输入：[z, X, W]，不重复包含 grad，配合 fwd_input_map {0, 1, 2}
+        std::vector<Tensor> inputs = {z, X, W};
+        auto result = registry.tryExecuteBackward(mimo_key, grad, inputs);
+        if (result.has_value() && result->size() == 4) {
+            // result[0]: grad_z, result[1]: grad_W, result[2]: grad_X, result[3]: grad_b
+            Tensor grad_z = std::move((*result)[0]);
+            Tensor grad_W = std::move((*result)[1]);
+            Tensor grad_X = std::move((*result)[2]);
+            Tensor grad_b = std::move((*result)[3]);
+
+            // 存入 pending_mimo_intercepted_
+            {
+                std::unique_lock<std::shared_mutex> lock(intercepted_mutex_);
+                // AddNode::backward expects to return: {grad_mm, grad_b}
+                pending_mimo_intercepted_[add_node] = {grad_z, grad_b};
+
+                // MatMulNode::backward expects to return: {grad_X, grad_W}
+                pending_mimo_intercepted_[matmul_node] = {grad_X, grad_W};
+            }
+            #ifdef CT_DEBUG
+            std::cerr << "[MIMO-EXEC-HIT] successfully executed fused backward layer!" << std::endl;
+            #endif
+
+            // ReLU_Grad returns `grad_z`
+            std::vector<Tensor> act_res = {grad_z};
+            return act_res;
+        }
+    }
+
+    // 触发异步编译
+    TensorDesc grad_desc = TensorDesc::fromShape(grad.sizes());
+    TensorDesc z_desc = TensorDesc::fromShape(z.sizes());
+    TensorDesc x_desc = TensorDesc::fromShape(X.sizes());
+    TensorDesc w_desc = TensorDesc::fromShape(W.sizes());
+    compileUnifiedMIMOBackwardAsync(node, add_node, matmul_node, grad_desc, z_desc, x_desc, w_desc);
+
+    return std::nullopt;
+}
+
+void C3BackwardCapture::compileUnifiedMIMOBackwardAsync(
+    const ::Node* relu_node, const ::Node* add_node, const ::Node* matmul_node,
+    const TensorDesc& grad_desc, const TensorDesc& z_desc,
+    const TensorDesc& x_desc, const TensorDesc& w_desc)
+{
+    std::string current_type = std::string(typeid(*relu_node).name());
+
+    std::stringstream ss;
+    ss << "mimo_backward_" << current_type << "|g:";
+    for (auto s : grad_desc.shape) ss << s << ",";
+    ss << "|z:";
+    for (auto s : z_desc.shape) ss << s << ",";
+    ss << "|x:";
+    for (auto s : x_desc.shape) ss << s << ",";
+    ss << "|w:";
+    for (auto s : w_desc.shape) ss << s << ",";
+    std::string mimo_key = ss.str();
+
+    {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        if (pending_compiles_.find(mimo_key) != pending_compiles_.end()) {
+            return;
+        }
+        pending_compiles_[mimo_key] = true;
+    }
+
+    std::thread([this, current_type, mimo_key, grad_desc, z_desc, x_desc, w_desc]() {
+        try {
+            // 1. 构建三个底层独立的反向子图 + 一个偏置子图
+            BackwardGraph act_bg;
+            if (current_type.find("ReLUNode") != std::string::npos) {
+                act_bg = buildReLUBackwardGraph(grad_desc, z_desc);
+            } else if (current_type.find("SigmoidNode") != std::string::npos) {
+                act_bg = buildSigmoidBackwardGraph(grad_desc, z_desc);
+            } else {
+                act_bg = buildTanhBackwardGraph(grad_desc, z_desc);
+            }
+            Graph act_sub = std::move(act_bg.first);
+            TensorDesc act_out_desc = act_sub.node(act_sub.outputs()[0]).out_desc;
+
+            // mm_w_sub: input_index == 1 计算 W 的梯度 (grad_W)
+            Graph mm_w_sub = buildMatMulBackwardGraph(act_out_desc, x_desc, w_desc, 1).first;
+            // mm_x_sub: input_index == 0 计算 X 的梯度 (grad_X)
+            Graph mm_x_sub = buildMatMulBackwardGraph(act_out_desc, x_desc, w_desc, 0).first;
+
+            // add_b_sub: bias 的梯度 (grad_b)
+            TensorDesc bias_grad_desc = TensorDesc::fromShape({grad_desc.shape[1]});
+            Graph add_b_sub = buildAddBackwardGraph(act_out_desc, grad_desc, bias_grad_desc, 1).first;
+
+            // 2. 声明 GraphMerger 的拓扑缝合规格，构造大一统融合图 (MIMO)
+            std::vector<Graph> sub_graphs = {act_sub, mm_w_sub, mm_x_sub, add_b_sub};
+            MergeSpec spec;
+
+            // 链接 1：act_sub (子图 0, 输出 0) ──► mm_w_sub (子图 1, 输入 0)
+            spec.links.push_back(MergeLink{0, 0, 1, 0});
+            // 链接 2：act_sub (子图 0, 输出 0) ──► mm_x_sub (子图 2, 输入 0)
+            spec.links.push_back(MergeLink{0, 0, 2, 0});
+            // 链接 3：act_sub (子图 0, 输出 0) ──► add_b_sub (子图 3, 输入 0)
+            spec.links.push_back(MergeLink{0, 0, 3, 0});
+
+            MergedGraphInfo unified_info = GraphMerger::merge(sub_graphs, spec);
+            Graph fused_graph = std::move(unified_info.graph);
+
+            // 3. 强行清除默认输出并按顺序物理标记四个输出
+            fused_graph.clearOutputs();
+            fused_graph.markOutput(unified_info.output_remap[0][0]); // Output 0: grad_z (for ReLU_Grad)
+            fused_graph.markOutput(unified_info.output_remap[1][0]); // Output 1: grad_W (for weights update)
+            fused_graph.markOutput(unified_info.output_remap[2][0]); // Output 2: grad_X (for backpropagation)
+            fused_graph.markOutput(unified_info.output_remap[3][0]); // Output 3: grad_b (for bias update)
+
+            CompileOptions opts;
+            opts.backend = C3Backend::MLIR;
+            opts.enable_fusion = true;
+
+            // 编译融合图为 JIT kernel
+            auto kernel = C3Engine::getInstance().compile(fused_graph, opts);
+            if (kernel) {
+                // 注册到 C3KernelRegistry 中，使用 {0, 1, 2} 对应 inputs 中的 z, X, W
+                C3KernelRegistry::getInstance().installBackward(
+                    mimo_key, kernel, grad_desc.shape, grad_desc.shape,
+                    {0, 1, 2}, 4
+                );
+                #ifdef CT_DEBUG
+                std::cerr << "[MIMO-COMPILE-SUCCESS] compiled unified backward layer successfully! key=" << mimo_key << std::endl;
+                #endif
+            }
+        } catch (const std::exception& e) {
+            #ifdef CT_DEBUG
+            std::cerr << "[MIMO-COMPILE-ERR] compile unified backward layer failed: " << e.what() << std::endl;
+            #endif
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(pending_mutex_);
+            pending_compiles_.erase(mimo_key);
+        }
+    }).detach();
 }
 
 } // namespace c3

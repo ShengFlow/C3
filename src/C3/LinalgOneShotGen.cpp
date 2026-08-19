@@ -161,8 +161,8 @@ struct BinaryTensorOpLowering : public OpRewritePattern<SrcOp> {
         if (rank == 0) rank = 1;
 
         std::vector<mlir::AffineExpr> lhs_exprs, rhs_exprs, out_exprs;
-        lhs_exprs.reserve(rank);
-        rhs_exprs.reserve(rank);
+        lhs_exprs.reserve(lhs_shape.size());
+        rhs_exprs.reserve(rhs_shape.size());
         out_exprs.reserve(rank);
 
         size_t lhs_offset = rank - lhs_shape.size();
@@ -171,20 +171,28 @@ struct BinaryTensorOpLowering : public OpRewritePattern<SrcOp> {
         for (size_t i = 0; i < rank; ++i) {
             mlir::AffineExpr d = rewriter.getAffineDimExpr(i);
             out_exprs.push_back(d);
+        }
 
-            // Map LHS dimension i
-            if (i < lhs_offset || lhs_shape[i - lhs_offset] == 1) {
+        // Map LHS dimensions
+        for (size_t i = 0; i < lhs_shape.size(); ++i) {
+            size_t out_dim = i + lhs_offset;
+            mlir::AffineExpr d = rewriter.getAffineDimExpr(out_dim);
+            if (lhs_shape[i] == 1) {
                 lhs_exprs.push_back(mlir::getAffineConstantExpr(0, ctx));
             } else {
                 lhs_exprs.push_back(d);
             }
+        }
 
-            // Map RHS dimension i
-            if (i < rhs_offset || rhs_shape[i - rhs_offset] == 1) {
+        // Map RHS dimensions
+        for (size_t i = 0; i < rhs_shape.size(); ++i) {
+            size_t out_dim = i + rhs_offset;
+            mlir::AffineExpr d = rewriter.getAffineDimExpr(out_dim);
+            if (rhs_shape[i] == 1) {
                 rhs_exprs.push_back(mlir::getAffineConstantExpr(0, ctx));
             } else {
-                int64_t r_sz = rhs_shape[i - rhs_offset];
-                int64_t l_sz = (i >= lhs_offset) ? lhs_shape[i - lhs_offset] : 1;
+                int64_t r_sz = rhs_shape[i];
+                int64_t l_sz = (out_dim >= lhs_offset) ? lhs_shape[out_dim - lhs_offset] : 1;
                 if (l_sz > r_sz && l_sz % r_sz == 0) {
                     rhs_exprs.push_back(d % mlir::getAffineConstantExpr(r_sz, ctx));
                 } else {
@@ -234,12 +242,13 @@ struct UnaryTensorOpLowering : public OpRewritePattern<SrcOp> {
 
         auto ctx = rewriter.getContext();
         auto tensorTy = mlir::cast<RankedTensorType>(dest.getType());
+        size_t rank = tensorTy.getRank();
+        if (rank == 0) rank = 1;
 
-        AffineExpr d0 = rewriter.getAffineDimExpr(0);
-        auto identityMap = AffineMap::get(1, 0, {d0}, ctx);
+        auto identityMap = AffineMap::getMultiDimIdentityMap(rank, ctx);
         std::vector<AffineMap> indexingMaps = {identityMap, identityMap};
 
-        std::vector<utils::IteratorType> iterTypes{utils::IteratorType::parallel};
+        std::vector<utils::IteratorType> iterTypes(rank, utils::IteratorType::parallel);
 
         auto genericOp = rewriter.create<linalg::GenericOp>(
             loc,
@@ -274,12 +283,13 @@ struct ReLUTensorOpLowering : public OpRewritePattern<mlir::c3::ReLUTensorOp> {
         auto ctx = rewriter.getContext();
         auto f32 = rewriter.getF32Type();
         auto tensorTy = mlir::cast<RankedTensorType>(dest.getType());
+        size_t rank = tensorTy.getRank();
+        if (rank == 0) rank = 1;
 
-        AffineExpr d0 = rewriter.getAffineDimExpr(0);
-        auto identityMap = AffineMap::get(1, 0, {d0}, ctx);
+        auto identityMap = AffineMap::getMultiDimIdentityMap(rank, ctx);
         std::vector<AffineMap> indexingMaps = {identityMap, identityMap};
 
-        std::vector<utils::IteratorType> iterTypes{utils::IteratorType::parallel};
+        std::vector<utils::IteratorType> iterTypes(rank, utils::IteratorType::parallel);
 
         auto genericOp = rewriter.create<linalg::GenericOp>(
             loc,
@@ -310,12 +320,13 @@ struct SigmoidTensorOpLowering : public OpRewritePattern<mlir::c3::SigmoidTensor
         auto ctx = rewriter.getContext();
         auto f32 = rewriter.getF32Type();
         auto tensorTy = mlir::cast<RankedTensorType>(dest.getType());
+        size_t rank = tensorTy.getRank();
+        if (rank == 0) rank = 1;
 
-        AffineExpr d0 = rewriter.getAffineDimExpr(0);
-        auto identityMap = AffineMap::get(1, 0, {d0}, ctx);
+        auto identityMap = AffineMap::getMultiDimIdentityMap(rank, ctx);
         std::vector<AffineMap> indexingMaps = {identityMap, identityMap};
 
-        std::vector<utils::IteratorType> iterTypes{utils::IteratorType::parallel};
+        std::vector<utils::IteratorType> iterTypes(rank, utils::IteratorType::parallel);
 
         auto genericOp = rewriter.create<linalg::GenericOp>(
             loc,
@@ -1061,9 +1072,11 @@ static void applyUnifiedTransformPipeline(mlir::ModuleOp module, size_t num_inpu
             tile_size = 2048;
         }
 
-        if (tile_size > 0) {
+        if (use_openmp || tile_size > 0) {
             pm.addPass(mlir::createConvertLinalgToParallelLoopsPass());
-            pm.addPass(mlir::createParallelLoopTilingPass({tile_size}));
+            if (tile_size > 0) {
+                pm.addPass(mlir::createParallelLoopTilingPass({tile_size}));
+            }
         } else {
             pm.addPass(mlir::createConvertLinalgToLoopsPass());
         }

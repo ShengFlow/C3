@@ -326,6 +326,11 @@ public:
     void markOutput(size_t node_id);
 
     /**
+     * @brief 清空图的所有输出标记
+     */
+    void clearOutputs() { outputs_.clear(); }
+
+    /**
      * @brief 对图做规范化（catamorphism：自底向上折叠）
      * @param rules 化简规则集（默认为 Add(x,0)→x, Mul(x,1)→x）
      * @return 规范化后的新图

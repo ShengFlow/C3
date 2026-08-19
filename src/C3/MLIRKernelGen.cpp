@@ -814,6 +814,13 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
 
     // 步骤 3: 分配缓冲区索引，记录每个缓冲区的 numel
     // 支持多输出（反向融合图）：输出节点写入 output 平面 buffer 的对应段（output_index * elem_n）
+    std::vector<size_t> output_offsets;
+    size_t current_offset = 0;
+    for (size_t out_id : outputs) {
+        output_offsets.push_back(current_offset);
+        current_offset += graph.node(out_id).out_desc.numel;
+    }
+
     std::unordered_map<size_t, size_t> node_to_buffer;
     std::unordered_map<size_t, size_t> output_index; // 输出节点 id → 平面 buffer 段索引（按 graph.outputs() 顺序）
     std::vector<size_t> buffer_numels; // buffer index → numel
@@ -982,7 +989,7 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
                 auto oi = output_index.find(in_node_id);
                 size_t seg = (oi != output_index.end()) ? oi->second : 0;
                 if (seg == 0) return out_ptr;
-                mlir::Value offset_val = builder.create<mlir::arith::ConstantIntOp>(loc, (int64_t)(seg * elem_n), 64);
+                mlir::Value offset_val = builder.create<mlir::arith::ConstantIntOp>(loc, (int64_t)(output_offsets[seg]), 64);
                 return builder.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, out_ptr, mlir::ValueRange{offset_val});
             }
             size_t pool_idx = logical_to_pool[buf_it->second];
@@ -1004,7 +1011,7 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
             if (seg == 0) {
                 out_buf = out_ptr;
             } else {
-                mlir::Value offset_val = builder.create<mlir::arith::ConstantIntOp>(loc, (int64_t)(seg * elem_n), 64);
+                mlir::Value offset_val = builder.create<mlir::arith::ConstantIntOp>(loc, (int64_t)(output_offsets[seg]), 64);
                 out_buf = builder.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, out_ptr, mlir::ValueRange{offset_val});
             }
         } else {

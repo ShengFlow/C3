@@ -104,6 +104,19 @@ public:
     /// @return 是否有任何已注册 region 以 last_op 结尾
     bool mayMatchAsLastOp(op last_op) const;
 
+    /// [Prewalk] 检查当前 op 是否可能是某个已注册 region 的首个 op
+    /// @details 用于 prewalk 启动: dispatch 时先查此位掩码, 若命中则进一步
+    ///          查 findRegionByFirstOp 做完整匹配。O(1) 无锁位测试。
+    bool mayMatchAsFirstOp(op first_op) const;
+
+    /// [Prewalk] 按 region 首个 op + 输入形状查找匹配的 active region
+    /// @param first_op 当前 dispatch 的 op（region 的首个 op）
+    /// @param first_input_shapes 首个 op 的输入形状
+    /// @return 匹配到的 RegionEntry，或 nullptr
+    RegionEntry* findRegionByFirstOp(
+        op first_op,
+        const std::vector<std::vector<size_t>>& first_input_shapes);
+
     void clear();
     void uninstallAll();
 
@@ -127,6 +140,11 @@ private:
     static_assert(static_cast<size_t>(op::kCount) <= 64,
                   "op::kCount exceeds uint64 bitmask capacity");
     mutable std::atomic<uint64_t> installed_last_ops_{0};
+
+    /// [Prewalk] 已注册 region 首个 op 位掩码
+    /// @details mayMatchAsFirstOp 用此位掩码做 O(1) 无锁快速过滤。
+    ///          install 时置 op_seq.front() 位, uninstallAll/clear 时清空。
+    mutable std::atomic<uint64_t> installed_first_ops_{0};
 };
 
 } // namespace c3

@@ -46,15 +46,28 @@ inline constexpr const char* kMergedCacheKeyPrefix = "merged_v4_";
  * @brief 合并规格：描述如何将 N 个子图串接成单个融合图
  * @details
  *   - `sub_graphs[i].outputs()[k]` = 子图 i 的第 k 个输出
- *   - `links[i]` 描述子图 i 的输出如何连接到子图 i+1 的输入：
- *     `links[i].from_output` = 子图 i 的输出索引
- *     `links[i].to_input`    = 子图 i+1 的输入索引
- *   - 若 `links[i].to_input == SIZE_MAX`，表示子图 i 的输出不连接到任何子图，
- *     而是作为融合图的最终输出之一
+ *   - `links[i]` 描述子图的输出如何连接到输入：
+ *     `links[i].from_subgraph` = 源子图索引，默认为 i
+ *     `links[i].from_output`   = 源子图的输出索引
+ *     `links[i].to_subgraph`   = 目标子图索引，默认为 i+1
+ *     `links[i].to_input`      = 目标子图的输入索引
  */
 struct MergeLink {
-    size_t from_output;  ///< 子图 i 的输出索引
-    size_t to_input;     ///< 子图 i+1 的输入索引（SIZE_MAX 表示不连接，作为最终输出）
+    size_t from_subgraph = SIZE_MAX; ///< 源子图索引（SIZE_MAX 表示基于位置的默认：即 i）
+    size_t from_output;              ///< 源子图的输出索引
+    size_t to_subgraph = SIZE_MAX;   ///< 目标子图索引（SIZE_MAX 表示基于位置的默认：即 i+1）
+    size_t to_input;                 ///< 目标子图的输入索引（SIZE_MAX 表示不连接，作为最终输出）
+
+    // 默认构造
+    MergeLink() : from_subgraph(SIZE_MAX), from_output(0), to_subgraph(SIZE_MAX), to_input(SIZE_MAX) {}
+
+    // 兼容旧版的 2 参数构造：表示 i -> i+1 的链接
+    MergeLink(size_t from_out, size_t to_in)
+        : from_subgraph(SIZE_MAX), from_output(from_out), to_subgraph(SIZE_MAX), to_input(to_in) {}
+
+    // 4 参数构造：指定具体的子图间链接
+    MergeLink(size_t from_sub, size_t from_out, size_t to_sub, size_t to_in)
+        : from_subgraph(from_sub), from_output(from_out), to_subgraph(to_sub), to_input(to_in) {}
 };
 
 struct MergeSpec {

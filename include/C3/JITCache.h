@@ -22,6 +22,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <string>
+#include <memory>
 
 // Forward declarations
 namespace llvm {

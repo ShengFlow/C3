@@ -37,6 +37,9 @@ void RegionFusionRegistry::install(uint64_t hash,
         installed_last_ops_.fetch_or(
             uint64_t(1) << static_cast<size_t>(op_seq.back()),
             std::memory_order_release);
+        installed_first_ops_.fetch_or(
+            uint64_t(1) << static_cast<size_t>(op_seq.front()),
+            std::memory_order_release);
     }
     installed_count_.fetch_add(1, std::memory_order_release);
 }
@@ -67,6 +70,9 @@ void RegionFusionRegistry::installFromCompiledKernel(
     if (!op_seq.empty()) {
         installed_last_ops_.fetch_or(
             uint64_t(1) << static_cast<size_t>(op_seq.back()),
+            std::memory_order_release);
+        installed_first_ops_.fetch_or(
+            uint64_t(1) << static_cast<size_t>(op_seq.front()),
             std::memory_order_release);
     }
     installed_count_.fetch_add(1, std::memory_order_release);
@@ -116,11 +122,14 @@ void RegionFusionRegistry::installWithCost(
     entry.active = basic_valid && worth_it;
     entries_[hash] = std::move(entry);
     // [Dev 2026-08-11 tryRegionDispatch 位掩码] 同步末尾 op 位掩码
-    //   installWithCost 路径: 即使 cost 判定不值, 仍置位 last op 位掩码
+    //   installWithCost 路径: 即使 cost 判定不值, 仍置位 last/first op 位掩码
     //   (实际 match 时 entry.active=false 会被跳过, 掩码仅用于快速 O(1) 过滤)
     if (!op_seq.empty()) {
         installed_last_ops_.fetch_or(
             uint64_t(1) << static_cast<size_t>(op_seq.back()),
+            std::memory_order_release);
+        installed_first_ops_.fetch_or(
+            uint64_t(1) << static_cast<size_t>(op_seq.front()),
             std::memory_order_release);
     }
     installed_count_.fetch_add(1, std::memory_order_release);
@@ -175,10 +184,40 @@ bool RegionFusionRegistry::mayMatchAsLastOp(op last_op) const {
             (uint64_t(1) << static_cast<size_t>(last_op))) != 0;
 }
 
+bool RegionFusionRegistry::mayMatchAsFirstOp(op first_op) const {
+    return (installed_first_ops_.load(std::memory_order_acquire) &
+            (uint64_t(1) << static_cast<size_t>(first_op))) != 0;
+}
+
+RegionEntry* RegionFusionRegistry::findRegionByFirstOp(
+    op first_op,
+    const std::vector<std::vector<size_t>>& first_input_shapes) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (auto& [_, entry] : entries_) {
+        if (!entry.active || entry.op_seq.empty()) continue;
+        if (entry.op_seq[0] != first_op) continue;
+        // 形状校验
+        if (!entry.first_input_shapes.empty() && !first_input_shapes.empty()) {
+            if (entry.first_input_shapes.size() != first_input_shapes.size()) continue;
+            bool shape_ok = true;
+            for (size_t i = 0; i < first_input_shapes.size(); ++i) {
+                if (entry.first_input_shapes[i] != first_input_shapes[i]) {
+                    shape_ok = false;
+                    break;
+                }
+            }
+            if (!shape_ok) continue;
+        }
+        return &entry;
+    }
+    return nullptr;
+}
+
 void RegionFusionRegistry::clear() {
     std::lock_guard<std::mutex> lock(mutex_);
     entries_.clear();
     installed_last_ops_.store(0, std::memory_order_release);
+    installed_first_ops_.store(0, std::memory_order_release);
     installed_count_.store(0, std::memory_order_release);
 }
 
@@ -189,6 +228,7 @@ void RegionFusionRegistry::uninstallAll() {
     }
     entries_.clear();
     installed_last_ops_.store(0, std::memory_order_release);
+    installed_first_ops_.store(0, std::memory_order_release);
     installed_count_.store(0, std::memory_order_release);
 }
 
