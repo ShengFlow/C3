@@ -22,6 +22,7 @@
 #ifdef CT_ENABLE_MLIR
 
 #include "C3/Graph.h"  // 高层 API mlirToLLVMIRFromGraph 用
+#include "C3/C3Dialect.h"  // [DCU Fix] C3Dialect 注册需要
 #include "MLIRKernelGen.h"  // ct::c3::buildMLIRModule + applyLoweringPipeline 公开 API
 
 // MLIR 头
@@ -168,6 +169,7 @@ MLIRToLLVMIRResult mlirToLLVMIRFromGraph(const Graph& graph,
         reg.insert<mlir::func::FuncDialect>();
         reg.insert<mlir::memref::MemRefDialect>();
         reg.insert<mlir::LLVM::LLVMDialect>();
+        reg.insert<mlir::c3::C3Dialect>();  // [DCU Fix] C3 dialect 注册
 
         mlir::MLIRContext context(reg);
         context.loadDialect<mlir::arith::ArithDialect>();
@@ -176,6 +178,7 @@ MLIRToLLVMIRResult mlirToLLVMIRFromGraph(const Graph& graph,
         context.loadDialect<mlir::func::FuncDialect>();
         context.loadDialect<mlir::memref::MemRefDialect>();
         context.loadDialect<mlir::LLVM::LLVMDialect>();
+        context.getOrLoadDialect<mlir::c3::C3Dialect>();  // [DCU Fix] C3 dialect 加载
 
         // 2. Build MLIR module (复用公开 API)
         auto module = ct::c3::buildMLIRModule(context, graph);
@@ -199,6 +202,17 @@ MLIRToLLVMIRResult mlirToLLVMIRFromGraph(const Graph& graph,
         if (result.text.empty()) {
             result.error_message = "mlirModuleToLLVMIRText returned empty (translate/verify failed)";
             return result;
+        }
+
+        // [DCU Fix] Mark c3_kernel as amdgpu_kernel so hipModuleGetFunction can find it.
+        // MLIR lowering produces a plain `define void @c3_kernel`; GCVM needs a kernel entry point.
+        {
+            const std::string target = "define void @c3_kernel";
+            const std::string replacement = "define amdgpu_kernel void @c3_kernel";
+            size_t pos = result.text.find(target);
+            if (pos != std::string::npos) {
+                result.text.replace(pos, target.size(), replacement);
+            }
         }
 
         // 6. 同步 emit bitcode (供 Plan B dcc 备用)

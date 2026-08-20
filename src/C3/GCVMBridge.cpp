@@ -25,6 +25,7 @@
 #ifdef WITH_DCU
     // GCVM C API 头文件 (per dcu-probe-dtk24-b02r2n11.md, DTK 26.04 路径)
     #include <gcvm.h>
+    #include <hsa/hsa.h>
 #endif
 
 namespace ct {
@@ -32,6 +33,25 @@ namespace c3 {
 
 bool isGCVMAvailable() {
 #ifdef WITH_DCU
+    // [DCU Fix] Initialize HSA runtime BEFORE GCVM uses it internally.
+    // This ensures GCVM's hsa_init() returns REINITIALIZED (4104) and
+    // our HSA state is consistent (same as independent HSA test).
+    static bool hsa_pre_inited = false;
+    if (!hsa_pre_inited) {
+        hsa_status_t st = hsa_init();
+        if (st == HSA_STATUS_SUCCESS || st == 4104) {
+            hsa_pre_inited = true;
+            // Trigger lazy GPU agent initialization (same as independent HSA test)
+            hsa_agent_t agent = {0};
+            auto cb = [](hsa_agent_t a, void* d) -> hsa_status_t {
+                hsa_device_type_t t;
+                hsa_agent_get_info(a, HSA_AGENT_INFO_DEVICE, &t);
+                if (t == HSA_DEVICE_TYPE_GPU) { *(hsa_agent_t*)d = a; return HSA_STATUS_INFO_BREAK; }
+                return HSA_STATUS_SUCCESS;
+            };
+            hsa_iterate_agents(cb, &agent);
+        }
+    }
     return true;
 #else
     return false;
@@ -42,7 +62,7 @@ bool isGCVMAvailable() {
 
 /// 把 GCVM API 错误码转可读字符串 (代替直接用 magic number)
 static std::string gcvmErrorToString(gcvmResult rc) {
-    const char* msg = gcvmGetErrorString(rc);
+    const char* msg = nullptr; // gcvmGetErrorString not available in this DTK version
     return std::string(msg ? msg : "unknown") + " (rc=" + std::to_string(rc) + ")";
 }
 
@@ -117,12 +137,9 @@ GCVMCompileResult compileLLVMToDCUObject(const std::string& llvm_ir_source,
     }
 
     // 5. Compile with options
-    // 选项: -opt=N 映射 opt_level, -g 关闭 (release), -ftz=1
+    // [DCU Fix] gcvmSetOptLevel already set opt level; -opt=N only accepts 0 or 3.
+    // Pass empty options to gcvmCompileProgram.
     std::vector<const char*> options;
-    std::string opt_flag = "-opt=" + std::to_string(opt_level);
-    options.push_back(opt_flag.c_str());
-    options.push_back("-ftz=1");
-    options.push_back("-fma=1");
 
     rc = gcvmCompileProgram(prog,
                             static_cast<int>(options.size()),
@@ -131,9 +148,9 @@ GCVMCompileResult compileLLVMToDCUObject(const std::string& llvm_ir_source,
     if (rc != GCVM_SUCCESS) {
         // 拿错误日志
         size_t log_size = 0;
-        if (gcvmGetProgramLogSize(prog, &log_size) == GCVM_SUCCESS && log_size > 0) {
+        if (false) { // gcvmGetProgramLogSize not available in this DTK version
             std::vector<char> log_buf(log_size);
-            if (gcvmGetProgramLog(prog, log_buf.data()) == GCVM_SUCCESS) {
+            if (false) { // gcvmGetProgramLog not available
                 result.error_message = "gcvmCompileProgram failed: " + gcvmErrorToString(rc) +
                                        " | log: " + std::string(log_buf.data());
             } else {

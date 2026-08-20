@@ -16,7 +16,7 @@
 # 生成：2026-08-17（由 CTorch 仓库 c3/CMakeLists.txt 物理拆分而来）
 # ==================================================================
 
-cmake_minimum_required(VERSION 3.31)
+cmake_minimum_required(VERSION 3.26)
 project(C3 VERSION 0.5.2 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)
@@ -76,8 +76,8 @@ if(CT_ENABLE_DCU)
     if(NOT DEFINED ROCM_PATH)
         set(ROCM_PATH "/opt/dtk" CACHE STRING "Default ROCM installation directory")
     endif()
-    set(GCVM_INCLUDE_DIR "${ROCM_PATH}/llvm/gcvm/include")
-    set(GCVM_LIBRARY "${ROCM_PATH}/llvm/gcvm/lib/libgcvm.so")
+    set(GCVM_INCLUDE_DIR "${ROCM_PATH}/dcc/gcvm/include")
+    set(GCVM_LIBRARY "${ROCM_PATH}/dcc/gcvm/lib/libgcvm.so")
     if(NOT EXISTS "${GCVM_INCLUDE_DIR}")
         message(FATAL_ERROR "GCVM include directory not found: ${GCVM_INCLUDE_DIR}. DTK 24.04+ required.")
     endif()
