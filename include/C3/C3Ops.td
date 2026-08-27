@@ -40,7 +40,7 @@ class C3_Op<string mnemonic, list<Trait> traits = []> :
 // MatMulOp
 //===----------------------------------------------------------------------===//
 
-def C3_MatMulOp : C3_Op<"matmul", [MemoryEffects<[MemWrite]>]> {
+def C3_MatMulOp : C3_Op<"matmul", [MemoryEffects<[MemWrite]>, AttrSizedOperandSegments]> {
   let summary = "High-performance Matrix Multiplication";
   let description = [{
     计算输入矩阵 A [M x K] 和 B [K x N] 的乘积，输出矩阵 C [M x N]。
@@ -55,6 +55,10 @@ def C3_MatMulOp : C3_Op<"matmul", [MemoryEffects<[MemWrite]>]> {
     可选 transpose folding：transA/transB 携带上游 Transpose 折叠信息（111=NoTrans, 112=Trans）。
     M/K/N 为 0 时表示维度在运行时确定（走 cblas 分支）。
     
+    [Prewalk A] 可选 $preAct 输出指针：当非空时，epilogue（bias+激活）执行前，
+    把 bias 后的 pre-activation 值也 store 一份到该指针（用于 backward 复用 MatMul 中间值，
+    避免物化时 eager 重算）。缺省为 nullptr 则行为与旧版完全一致。
+    
     示例：
       c3.matmul %A, %B, %C, %bias {M = 32, K = 64, N = 16, transA = 111, transB = 111, act = 1} : !llvm.ptr, !llvm.ptr, !llvm.ptr
   }];
@@ -64,6 +68,7 @@ def C3_MatMulOp : C3_Op<"matmul", [MemoryEffects<[MemWrite]>]> {
     AnyType:$rhs,
     AnyType:$out,
     Optional<AnyType>:$bias,
+    Optional<AnyType>:$preAct,
     I64Attr:$M,
     I64Attr:$K,
     I64Attr:$N,
@@ -76,10 +81,18 @@ def C3_MatMulOp : C3_Op<"matmul", [MemoryEffects<[MemWrite]>]> {
   );
   let results = (outs);
 
-  let assemblyFormat = "$lhs `,` $rhs `,` $out (`,` $bias^)? attr-dict `:` type($lhs) `,` type($rhs) `,` type($out) `,` type($bias)";
+  let assemblyFormat = "$lhs `,` $rhs `,` $out (`,` $bias^)? (`,` $preAct^)? attr-dict `:` type($lhs) `,` type($rhs) `,` type($out) `,` type($bias) `,` type($preAct)";
 
   let builders = [
+    // build 均在 c3/src/C3/C3Dialect.cpp 手写（含 optional operand 顺序 + AttrSizedOperandSegments）。
+    // 这里只声明签名，供 tblgen 生成 factory；调用最终落到手写 build。
+    // 旧签名（无 preAct）——保持向后兼容
     OpBuilder<(ins "Value":$lhs, "Value":$rhs, "Value":$out, "Value":$bias,
+                  "int64_t":$M, "int64_t":$K, "int64_t":$N,
+                  "int":$transA, "int":$transB, "int":$act,
+                  "int64_t":$tileM, "int64_t":$tileN, "int64_t":$biasNumel)>,
+    // 新签名：显式 preAct（可为 nullptr）
+    OpBuilder<(ins "Value":$lhs, "Value":$rhs, "Value":$out, "Value":$bias, "Value":$preAct,
                   "int64_t":$M, "int64_t":$K, "int64_t":$N,
                   "int":$transA, "int":$transB, "int":$act,
                   "int64_t":$tileM, "int64_t":$tileN, "int64_t":$biasNumel)>

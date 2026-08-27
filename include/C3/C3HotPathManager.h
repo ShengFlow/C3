@@ -594,7 +594,41 @@ private:
                         shape_ok = (last3_1.shape[0] == M * N);
                     }
                     if (shape_ok) {
-                        submitFusedCompileAsync({last3_0, last3_1}, dev, cfg, "MatMul+ReLU");
+                        // [forward 诊断] 2-op MatMul+ReLU 触发时 dump 缓冲尾部，定位为何 L1 漏掉 bias Add
+                        static std::mutex dmu;
+                        static std::unordered_set<size_t> dseen;
+                        size_t dk = 0;
+                        for (auto dd : last3_0.shape) dk = dk * 31 + dd;
+                        bool d1st = false;
+                        {
+                            std::lock_guard<std::mutex> lk(dmu);
+                            d1st = dseen.insert(dk).second;
+                        }
+                        if (d1st && seq.size() > 0) {
+                            std::lock_guard<std::mutex> lk(dmu);
+                            fprintf(stderr, "[DUMP-BUF] n=%llu:",
+                                    (unsigned long long)seq.size());
+                            size_t start = seq.size() > 8 ? seq.size() - 8 : 0;
+                            for (size_t bi = start; bi < seq.size(); ++bi) {
+                                fprintf(stderr, " op%d:[", (int)seq[bi].op_type);
+                                for (auto dd : seq[bi].shape) fprintf(stderr, "%zu,", dd);
+                                fprintf(stderr, "]");
+                            }
+                            fprintf(stderr, "\n");
+                        }
+                        // [forward 稳健化] 2-op MatMul+ReLU 命中时，优先在缓冲内寻找与该 MatMul
+                        // 输出 (M,N) 形状兼容的 Add（bias），提交更完备的 MatMul+Add+ReLU；
+                        // 找不到才退回 2-op。修复 L1(784→256) 因窗口顺序漏 bias Add 而从不融合。
+                        const DispatchRecord* add_rec = nullptr;
+                        for (const auto& r : seq) {
+                            if (r.op_type != op::Add || r.shape.size() < 2) continue;
+                            if (r.shape[0] == M && r.shape[1] == N) { add_rec = &r; break; }
+                        }
+                        if (add_rec) {
+                            submitFusedCompileAsync({last3_0, *add_rec, last3_1}, dev, cfg, "MatMul+Add+ReLU");
+                        } else {
+                            submitFusedCompileAsync({last3_0, last3_1}, dev, cfg, "MatMul+ReLU");
+                        }
                         return true;
                     }
                 }
@@ -745,6 +779,7 @@ private:
 
         // 添加计算节点并连接
         size_t prev_node_id = SIZE_MAX;
+        size_t matmul_node_id = SIZE_MAX; // [Prewalk A] 记录 MatMul 节点 id，用于暴露 preAct 中间值
         for (size_t ri = 0; ri < records.size(); ++ri) {
             const auto& rec = records[ri];
             const auto& info = infos[ri];
@@ -784,12 +819,21 @@ private:
 
             // 创建节点
             size_t node_id = g.addNode(makeNodeVariant(rec), node_input_ids, info.out_desc);
+            if (rec.op_type == op::MatMul) matmul_node_id = node_id; // [Prewalk A]
             prev_node_id = node_id;
         }
 
         // 标记最后一个节点为输出
         if (prev_node_id != SIZE_MAX) {
             g.markOutput(prev_node_id);
+        }
+
+        // [Prewalk A] 暴露 MatMul 中间值（preAct）作为第二个输出：
+        // 对 MatMul + 单激活（ReLU/Sigmoid/Tanh）融合模式，把 MatMul 节点也标记为输出，
+        // 让生成器把 pre-activation 值写到独立输出段。backward 直接复用，避免物化重算。
+        // 仅当存在 MatMul 且不是最后一个节点（有 epilogue 激活）时启用。
+        if (matmul_node_id != SIZE_MAX && matmul_node_id != prev_node_id) {
+            g.markOutput(matmul_node_id);
         }
 
         return g;
@@ -851,6 +895,29 @@ private:
 
             // 编译(强制 Handwritten backend,见上 CompileOptions opts 的注释)
             auto& engine = C3Engine::getInstance();
+            // [forward 诊断] 按 fused_key 打印一次该融合模式的 records(算子+形状)与编译结果/错误，
+            // 用于定位 L1(784→256)与 L2(256→128)为何只有 L2 注册进 region。
+            {
+                static std::mutex dbg_mu;
+                static std::unordered_set<size_t> dbg_seen;
+                bool first = false;
+                {
+                    std::lock_guard<std::mutex> lk(dbg_mu);
+                    first = dbg_seen.insert(fused_key).second;
+                }
+                if (first) {
+                    std::lock_guard<std::mutex> lk(dbg_mu);
+                    std::string s = pattern_name + "|";
+                    for (auto& r : records) {
+                        s += "op" + std::to_string((int)r.op_type) + ":[";
+                        for (auto d : r.shape) s += std::to_string(d) + ",";
+                        s += "] ";
+                    }
+                    fprintf(stderr, "[FUSE-COMPILE] key=%llu %s\n",
+                            (unsigned long long)fused_key, s.c_str());
+                }
+            }
+            try {
             auto kernel = engine.compile(g, opts);
 
             if (kernel) {
@@ -907,6 +974,26 @@ private:
                     CtorchError::log(ErrorLevel::INFO, ErrorPlatform::kGENERAL,
                         ErrorType::UNKNOWN,
                         "C3HotPathManager: 融合编译完成: " + pattern_name);
+                }
+            } else {
+                // [forward 诊断] kernel 编译成功但返回空 → 未注册 region
+                fprintf(stderr, "[FUSE-COMPILE-EMPTY] key=%llu\n",
+                        (unsigned long long)fused_key);
+            }
+            } catch (const std::exception& e) {
+                // [forward 诊断] 暴露前向融合 kernel 编译失败根因（async 异常原本被吞掉）
+                static std::mutex fe_mu;
+                static std::unordered_set<size_t> fe_seen;
+                size_t fh = std::hash<std::string>{}(std::string(e.what()) + std::to_string(fused_key));
+                bool ffirst = false;
+                {
+                    std::lock_guard<std::mutex> lk(fe_mu);
+                    ffirst = fe_seen.insert(fh).second;
+                }
+                if (ffirst) {
+                    std::lock_guard<std::mutex> lk(fe_mu);
+                    fprintf(stderr, "[FUSE-COMPILE-ERR] key=%llu err=%s\n",
+                            (unsigned long long)fused_key, e.what());
                 }
             }
 

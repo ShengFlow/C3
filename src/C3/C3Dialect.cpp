@@ -54,10 +54,25 @@ void MatMulOp::build(::mlir::OpBuilder &odsBuilder, ::mlir::OperationState &odsS
                      int64_t M, int64_t K, int64_t N,
                      int transA, int transB, int act,
                      int64_t tileM, int64_t tileN, int64_t biasNumel) {
+  MatMulOp::build(odsBuilder, odsState, lhs, rhs, out, bias, mlir::Value(),
+                  M, K, N, transA, transB, act, tileM, tileN, biasNumel);
+}
+
+void MatMulOp::build(::mlir::OpBuilder &odsBuilder, ::mlir::OperationState &odsState,
+                     ::mlir::Value lhs, ::mlir::Value rhs, ::mlir::Value out,
+                     ::mlir::Value bias, ::mlir::Value preAct,
+                     int64_t M, int64_t K, int64_t N,
+                     int transA, int transB, int act,
+                     int64_t tileM, int64_t tileN, int64_t biasNumel) {
   odsState.addOperands(lhs);
   odsState.addOperands(rhs);
   odsState.addOperands(out);
   if (bias) odsState.addOperands(bias);
+  if (preAct) odsState.addOperands(preAct);
+  // AttrSizedOperandSegments：声明各段大小（lhs,rhs,out,bias,preAct），
+  // 写进 Properties（与 tblgen 生成的 build 保持一致），供 getBias()/getPreAct() 定位。
+  ::llvm::copy(::llvm::ArrayRef<int32_t>({1, 1, 1, bias ? 1 : 0, preAct ? 1 : 0}),
+               odsState.getOrAddProperties<MatMulOp::Properties>().operandSegmentSizes.begin());
   auto i64 = odsBuilder.getI64Type();
   auto i32 = odsBuilder.getI32Type();
   odsState.getOrAddProperties<MatMulOp::Properties>().M = odsBuilder.getIntegerAttr(i64, M);

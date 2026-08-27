@@ -86,11 +86,50 @@ private:
     int rhs_mod_ = RhsNoBroadcast;
 };
 
+/// 编译并持有单个多维广播 JIT kernel（memref 签名 + invokePacked ABI）
+class LinalgBroadcastingKernel {
+public:
+    explicit LinalgBroadcastingKernel(ElementwiseOp op, int opt_level,
+                                      const std::vector<size_t>& lhs_shape,
+                                      const std::vector<size_t>& rhs_shape,
+                                      const std::vector<size_t>& out_shape);
+    ~LinalgBroadcastingKernel();
+    LinalgBroadcastingKernel(const LinalgBroadcastingKernel&) = delete;
+    LinalgBroadcastingKernel& operator=(const LinalgBroadcastingKernel&) = delete;
+    LinalgBroadcastingKernel(LinalgBroadcastingKernel&&) noexcept;
+    LinalgBroadcastingKernel& operator=(LinalgBroadcastingKernel&&) noexcept;
+
+    ElementwiseOp op() const { return op_; }
+    size_t numInputs() const { return num_inputs_; }
+
+    /// 执行多维广播 JIT kernel
+    void execute(const float* const* in_ptrs, float* out_ptr,
+                 const std::vector<size_t>& lhs_shape,
+                 const std::vector<size_t>& rhs_shape,
+                 const std::vector<size_t>& out_shape) const;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+    ElementwiseOp op_;
+    size_t num_inputs_;
+    std::vector<size_t> lhs_shape_;
+    std::vector<size_t> rhs_shape_;
+    std::vector<size_t> out_shape_;
+};
+
 /// 共享 kernel 缓存工厂：同一 (op, opt_level, rhs_mod) 只 JIT 编译一次，之后复用。
 /// 线程安全：构造互斥 + execute 并发安全。编译失败抛 std::runtime_error。
 /// 逃生开关：`C3_LINALG_CACHE=0` 关闭缓存（每次全新编译，便于对比）。
 std::shared_ptr<LinalgElementwiseKernel> getCachedLinalgKernel(
     ElementwiseOp op, int opt_level = 3, int rhs_mod = RhsNoBroadcast);
+
+/// 共享多维广播 JIT kernel 缓存工厂
+std::shared_ptr<LinalgBroadcastingKernel> getCachedLinalgBroadcastKernel(
+    ElementwiseOp op, int opt_level,
+    const std::vector<size_t>& lhs_shape,
+    const std::vector<size_t>& rhs_shape,
+    const std::vector<size_t>& out_shape);
 
 /// 便捷函数：编译并执行一次（测试 / 小规模场景用）。
 /// inputs 按算子输入顺序传数据；输出自动分配并返回。

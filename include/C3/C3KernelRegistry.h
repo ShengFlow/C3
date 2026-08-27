@@ -236,6 +236,11 @@ public:
         // 不值得 (worthwhile=false) 计数器 +1,理论上 install 端 cost gating 已过滤,
         // 此 counter 是 sanity check + perf 阶段 ROI 分布观测
         uint64_t region_cost_rejected_count = 0; ///< match 成功但 cost.worthwhile=false 拒绝次数
+        // [MIMO 深挖] backward::tryExecuteBackward 各阶段累计耗时。
+        // bwd_dispatch_us = 锁 + map 查找 + grad_shape 校验 + 输入 vector 组装（不含 kernel 执行）；
+        // bwd_exec_us     = entry.kernel->execute()（含 setup + cargo GEMM/epilogue）。
+        uint64_t bw_dispatch_us = 0;  ///< backward 派发(查表/校验/组装)累计耗时(us)
+        uint64_t bw_exec_us = 0;      ///< backward kernel->execute 累计耗时(us)
     };
 
     /**
@@ -295,6 +300,8 @@ public:
         s.c3_single_invoke_count = c3_single_invoke_count_.load(std::memory_order_relaxed);
         s.eager_invoke_count = eager_invoke_count_.load(std::memory_order_relaxed);
         s.region_cost_rejected_count = region_cost_rejected_count_.load(std::memory_order_relaxed);
+        s.bw_dispatch_us = bw_dispatch_ns_.load(std::memory_order_relaxed) / 1000;
+        s.bw_exec_us = bw_exec_ns_.load(std::memory_order_relaxed) / 1000;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             s.active_entries = entries_.size();
@@ -393,7 +400,8 @@ public:
      */
     Tensor executeFusedWithInputs(std::shared_ptr<CompiledKernel> kernel,
                                    const std::vector<Tensor>& inputs,
-                                   const KernelShapeInfo& shapes);
+                                   const KernelShapeInfo& shapes,
+                                   Tensor* secondary_out = nullptr);
 
     /**
      * @brief 卸载融合 kernel
@@ -582,6 +590,9 @@ private:
     std::atomic<uint64_t> eager_invoke_count_{0};
     // M1 1.3 (2026-08-09): ROI 评估可观察性 counter
     std::atomic<uint64_t> region_cost_rejected_count_{0};
+    // [MIMO 深挖] backward::tryExecuteBackward 阶段耗时累加器（relaxed，低成本）
+    std::atomic<uint64_t> bw_dispatch_ns_{0};  ///< 查表/校验/组装（不含 kernel 执行）
+    std::atomic<uint64_t> bw_exec_ns_{0};      ///< entry.kernel->execute()
 };
 
 } // namespace c3

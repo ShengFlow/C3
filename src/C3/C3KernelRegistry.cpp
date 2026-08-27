@@ -36,9 +36,13 @@ namespace c3 {
 Tensor C3KernelRegistry::executeFusedWithInputs(
     std::shared_ptr<CompiledKernel> kernel,
     const std::vector<Tensor>& inputs,
-    const KernelShapeInfo& shapes) {
+    const KernelShapeInfo& shapes,
+    Tensor* secondary_out) {
     if (!kernel || inputs.empty()) {
         return Tensor();
+    }
+    if (secondary_out) {
+        *secondary_out = Tensor();
     }
 
     // 从 CompiledKernel 派生类取 FusedKernelFunc
@@ -60,6 +64,10 @@ Tensor C3KernelRegistry::executeFusedWithInputs(
             return Tensor();
         }
         fused_hit_count_.fetch_add(1, std::memory_order_relaxed);
+        // [Prewalk A] 第 2 输出（preAct 中间值）供调度层回填 placeholder，backward 直接复用
+        if (secondary_out && outputs.size() >= 2) {
+            *secondary_out = outputs[1];
+        }
         return outputs[0];
     } catch (const std::exception& e) {
         CtorchError::log(ErrorLevel::WARN, ErrorPlatform::kGENERAL,
@@ -230,6 +238,8 @@ std::optional<Tensor> C3KernelRegistry::tryExecuteUnary(op op_type, const Tensor
 std::optional<std::vector<Tensor>> C3KernelRegistry::tryExecuteBackward(
     const std::string& backward_key, const Tensor& grad,
     const std::vector<Tensor>& forward_inputs) {
+    // [MIMO 深挖] 分阶段累加：dispatch(锁+查表+校验+组装) 与 kernel->execute 分开统计
+    auto t_bw0 = std::chrono::steady_clock::now();
     BackwardEntry entry;
     bool found = false;
     size_t map_size = 0;
@@ -313,8 +323,16 @@ std::optional<std::vector<Tensor>> C3KernelRegistry::tryExecuteBackward(
             // 防御：输入数量与注册时不符 → 回退 eager
             return std::nullopt;
         }
+        bw_dispatch_ns_.fetch_add(
+            (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t_bw0).count(), std::memory_order_relaxed);
+        auto t_bw_exec0 = std::chrono::steady_clock::now();
         auto outputs = entry.kernel->execute(inputs);
         if (outputs.empty()) return std::nullopt;
+        // [MIMO 深挖] kernel->execute 单独分桶累计（含 setup + cargo GEMM/epilogue）
+        bw_exec_ns_.fetch_add(
+            (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t_bw_exec0).count(), std::memory_order_relaxed);
         return outputs;
     } catch (...) {
         return std::nullopt;

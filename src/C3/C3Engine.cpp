@@ -22,8 +22,15 @@
 #include "C3/LinalgOneShotGen.h"
 #endif
 
+#ifdef WITH_DCU
+#include "C3/MLIRToLLVMIR.h"
+#include "C3/GCVMBridge.h"
+#include "C3/DCUCompiledKernel.h"
+#endif
+
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <dlfcn.h>
 #include <future>
 #include <mutex>
@@ -120,6 +127,47 @@ private:
  * @class MultiNodeCompiledKernel
  * @brief 多节点编译产物：封装 MultiNodeKernelFunc，支持多节点图执行
  */
+// [MIMO/多节点输出分配池] 用带"引用归零才归还"deleter 的 shared_ptr<char> 复用 flat 输出缓冲，
+// 消除每次 execute 的裸 malloc/free 抖动。只有当所有引用（含逃逸出的 Tensor 拷贝）释放时
+// refcount 归零才触发归还，天然安全。C3 多节点 kernel（MIMO 4 输出 / 前向融合 2 输出）均全量
+// 写入每个输出字节（cblas beta=0 + 全量逐元素循环），复用不残留脏数据。
+namespace {
+struct FlatOutPool {
+    std::mutex mu;
+    std::unordered_map<size_t, std::vector<char*>> free_bufs;
+
+    static FlatOutPool& instance() {
+        static FlatOutPool p;
+        return p;
+    }
+    std::shared_ptr<char> acquire(size_t bytes) {
+        char* p = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            auto it = free_bufs.find(bytes);
+            if (it != free_bufs.end() && !it->second.empty()) {
+                p = it->second.back();
+                it->second.pop_back();
+            }
+        }
+        if (!p) p = static_cast<char*>(std::malloc(bytes));
+        return std::shared_ptr<char>(p, [bytes](char* q) {
+            FlatOutPool& pool = FlatOutPool::instance();
+            std::lock_guard<std::mutex> lk(pool.mu);
+            pool.free_bufs[bytes].push_back(q);
+        });
+    }
+};
+} // namespace
+
+// [MIMO 深挖] MultiNodeCompiledKernel::execute 的 setup(非 func_) 与 func_(cargo) 分桶累计。
+// 文件内 static 原子量，跨核函数 getMultiNodeExecTiming() 只读。relaxed 累加，成本可忽略。
+namespace {
+std::atomic<uint64_t> g_mn_setup_ns{0};
+std::atomic<uint64_t> g_mn_func_ns{0};
+std::atomic<uint64_t> g_mn_calls{0};
+} // namespace
+
 class MultiNodeCompiledKernel : public CompiledKernel {
 public:
     MultiNodeCompiledKernel(MultiNodeKernelFunc func,
@@ -150,6 +198,9 @@ public:
                 " inputs, got " + std::to_string(inputs.size()));
         }
 
+        // [MIMO 深挖] setup(输入指针收集 + 平坦输出分配 + 输出 Tensor 构造) vs func_(cargo) 分桶
+        auto t_mn0 = std::chrono::steady_clock::now();
+
         // 收集输入指针
         std::vector<const float*> in_ptrs;
         for (size_t i = 0; i < num_inputs_; ++i) {
@@ -170,7 +221,16 @@ public:
         }
 
         // 1. 分配一个平面 contiguous Storage
-        Storage out_storage(total_out_numel, DType::kFloat, device_);
+        // [MIMO/多节点输出分配池] CPU 路径走池化复用 flat 缓冲（引用归零自动归还），
+        // 消除多次 execute 的裸 malloc/free 抖动；非 CPU 或零输出回退普通分配。
+        Storage out_storage;
+        if (device_ == DeviceType::kCPU && total_out_numel > 0) {
+            size_t out_bytes = total_out_numel * sizeof(float);
+            out_storage = Storage(FlatOutPool::instance().acquire(out_bytes),
+                                  total_out_numel, DType::kFloat, DeviceType::kCPU);
+        } else {
+            out_storage = Storage(total_out_numel, DType::kFloat, device_);
+        }
         float* out_raw_ptr = out_storage.data<float>();
 
         // 2. 构造输出 Tensors，它们共享 out_storage 并设置偏移量
@@ -190,6 +250,13 @@ public:
         
         // 仅当元素数足够大、单输出，且不是 MatMul（MatMul 自带并行）时才开启多线程并行
         bool do_parallel = (elem_n_ >= kParallelThreshold && M_ == 0 && seg_n == 1);
+
+        // [MIMO 深挖] setup 到此结束（数据读取 + 输出分配 + Tensor 构造），累计后单独计时 cargo
+        g_mn_setup_ns.fetch_add(
+            (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t_mn0).count(), std::memory_order_relaxed);
+        g_mn_calls.fetch_add(1, std::memory_order_relaxed);
+        auto t_mn_func = std::chrono::steady_clock::now();
         
         if (do_parallel) {
             unsigned int num_threads = std::thread::hardware_concurrency();
@@ -243,6 +310,11 @@ public:
 
             func_(in_ptrs.data(), out_raw_ptr, elem_n_, M_, K_, N_, scratch_ptr);
         }
+
+        // 记录 cargo(func_) 耗时（覆盖串行与并行两分支）
+        g_mn_func_ns.fetch_add(
+            (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t_mn_func).count(), std::memory_order_relaxed);
 
         return outs;
     }
@@ -733,6 +805,30 @@ static std::shared_ptr<CompiledKernel> doCompile(
             at_cfg.verbose = true;
             C3Engine::getInstance().autoTune(at_cfg);
         }
+
+#ifdef WITH_DCU
+        if (options.target_device == DeviceType::kDCU) {
+            // Translate Graph to LLVM IR using MLIRToLLVMIR
+            MLIRToLLVMIROptions ir_opts;
+            ir_opts.opt_level = options.opt_level;
+            ir_opts.verify_llvm_ir = true;
+            auto ir_result = mlirToLLVMIRFromGraph(working_graph, ir_opts);
+            if (!ir_result.success) {
+                throw std::runtime_error("C3Engine: MLIR -> LLVM IR translation failed for DCU: " + ir_result.error_message);
+            }
+
+            // Compile LLVM IR to Code Object using GCVM Bridge
+            auto gcvm_result = compileLLVMToDCUObject(ir_result.text, "c3_kernel", options.opt_level);
+            if (!gcvm_result.success) {
+                throw std::runtime_error("C3Engine: GCVM compilation failed for DCU: " + gcvm_result.error_message);
+            }
+
+            // Return a new DCUCompiledKernel
+            return std::make_shared<DCUCompiledKernel>(
+                gcvm_result.code_object, "c3_kernel", working_graph, 0
+            );
+        }
+#endif
 
 #ifdef CT_ENABLE_MLIR
         // [2026-08-15] linalg.generic 多核并行/多输出大一统路线
@@ -1717,6 +1813,15 @@ void C3Engine::shutdown() {
     } catch (...) {
         // best-effort 清理
     }
+}
+
+// [MIMO 深挖] 多节点 kernel 执行分桶计时读取（跨模块只读）
+MultiNodeExecTiming getMultiNodeExecTiming() {
+    MultiNodeExecTiming t;
+    t.setup_us = g_mn_setup_ns.load(std::memory_order_relaxed) / 1000;
+    t.func_us = g_mn_func_ns.load(std::memory_order_relaxed) / 1000;
+    t.calls = g_mn_calls.load(std::memory_order_relaxed);
+    return t;
 }
 
 } // namespace c3

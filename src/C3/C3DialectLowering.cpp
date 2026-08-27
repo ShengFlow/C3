@@ -113,6 +113,7 @@ static void buildVectorizedLoop(mlir::OpBuilder& builder, mlir::Location loc,
 
 static void buildSmallMatMul(mlir::OpBuilder& builder, mlir::Location loc,
                              mlir::Value lhs, mlir::Value rhs, mlir::Value out, mlir::Value bias,
+                             mlir::Value preAct,   // [Prewalk A] 可选 pre-activation 输出（可为 nullptr）
                              size_t M, size_t K, size_t N,
                              int transA, int transB, int act,
                              size_t bias_numel) {
@@ -189,6 +190,12 @@ static void buildSmallMatMul(mlir::OpBuilder& builder, mlir::Location loc,
 
     builder.setInsertionPointAfter(loop_k);
     mlir::Value final_sum = loop_k.getResult(0);
+
+    // [Prewalk A] 需要时把 pre-activation 值写一份到 preAct（backward 复用中间值）
+    if (preAct) {
+        mlir::Value preAct_cell_ptr = builder.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, preAct, mlir::ValueRange{out_idx});
+        builder.create<mlir::LLVM::StoreOp>(loc, final_sum, preAct_cell_ptr);
+    }
 
     mlir::Value activated = final_sum;
     if (act == 1) { // ReLU
@@ -497,36 +504,43 @@ struct SumReduceOpLowering : public mlir::OpRewritePattern<mlir::c3::SumReduceOp
         auto ptr_type = mlir::LLVM::LLVMPointerType::get(rewriter.getContext());
 
         if (axis == 0) {
+            // [MIMO epilogue 优化] 原实现「外 j 内 i」：input[i*N+j] 沿 i 跨 N*4=1KB stride，
+            // cache 极差 + 标量。改为「外 i 内 j」行优先：input 行连续读、out 连续累积，
+            // LLVM 可向量化内层 for-j。同一列 j 的累加仍按 i 升序，浮点次序不变，数值等价。
+            mlir::Value M_v = rewriter.create<mlir::arith::ConstantIndexOp>(loc, M);
             mlir::Value N_v = rewriter.create<mlir::arith::ConstantIndexOp>(loc, N);
             mlir::Value c0 = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 0);
             mlir::Value c1 = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 1);
+            auto mk_zero = rewriter.create<mlir::arith::ConstantFloatOp>(loc, f32, llvm::APFloat(0.0f));
 
-            auto loop_j = rewriter.create<mlir::scf::ForOp>(loc, c0, N_v, c1);
-            rewriter.setInsertionPointToStart(loop_j.getBody());
-            mlir::Value j_idx = loop_j.getInductionVar();
-            mlir::Value j_i64 = indexToI64(rewriter, loc, j_idx);
-
-            mlir::Value out_ptr = rewriter.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, out, mlir::ValueRange{j_i64});
-            mlir::Value zero = rewriter.create<mlir::arith::ConstantFloatOp>(loc, f32, llvm::APFloat(0.0f));
-            rewriter.create<mlir::LLVM::StoreOp>(loc, zero, out_ptr);
-
-            mlir::Value M_v = rewriter.create<mlir::arith::ConstantIndexOp>(loc, M);
-            auto loop_i = rewriter.create<mlir::scf::ForOp>(loc, c0, M_v, c1);
-            rewriter.setInsertionPointToStart(loop_i.getBody());
-            mlir::Value i_idx = loop_i.getInductionVar();
-            mlir::Value i_i64 = indexToI64(rewriter, loc, i_idx);
-
-            mlir::Value in_idx = rewriter.create<mlir::arith::MulIOp>(loc, i_i64, rewriter.create<mlir::arith::ConstantIntOp>(loc, N, 64));
-            in_idx = rewriter.create<mlir::arith::AddIOp>(loc, in_idx, j_i64);
-
-            mlir::Value in_ptr = rewriter.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, input, mlir::ValueRange{in_idx});
-            mlir::Value val = rewriter.create<mlir::LLVM::LoadOp>(loc, f32, in_ptr);
-            mlir::Value old_sum = rewriter.create<mlir::LLVM::LoadOp>(loc, f32, out_ptr);
-            mlir::Value new_sum = rewriter.create<mlir::arith::AddFOp>(loc, old_sum, val);
-            rewriter.create<mlir::LLVM::StoreOp>(loc, new_sum, out_ptr);
-
-            rewriter.setInsertionPointAfter(loop_i);
-            rewriter.setInsertionPointAfter(loop_j);
+            // 1) 清零 out[0,N)
+            {
+                auto lzero = rewriter.create<mlir::scf::ForOp>(loc, c0, N_v, c1);
+                rewriter.setInsertionPointToStart(lzero.getBody());
+                auto jo = rewriter.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, out,
+                    mlir::ValueRange{indexToI64(rewriter, loc, lzero.getInductionVar())});
+                rewriter.create<mlir::LLVM::StoreOp>(loc, mk_zero, jo);
+                rewriter.setInsertionPointAfter(lzero);
+            }
+            // 2) 行优先累积: 外 i(0,M), 内 j(0,N) —— input 行连续读, out 连续 load/store
+            {
+                auto lrow = rewriter.create<mlir::scf::ForOp>(loc, c0, M_v, c1);
+                rewriter.setInsertionPointToStart(lrow.getBody());
+                auto iN = rewriter.create<mlir::arith::MulIOp>(loc,
+                    indexToI64(rewriter, loc, lrow.getInductionVar()),
+                    rewriter.create<mlir::arith::ConstantIntOp>(loc, N, 64));
+                auto lcol = rewriter.create<mlir::scf::ForOp>(loc, c0, N_v, c1);
+                rewriter.setInsertionPointToStart(lcol.getBody());
+                auto j_idx = indexToI64(rewriter, loc, lcol.getInductionVar());
+                auto in_idx = rewriter.create<mlir::arith::AddIOp>(loc, iN, j_idx);
+                auto in_ptr = rewriter.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, input, mlir::ValueRange{in_idx});
+                auto out_ptr = rewriter.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, out, mlir::ValueRange{j_idx});
+                auto val = rewriter.create<mlir::LLVM::LoadOp>(loc, f32, in_ptr);
+                auto old = rewriter.create<mlir::LLVM::LoadOp>(loc, f32, out_ptr);
+                rewriter.create<mlir::LLVM::StoreOp>(loc, rewriter.create<mlir::arith::AddFOp>(loc, old, val), out_ptr);
+                rewriter.setInsertionPointAfter(lcol);
+                rewriter.setInsertionPointAfter(lrow);
+            }
         } else {
             mlir::Value M_v = rewriter.create<mlir::arith::ConstantIndexOp>(loc, M);
             mlir::Value c0 = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 0);
@@ -601,6 +615,7 @@ struct MatMulOpLowering : public mlir::OpRewritePattern<mlir::c3::MatMulOp> {
         mlir::Value rhs = op.getRhs();
         mlir::Value out = op.getOut();
         mlir::Value bias = op.getBias();
+        mlir::Value preAct = op.getPreAct();   // [Prewalk A] 可选 pre-activation 输出（可为 nullptr）
 
         int64_t M = op.getM();
         int64_t K = op.getK();
@@ -694,6 +709,12 @@ struct MatMulOpLowering : public mlir::OpRewritePattern<mlir::c3::MatMulOp> {
                         val_vec = vb.create<mlir::arith::AddFOp>(vloc, val_vec, b_vec);
                     }
 
+                    // [Prewalk A] 需要时把 pre-activation 值同时写一份到 preAct（backward 复用中间值）
+                    if (preAct) {
+                        mlir::Value preAct_ptr = vb.create<mlir::LLVM::GEPOp>(vloc, ptr_type, f32, preAct, mlir::ValueRange{out_row_off});
+                        vb.create<mlir::LLVM::StoreOp>(vloc, val_vec, preAct_ptr, /*alignment=*/16);
+                    }
+
                     mlir::Value act_vec = val_vec;
                     if (act == 1) { // ReLU (vector.max with zero broadcast)
                         mlir::Value zero_s = vb.create<mlir::arith::ConstantFloatOp>(vloc, f32, llvm::APFloat(0.0f));
@@ -725,6 +746,10 @@ struct MatMulOpLowering : public mlir::OpRewritePattern<mlir::c3::MatMulOp> {
                         mlir::Value bias_val = sb.create<mlir::LLVM::LoadOp>(sloc, f32, bias_ptr);
                         val = sb.create<mlir::arith::AddFOp>(sloc, val, bias_val);
                     }
+                    if (preAct) {
+                        mlir::Value preAct_cell_ptr = sb.create<mlir::LLVM::GEPOp>(sloc, ptr_type, f32, preAct, mlir::ValueRange{out_idx});
+                        sb.create<mlir::LLVM::StoreOp>(sloc, val, preAct_cell_ptr);
+                    }
                     mlir::Value activated = val;
                     if (act == 1) {
                         mlir::Value zero = sb.create<mlir::arith::ConstantFloatOp>(sloc, f32, llvm::APFloat(0.0f));
@@ -749,7 +774,7 @@ struct MatMulOpLowering : public mlir::OpRewritePattern<mlir::c3::MatMulOp> {
         }
 
         if (fallback_to_small) {
-            buildSmallMatMul(rewriter, loc, lhs, rhs, out, bias,
+            buildSmallMatMul(rewriter, loc, lhs, rhs, out, bias, preAct,
                              (size_t)M, (size_t)K, (size_t)N,
                              transA, transB, act, (size_t)bias_numel);
         }

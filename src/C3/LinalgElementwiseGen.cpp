@@ -591,5 +591,299 @@ std::vector<float> runLinalgElementwise(ElementwiseOp op,
     return out;
 }
 
+// ======================= 多维张量广播 Linalg 优化实现 =======================
+
+static mlir::AffineMap getBroadcastMap(mlir::OpBuilder& builder, mlir::MLIRContext& context,
+                                       int64_t rank, const std::vector<size_t>& input_shape) {
+    std::vector<mlir::AffineExpr> exprs;
+    exprs.reserve(input_shape.size());
+    for (size_t i = 0; i < input_shape.size(); ++i) {
+        if (input_shape[i] == 1) {
+            exprs.push_back(mlir::getAffineConstantExpr(0, &context));
+        } else {
+            exprs.push_back(builder.getAffineDimExpr(static_cast<unsigned>(i)));
+        }
+    }
+    return mlir::AffineMap::get(static_cast<unsigned>(rank), 0, exprs, &context);
+}
+
+mlir::ModuleOp buildLinalgBroadcastingModule(mlir::MLIRContext& context, ElementwiseOp op,
+                                             size_t num_inputs,
+                                             const std::vector<size_t>& lhs_shape,
+                                             const std::vector<size_t>& rhs_shape,
+                                             const std::vector<size_t>& out_shape) {
+    auto loc = mlir::UnknownLoc::get(&context);
+    auto module = mlir::ModuleOp::create(loc);
+    mlir::OpBuilder builder(&context);
+    builder.setInsertionPointToEnd(module.getBody());
+
+    auto f32Type = builder.getF32Type();
+    
+    size_t rank = out_shape.size();
+    std::vector<size_t> padded_lhs = lhs_shape;
+    std::vector<size_t> padded_rhs = rhs_shape;
+    while (padded_lhs.size() < rank) padded_lhs.insert(padded_lhs.begin(), 1);
+    while (padded_rhs.size() < rank) padded_rhs.insert(padded_rhs.begin(), 1);
+
+    std::vector<int64_t> dynamic_dims(rank, mlir::ShapedType::kDynamic);
+    auto memrefType = mlir::MemRefType::get(dynamic_dims, f32Type);
+
+    std::vector<mlir::Type> arg_types(num_inputs + 1, memrefType);
+    auto funcType = builder.getFunctionType(arg_types, {});
+    auto func = builder.create<mlir::func::FuncOp>(loc, "c3_kernel", funcType);
+    for (size_t i = 0; i < arg_types.size(); ++i) {
+        func.setArgAttr(i, "llvm.noalias", builder.getUnitAttr());
+    }
+
+    auto* entry = func.addEntryBlock();
+    builder.setInsertionPointToStart(entry);
+
+    std::vector<mlir::Value> memrefs;
+    for (size_t i = 0; i < num_inputs + 1; ++i) {
+        memrefs.push_back(entry->getArgument(static_cast<unsigned>(i)));
+    }
+    mlir::Value out_memref = memrefs.back();
+
+    std::vector<mlir::AffineMap> indexingMaps;
+    indexingMaps.reserve(num_inputs + 1);
+    
+    if (num_inputs == 1) {
+        indexingMaps.push_back(mlir::AffineMap::getMultiDimIdentityMap(static_cast<unsigned>(rank), &context));
+    } else {
+        indexingMaps.push_back(getBroadcastMap(builder, context, rank, padded_lhs));
+        indexingMaps.push_back(getBroadcastMap(builder, context, rank, padded_rhs));
+    }
+    indexingMaps.push_back(mlir::AffineMap::getMultiDimIdentityMap(static_cast<unsigned>(rank), &context));
+
+    std::vector<mlir::utils::IteratorType> iteratorTypes(rank, mlir::utils::IteratorType::parallel);
+
+    mlir::ImplicitLocOpBuilder iBuilder(loc, builder);
+    std::vector<mlir::Value> inputs(memrefs.begin(), memrefs.end() - 1);
+
+    iBuilder.create<mlir::linalg::GenericOp>(
+        mlir::TypeRange{},
+        mlir::ValueRange{inputs},
+        mlir::ValueRange{out_memref},
+        indexingMaps,
+        iteratorTypes,
+        [&](mlir::OpBuilder& b, mlir::Location regionLoc, mlir::ValueRange args) {
+            mlir::Value result;
+            switch (op) {
+            case ElementwiseOp::ReLU: {
+                mlir::Value in_val = args[0];
+                mlir::Value zero = b.create<mlir::arith::ConstantFloatOp>(
+                    regionLoc, f32Type, llvm::APFloat(0.0f));
+                result = b.create<mlir::arith::MaxNumFOp>(regionLoc, in_val, zero);
+                break;
+            }
+            case ElementwiseOp::Sigmoid: {
+                mlir::Value x = args[0];
+                mlir::Value neg_x = b.create<mlir::arith::NegFOp>(regionLoc, x);
+                mlir::Value exp_neg_x = b.create<mlir::math::ExpOp>(regionLoc, neg_x);
+                mlir::Value one = b.create<mlir::arith::ConstantFloatOp>(
+                    regionLoc, f32Type, llvm::APFloat(1.0f));
+                mlir::Value denom = b.create<mlir::arith::AddFOp>(regionLoc, one, exp_neg_x);
+                result = b.create<mlir::arith::DivFOp>(regionLoc, one, denom);
+                break;
+            }
+            case ElementwiseOp::Tanh:
+                result = b.create<mlir::math::TanhOp>(regionLoc, args[0]);
+                break;
+            case ElementwiseOp::Exp:
+                result = b.create<mlir::math::ExpOp>(regionLoc, args[0]);
+                break;
+            case ElementwiseOp::Log:
+                result = b.create<mlir::math::LogOp>(regionLoc, args[0]);
+                break;
+            case ElementwiseOp::Add:
+                result = b.create<mlir::arith::AddFOp>(regionLoc, args[0], args[1]);
+                break;
+            case ElementwiseOp::Sub:
+                result = b.create<mlir::arith::SubFOp>(regionLoc, args[0], args[1]);
+                break;
+            case ElementwiseOp::Mul:
+                result = b.create<mlir::arith::MulFOp>(regionLoc, args[0], args[1]);
+                break;
+            }
+            b.create<mlir::linalg::YieldOp>(regionLoc, mlir::ValueRange{result});
+        });
+
+    builder.create<mlir::func::ReturnOp>(loc);
+    return module;
+}
+
+static std::vector<int64_t> computeContiguousStrides(const std::vector<size_t>& shape) {
+    if (shape.empty()) return {};
+    size_t rank = shape.size();
+    std::vector<int64_t> strides(rank, 1);
+    for (int i = (int)rank - 2; i >= 0; --i) {
+        strides[i] = strides[i + 1] * static_cast<int64_t>(shape[i + 1]);
+    }
+    return strides;
+}
+
+struct DynMemRefDesc {
+    float* allocated;
+    float* aligned;
+    int64_t offset;
+    int64_t sizes[6];
+    int64_t strides[6];
+    int64_t rank;
+};
+
+static void appendDynMemRefDescArgs(DynMemRefDesc& desc, void** args, int& idx) {
+    args[idx++] = const_cast<float**>(&desc.allocated);
+    args[idx++] = const_cast<float**>(&desc.aligned);
+    args[idx++] = const_cast<int64_t*>(&desc.offset);
+    for (int64_t i = 0; i < desc.rank; ++i) {
+        args[idx++] = const_cast<int64_t*>(&desc.sizes[i]);
+    }
+    for (int64_t i = 0; i < desc.rank; ++i) {
+        args[idx++] = const_cast<int64_t*>(&desc.strides[i]);
+    }
+}
+
+static DynMemRefDesc makeDynMemRefDesc(float* ptr, const std::vector<size_t>& shape, const std::vector<int64_t>& strides) {
+    DynMemRefDesc desc;
+    desc.allocated = ptr;
+    desc.aligned = ptr;
+    desc.offset = 0;
+    desc.rank = static_cast<int64_t>(shape.size());
+    for (size_t i = 0; i < shape.size() && i < 6; ++i) {
+        desc.sizes[i] = static_cast<int64_t>(shape[i]);
+        desc.strides[i] = strides[i];
+    }
+    return desc;
+}
+
+struct LinalgBroadcastingKernel::Impl {
+    mlir::DialectRegistry registry;
+    mlir::MLIRContext context;
+    mlir::OwningOpRef<mlir::ModuleOp> heldModule;
+    std::function<std::unique_ptr<llvm::Module>(mlir::Operation*, llvm::LLVMContext&)> aotBuilder;
+    std::unique_ptr<mlir::ExecutionEngine> engine;
+
+    Impl() : context(registry) {
+        registry.insert<mlir::arith::ArithDialect>();
+        registry.insert<mlir::math::MathDialect>();
+        registry.insert<mlir::scf::SCFDialect>();
+        registry.insert<mlir::func::FuncDialect>();
+        registry.insert<mlir::memref::MemRefDialect>();
+        registry.insert<mlir::LLVM::LLVMDialect>();
+        registry.insert<mlir::linalg::LinalgDialect>();
+        mlir::registerBuiltinDialectTranslation(registry);
+        mlir::registerLLVMDialectTranslation(registry);
+        context.appendDialectRegistry(registry);
+        context.loadAllAvailableDialects();
+    }
+};
+
+LinalgBroadcastingKernel::LinalgBroadcastingKernel(ElementwiseOp op, int opt_level,
+                                                   const std::vector<size_t>& lhs_shape,
+                                                   const std::vector<size_t>& rhs_shape,
+                                                   const std::vector<size_t>& out_shape)
+    : impl_(std::make_unique<Impl>()), op_(op), num_inputs_(elementwiseOpNumInputs(op)),
+      lhs_shape_(lhs_shape), rhs_shape_(rhs_shape), out_shape_(out_shape) {
+
+    impl_->heldModule = buildLinalgBroadcastingModule(impl_->context, op_, num_inputs_,
+                                                      lhs_shape_, rhs_shape_, out_shape_);
+    mlir::ModuleOp module = *impl_->heldModule;
+    applyLinalgLoweringPipeline(module);
+
+    std::string cache_graph = std::string("linalg_broadcast_") + elementwiseOpName(op_)
+                              + "_ol" + std::to_string(opt_level) + "_";
+    for (size_t d : lhs_shape) cache_graph += std::to_string(d) + "x";
+    cache_graph += "_";
+    for (size_t d : rhs_shape) cache_graph += std::to_string(d) + "x";
+    cache_graph += "_";
+    for (size_t d : out_shape) cache_graph += std::to_string(d) + "x";
+
+    impl_->engine = createEngine(module, opt_level, cache_graph, impl_->aotBuilder);
+    if (!impl_->engine->lookup("c3_kernel")) {
+        throw std::runtime_error("LinalgBroadcastingKernel: lookup c3_kernel failed");
+    }
+}
+
+LinalgBroadcastingKernel::~LinalgBroadcastingKernel() = default;
+LinalgBroadcastingKernel::LinalgBroadcastingKernel(LinalgBroadcastingKernel&&) noexcept = default;
+LinalgBroadcastingKernel& LinalgBroadcastingKernel::operator=(LinalgBroadcastingKernel&&) noexcept = default;
+
+void LinalgBroadcastingKernel::execute(const float* const* in_ptrs, float* out_ptr,
+                                       const std::vector<size_t>& lhs_shape,
+                                       const std::vector<size_t>& rhs_shape,
+                                       const std::vector<size_t>& out_shape) const {
+    size_t rank = out_shape.size();
+    std::vector<size_t> padded_lhs = lhs_shape;
+    std::vector<size_t> padded_rhs = rhs_shape;
+    while (padded_lhs.size() < rank) padded_lhs.insert(padded_lhs.begin(), 1);
+    while (padded_rhs.size() < rank) padded_rhs.insert(padded_rhs.begin(), 1);
+
+    std::vector<int64_t> lhs_strides = computeContiguousStrides(padded_lhs);
+    std::vector<int64_t> rhs_strides = computeContiguousStrides(padded_rhs);
+    std::vector<int64_t> out_strides = computeContiguousStrides(out_shape);
+
+    DynMemRefDesc descs[3];
+    void* args[64];
+    int arg_idx = 0;
+
+    if (num_inputs_ == 1) {
+        descs[0] = makeDynMemRefDesc(const_cast<float*>(in_ptrs[0]), out_shape, out_strides);
+        appendDynMemRefDescArgs(descs[0], args, arg_idx);
+    } else {
+        descs[0] = makeDynMemRefDesc(const_cast<float*>(in_ptrs[0]), padded_lhs, lhs_strides);
+        appendDynMemRefDescArgs(descs[0], args, arg_idx);
+
+        descs[1] = makeDynMemRefDesc(const_cast<float*>(in_ptrs[1]), padded_rhs, rhs_strides);
+        appendDynMemRefDescArgs(descs[1], args, arg_idx);
+    }
+
+    descs[num_inputs_] = makeDynMemRefDesc(out_ptr, out_shape, out_strides);
+    appendDynMemRefDescArgs(descs[num_inputs_], args, arg_idx);
+
+    auto err = impl_->engine->invokePacked("c3_kernel", args);
+    if (err) {
+        throw std::runtime_error("LinalgBroadcastingKernel: invokePacked failed: "
+                                 + llvm::toString(std::move(err)));
+    }
+}
+
+std::shared_ptr<LinalgBroadcastingKernel> getCachedLinalgBroadcastKernel(
+    ElementwiseOp op, int opt_level,
+    const std::vector<size_t>& lhs_shape,
+    const std::vector<size_t>& rhs_shape,
+    const std::vector<size_t>& out_shape) {
+    
+    static const bool cache_disabled = [] {
+        const char* v = std::getenv("C3_LINALG_CACHE");
+        return v != nullptr && std::string(v) == "0";
+    }();
+    if (cache_disabled) {
+        return std::make_shared<LinalgBroadcastingKernel>(op, opt_level, lhs_shape, rhs_shape, out_shape);
+    }
+
+    static std::mutex cache_mutex;
+    static std::unordered_map<std::string, std::weak_ptr<LinalgBroadcastingKernel>> cache;
+
+    std::string key = std::string(elementwiseOpName(op)) + "_" + std::to_string(opt_level) + "_";
+    for (size_t d : lhs_shape) key += std::to_string(d) + "x";
+    key += "_";
+    for (size_t d : rhs_shape) key += std::to_string(d) + "x";
+    key += "_";
+    for (size_t d : out_shape) key += std::to_string(d) + "x";
+
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        if (auto sp = it->second.lock()) {
+            return sp;
+        }
+        cache.erase(it);
+    }
+
+    auto kernel = std::make_shared<LinalgBroadcastingKernel>(op, opt_level, lhs_shape, rhs_shape, out_shape);
+    cache[key] = kernel;
+    return kernel;
+}
+
 } // namespace c3
 } // namespace ct

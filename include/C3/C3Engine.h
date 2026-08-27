@@ -639,6 +639,16 @@ private:
     std::unique_ptr<EngineState> state_;
 };
 
+/// [MIMO 深挖] MultiNodeCompiledKernel::execute 的 setup(收集输入指针/输出分配/Tensor 构造)
+/// 与 func_(cargo GEMM + epilogue) 分桶累计。setup 与执行分离判定 MIMO 非 cargo 开销归属。
+struct MultiNodeExecTiming {
+    uint64_t setup_us = 0;  ///< execute 中非 func_ 部分（输入指针收集 + flat 输出分配 + 输出 Tensor 构造）
+    uint64_t func_us = 0;   ///< func_ 调用（cargo：GEMM + 激活 epilogue）
+    uint64_t calls = 0;     ///< MultiNode execute 调用次数
+};
+/// 读取多节点 kernel 执行分桶计时（自上次查询并累计，跨模块只读）。
+MultiNodeExecTiming getMultiNodeExecTiming();
+
 } // namespace c3
 } // namespace ct
 

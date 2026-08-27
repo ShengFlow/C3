@@ -198,6 +198,11 @@ public:
         size_t fusion_compile_count = 0; ///< 融合编译次数
         size_t fusion_hit_count = 0;    ///< 融合执行命中次数
         size_t fusion_miss_count = 0;   ///< 融合尝试未命中次数
+        size_t mimo_compile_count = 0;  ///< MIMO(ReLU/Add/MatMul 反向融合)编译次数
+        size_t mimo_hit_count = 0;      ///< MIMO 执行命中次数
+        size_t mimo_miss_count = 0;     ///< MIMO 尝试未命中(无已编译 kernel)次数
+        uint64_t mimo_exec_us = 0;      ///< MIMO kernel->execute() 累计耗时(us)
+        uint64_t mimo_keybuild_us = 0;  ///< MIMO cache key 字符串构建累计耗时(us)
     };
 
     Stats getStats() const;
@@ -500,6 +505,11 @@ private:
     // ======================= 统计字段新增 =======================
     size_t fusion_hit_count_ = 0;
     size_t fusion_miss_count_ = 0;
+    size_t mimo_compile_count_ = 0; ///< MIMO 编译次数
+    size_t mimo_hit_count_ = 0;     ///< MIMO 执行命中次数
+    size_t mimo_miss_count_ = 0;    ///< MIMO 尝试未命中次数
+    uint64_t mimo_exec_ns_ = 0;     ///< MIMO kernel->execute() 累计耗时(ns, stats_mutex_ 保护)
+    uint64_t mimo_keybuild_ns_ = 0; ///< MIMO cache key 构建累计耗时(ns, stats_mutex_ 保护)
 };
 
 } // namespace c3

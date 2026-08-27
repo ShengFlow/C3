@@ -129,6 +129,25 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteBackward(
                 std::lock_guard<std::mutex> lock(stats_mutex_);
                 cache_miss_count_++;
             }
+            // [reverse-fusion 诊断] C3_BW_MISS_TRACE=1：打印每个首次出现的未命中节点 key，
+            // 用于定位剩下仍未纳入反向融合的 backward 节点（避免逐 batch 刷屏）。
+            static const bool miss_trace = [] {
+                const char* e = std::getenv("C3_BW_MISS_TRACE");
+                return e && std::string(e) == "1";
+            }();
+            if (miss_trace) {
+                static std::mutex mt_mu;
+                static std::unordered_set<size_t> mt_seen;
+                size_t kh = std::hash<std::string>{}(base_key + "|in:" + std::to_string(i));
+                bool first = false;
+                {
+                    std::lock_guard<std::mutex> mk(mt_mu);
+                    first = mt_seen.insert(kh).second;
+                }
+                if (first)
+                    fprintf(stderr, "[BW-MISS] key=%s\n",
+                            (base_key + "|in:" + std::to_string(i)).c_str());
+            }
             compileBackwardAsyncForInput(node, grad, i);
             return std::nullopt;
         }
@@ -509,6 +528,11 @@ C3BackwardCapture::Stats C3BackwardCapture::getStats() const {
     s.fusion_compile_count = fusion_compile_count_;
     s.fusion_hit_count = fusion_hit_count_;
     s.fusion_miss_count = fusion_miss_count_;
+    s.mimo_compile_count = mimo_compile_count_;
+    s.mimo_hit_count = mimo_hit_count_;
+    s.mimo_miss_count = mimo_miss_count_;
+    s.mimo_exec_us = mimo_exec_ns_ / 1000;
+    s.mimo_keybuild_us = mimo_keybuild_ns_ / 1000;
     return s;
 }
 
@@ -1776,6 +1800,7 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteUnifiedMIMOBackw
     const Tensor& W = matmul_node->getInputs()[1];
 
     // 构建 MIMO cache key
+    auto t_key0 = std::chrono::steady_clock::now();
     std::stringstream ss;
     ss << "mimo_backward_" << current_type << "|g:";
     for (auto s : grad.sizes()) ss << s << ",";
@@ -1786,12 +1811,42 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteUnifiedMIMOBackw
     ss << "|w:";
     for (auto s : W.sizes()) ss << s << ",";
     std::string mimo_key = ss.str();
+    {
+        std::lock_guard<std::mutex> klock(stats_mutex_);
+        mimo_keybuild_ns_ += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t_key0).count());
+    }
 
     // 检查是否有已编译的 JIT kernel
     auto& registry = C3KernelRegistry::getInstance();
     if (registry.hasBackwardKey(mimo_key)) {
+        // [mimo_exec_us] 默认为 True
+        // [主坑定位] C3_MIMO_TRACE=1：量化反向输入 data_read/物化 是否为大头
+        //   mn_setup 全 MultiNode 仅 ~3µs/call，应反证 data_read 不物化；实测定音。
+        if (const char* mt = std::getenv("C3_MIMO_TRACE")) {
+            (void)mt;
+            static int mt_cnt = 0;
+            if (mt_cnt < 8) { mt_cnt++;
+                auto t0r = std::chrono::steady_clock::now();
+                (void)z.data_read<float>();
+                (void)X.data_read<float>();
+                (void)W.data_read<float>();
+                auto dns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - t0r).count();
+                auto lmz = z.lazyMaterializer();
+                auto lmx = X.lazyMaterializer();
+                auto lmw = W.lazyMaterializer();
+                fprintf(stderr, "[MIMO-TRACE] z_lazy=%p x_lazy=%p w_lazy=%p data_read_us=%.2f\n",
+                        (void*)(lmz ? lmz.get() : nullptr),
+                        (void*)(lmx ? lmx.get() : nullptr),
+                        (void*)(lmw ? lmw.get() : nullptr),
+                        dns / 1000.0);
+            }
+        }
         // 收集输入：[z, X, W]，不重复包含 grad，配合 fwd_input_map {0, 1, 2}
         std::vector<Tensor> inputs = {z, X, W};
+        auto t_exec0 = std::chrono::steady_clock::now();
         auto result = registry.tryExecuteBackward(mimo_key, grad, inputs);
         if (result.has_value() && result->size() == 4) {
             // result[0]: grad_z, result[1]: grad_W, result[2]: grad_X, result[3]: grad_b
@@ -1799,6 +1854,13 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteUnifiedMIMOBackw
             Tensor grad_W = std::move((*result)[1]);
             Tensor grad_X = std::move((*result)[2]);
             Tensor grad_b = std::move((*result)[3]);
+            {
+                std::lock_guard<std::mutex> slock(stats_mutex_);
+                mimo_hit_count_++;
+                mimo_exec_ns_ += static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - t_exec0).count());
+            }
 
             // 存入 pending_mimo_intercepted_
             {
@@ -1825,6 +1887,10 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteUnifiedMIMOBackw
     TensorDesc x_desc = TensorDesc::fromShape(X.sizes());
     TensorDesc w_desc = TensorDesc::fromShape(W.sizes());
     compileUnifiedMIMOBackwardAsync(node, add_node, matmul_node, grad_desc, z_desc, x_desc, w_desc);
+    {
+        std::lock_guard<std::mutex> slock(stats_mutex_);
+        mimo_miss_count_++;
+    }
 
     return std::nullopt;
 }
@@ -1854,6 +1920,11 @@ void C3BackwardCapture::compileUnifiedMIMOBackwardAsync(
         }
         pending_compiles_[mimo_key] = true;
     }
+    {
+        std::lock_guard<std::mutex> slock(stats_mutex_);
+        mimo_compile_count_++;
+    }
+    std::string compile_err = "";
 
     std::thread([this, current_type, mimo_key, grad_desc, z_desc, x_desc, w_desc]() {
         try {
@@ -1919,6 +1990,18 @@ void C3BackwardCapture::compileUnifiedMIMOBackwardAsync(
             #ifdef CT_DEBUG
             std::cerr << "[MIMO-COMPILE-ERR] compile unified backward layer failed: " << e.what() << std::endl;
             #endif
+            // 诊断：非 debug 构建也暴露一次编译根因，便于定位 MIMO 未命中的原因
+            {
+                static std::mutex err_mu;
+                std::lock_guard<std::mutex> ek(err_mu);
+                static std::hash<std::string> h;
+                static std::unordered_set<size_t> seen;
+                size_t kh = h(std::string(e.what()) + "|" + mimo_key);
+                if (seen.insert(kh).second) {
+                    fprintf(stderr, "[MIMO-COMPILE-ERR] key=%s err=%s\n",
+                            mimo_key.c_str(), e.what());
+                }
+            }
         }
 
         {

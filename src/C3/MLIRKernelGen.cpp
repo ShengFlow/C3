@@ -753,6 +753,19 @@ static void buildFusedMultiNode(mlir::OpBuilder& builder, mlir::Location loc,
                         b.create<mlir::scf::YieldOp>(loc, div_result);
                         b.setInsertionPointAfter(div_if);
                         result = div_if.getResult(0);
+                    } else if constexpr (std::is_same_v<T, GtNode>) {
+                        if (op_idx > 0) { lhs = prev_val; rhs = loadExternal(ext_inputs[0]); }
+                        else { lhs = loadExternal(ext_inputs[0]); rhs = loadExternal(ext_inputs[1]); }
+                        mlir::Value zero_v = mlir::arith::ConstantFloatOp::create(b, loc, f32, llvm::APFloat(0.0f));
+                        mlir::Value one_v = mlir::arith::ConstantFloatOp::create(b, loc, f32, llvm::APFloat(1.0f));
+                        auto cmp = b.create<mlir::arith::CmpFOp>(loc, mlir::arith::CmpFPredicate::OGT, lhs, rhs);
+                        result = b.create<mlir::arith::SelectOp>(loc, cmp, one_v, zero_v);
+                    } else if constexpr (std::is_same_v<T, ExpNode>) {
+                        lhs = (op_idx > 0) ? prev_val : loadExternal(ext_inputs[0]);
+                        result = b.create<mlir::math::ExpOp>(loc, lhs);
+                    } else if constexpr (std::is_same_v<T, LogNode>) {
+                        lhs = (op_idx > 0) ? prev_val : loadExternal(ext_inputs[0]);
+                        result = b.create<mlir::math::LogOp>(loc, lhs);
                     }
                     (void)result;
                 }, op);
@@ -835,27 +848,29 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
         }
     }
 
+    // 输出段的索引必须与 graph.outputs() 顺序一致（output_offsets 严格按该顺序累加），
+    // 而非 compute 拓扑序。多输出场景（如 region 融合暴露 MatMul preAct 作为第 2 输出）下，
+    // 新增的输出节点可能在 compute 序中早于主输出；若按 compute 序赋段，
+    // 会产生与 output_offsets / MultiNodeCompiledKernel out_shapes 的错位。
     auto assign_output_mlir = [&](size_t node_id) {
         if (output_index.count(node_id)) return; // 去重
         const size_t seg = output_index.size();
         output_index[node_id] = seg;
         node_to_buffer[node_id] = SIZE_MAX;
     };
+    // 第一步：按 graph.outputs() 顺序为所有显式输出节点分配输出段
+    for (size_t out_id : outputs) {
+        assign_output_mlir(out_id);
+    }
+    // 安全网：确保最后一个计算节点总是输出（不在显式 outputs 中时追加为独立段）
+    assign_output_mlir(compute_nodes.back()->id);
+    // 第二步：剩余计算节点作为中间 buffer
     for (size_t i = 0; i < compute_nodes.size(); ++i) {
         size_t node_id = compute_nodes[i]->id;
-        bool is_output = false;
-        for (size_t out_id : outputs) {
-            if (node_id == out_id) { is_output = true; break; }
-        }
-        if (is_output) {
-            assign_output_mlir(node_id);
-        } else {
-            node_to_buffer[node_id] = num_intermediates++;
-            buffer_numels.push_back(compute_nodes[i]->out_desc.numel);
-        }
+        if (output_index.count(node_id)) continue;
+        node_to_buffer[node_id] = num_intermediates++;
+        buffer_numels.push_back(compute_nodes[i]->out_desc.numel);
     }
-    // 安全网：确保最后一个计算节点总是输出
-    assign_output_mlir(compute_nodes.back()->id);
 
     // 确定 elem_n（最大输出元素数，作为多输出平面偏移的步长）
     size_t elem_n = 0;
@@ -1000,8 +1015,156 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
     };
 
     // 步骤 6: 生成每个计算节点的 MLIR 代码
+    // [MIMO epilogue bug 修复] 预扫描：被 MatMul「转置折叠」吸收的 TransposeNode 不再生成转置循环。
+    // 此前折叠只给 cblas 设 transA/transB=112，但 TransposeNode 仍被单独生成显式转置拷贝循环
+    // （X^T 100352 + W^T 200704 元素写入 scratch），而 cblas 实际走 trans 直读根本不用这批数据，
+    // → 每次 MIMO call 白拷 ~300K 元素死数据（LLVM 因外部 cblas 副作用无法 DCE），即历次 ~100ms 主坑。
+    // [守卫] 仅跳过「非图输出 && 单消费者」的 Transpose：若它同时被别的节点消费，或本身需输出，
+    //   保留生成（MatMul 仍走 trans 折叠，但该 Transpose 副产出仍要物化给其他消费者），避免破坏正确性。
+    std::unordered_map<size_t, int> in_consumer_count;
+    for (const Node* n : compute_nodes)
+        for (size_t in : n->inputs) in_consumer_count[in]++;
+    std::set<size_t> trans_folded_skip;
+    for (const Node* n : compute_nodes) {
+        if (std::holds_alternative<MatMulNode>(n->op) && n->inputs.size() >= 2) {
+            for (size_t side = 0; side < 2; ++side) {
+                size_t in_id = n->inputs[side];
+                for (const auto& gn : nodes) {
+                    if (gn.id == in_id && std::holds_alternative<TransposeNode>(gn.op)) {
+                        bool single_consumer = (in_consumer_count[in_id] == 1);
+                        bool is_output = (output_index.count(in_id) > 0);
+                        if (single_consumer && !is_output) trans_folded_skip.insert(in_id);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    // [治理 2026-08-26] 普通图 elementwise 链融合（复用 FusedNode 生成机制）：
+    // 连续相邻、均为可融合逐元素算子、同 numel、严格线性(input[0]=prev)、中间节点单消费
+    // 的 elementwise 子序列，在生成层合并为单条 buildFusedMultiNode* 链，消除每节点
+    // 独立 loop + 中间 buffer 往返（串行多 pass）。与 compile() 的 Graph::fuse() 语义对齐，
+    // 但不依赖 enable_fusion 标志——MIMO 反向图 enable_fusion=false（防多输出拓扑序被打乱）
+    // 无法走 Graph::fuse()，本生成层治理即覆盖该路径。
+    auto isFusableEW = [](const NodeVariant& v) -> bool {
+        // scalar buildFusedMultiNode 现补齐 Gt/Exp/Log 分支（与 vectorized 对称），
+        // 故此处可安全纳入：任意形成链的算子都有 scalar 与 vectorized 两套完整求值。
+        // 覆盖 MIMO 反向 ReLU-backward 的 (z>0)*dz 即 Gt+Mul 链。
+        return std::holds_alternative<AddNode>(v) || std::holds_alternative<SubNode>(v) ||
+               std::holds_alternative<MulNode>(v) || std::holds_alternative<DivNode>(v) ||
+               std::holds_alternative<NegNode>(v) || std::holds_alternative<ReLUNode>(v) ||
+               std::holds_alternative<SigmoidNode>(v) || std::holds_alternative<TanhNode>(v) ||
+               std::holds_alternative<GtNode>(v) || std::holds_alternative<ExpNode>(v) ||
+               std::holds_alternative<LogNode>(v);
+    };
+    // ew_chain_len[i] = 以节点 i 起可融合链长度（>=2 生效；=1 表示不参与/打断点）
+    std::vector<size_t> ew_chain_len(compute_nodes.size(), 1);
+    for (size_t i = 0; i < compute_nodes.size(); ) {
+        if (!isFusableEW(compute_nodes[i]->op)) { ++i; continue; }
+        size_t j = i;
+        while (j + 1 < compute_nodes.size() &&
+               isFusableEW(compute_nodes[j + 1]->op) &&
+               compute_nodes[j]->out_desc.numel == compute_nodes[j + 1]->out_desc.numel &&
+               compute_nodes[j + 1]->inputs.size() >= 1 &&
+               compute_nodes[j + 1]->inputs[0] == compute_nodes[j]->id &&
+               in_consumer_count[compute_nodes[j]->id] == 1) {
+            ++j;
+        }
+        size_t len = j - i + 1;
+        if (len >= 2) {
+            // 链内非末节点不能是图输出段（输出段语义不可被覆盖）
+            bool chain_ok = true;
+            for (size_t k = i; k < j; ++k) {
+                if (output_index.count(compute_nodes[k]->id)) { chain_ok = false; break; }
+            }
+            if (chain_ok) {
+                for (size_t k = i; k <= j; ++k) ew_chain_len[k] = (k == i) ? len : 0;
+            }
+        }
+        i = j + 1;
+    }
+
+    // 实验开关 C3_EW_CHAIN_FUSION=1 开启生成层 elementwise 链融合（默认关闭）。
+    // 实测（MNIST 5ep，Gt/Exp/Log 补齐后）开启≈关闭（264.65 vs 264.72ms/epoch），
+    // 因 MIMO 多输出反向图里链检测匹配不到可融合链 → 无收益。故默认关闭保持原行为，
+    // 保留此实验开关以备在有真正线性 elementwise 链的模型上二次验证。
+    static const bool ew_chain_fusion_on = [] {
+        const char* v = std::getenv("C3_EW_CHAIN_FUSION");
+        return v != nullptr && std::string(v) == "1";
+    }();
+
     for (size_t ci = 0; ci < compute_nodes.size(); ++ci) {
         const Node* node = compute_nodes[ci];
+        // 已被 MatMul 转置折叠吸收 → 跳过，不再生成死转置循环（数值不变：cblas 用 transA/B=112 直读原输入）
+        if (trans_folded_skip.count(node->id)) continue;
+
+        // ==== elementwise 链融合（复用 FusedNode 生成机制；实验开关默认关）====
+        if (ew_chain_fusion_on && ew_chain_len[ci] >= 2) {
+            const size_t len = ew_chain_len[ci];
+            const Node* last = compute_nodes[ci + len - 1];
+
+            // 收集链内成员 id
+            std::set<size_t> chain_ids;
+            for (size_t k = 0; k < len; ++k) chain_ids.insert(compute_nodes[ci + k]->id);
+
+            // ops / op_inputs（严格线性：op[k].inputs[0] = 前一成员 id）
+            std::vector<NodeVariant> ops;
+            std::vector<std::vector<size_t>> op_inputs;
+            std::set<size_t> arg_set;
+            for (size_t k = 0; k < len; ++k) {
+                const Node* cn = compute_nodes[ci + k];
+                ops.push_back(cn->op);
+                op_inputs.push_back(cn->inputs);
+                for (size_t in_id : cn->inputs) {
+                    if (!chain_ids.count(in_id)) arg_set.insert(in_id);
+                }
+            }
+            std::vector<size_t> arg_ids(arg_set.begin(), arg_set.end());
+            std::unordered_map<size_t, mlir::Value> ew_arg_ptrs;
+            std::unordered_map<size_t, int64_t> ew_arg_numels;
+            for (size_t aid : arg_ids) {
+                ew_arg_ptrs[aid] = getInputPtr(aid);
+                ew_arg_numels[aid] = (int64_t)graph.node(aid).out_desc.numel;
+            }
+
+            // 链末节点输出 buffer（复用主循环 out_buf 语义）
+            mlir::Value ew_out;
+            {
+                auto oci = output_index.find(last->id);
+                if (oci != output_index.end()) {
+                    size_t seg = oci->second;
+                    if (seg == 0) ew_out = out_ptr;
+                    else {
+                        mlir::Value off = builder.create<mlir::arith::ConstantIntOp>(
+                            loc, (int64_t)output_offsets[seg], 64);
+                        ew_out = builder.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, out_ptr, mlir::ValueRange{off});
+                    }
+                } else {
+                    auto rit = node_buffer_reuse.find(last->id);
+                    if (rit != node_buffer_reuse.end()) {
+                        size_t pi = logical_to_pool[rit->second];
+                        ew_out = (pi < tmp_buffers.size()) ? tmp_buffers[pi] : out_ptr;
+                    } else {
+                        size_t li = node_to_buffer.at(last->id);
+                        size_t pi = logical_to_pool[li];
+                        ew_out = (pi < tmp_buffers.size()) ? tmp_buffers[pi] : out_ptr;
+                    }
+                }
+            }
+
+            int64_t last_numel = (int64_t)last->out_desc.numel;
+            auto last_numel_c = builder.create<mlir::arith::ConstantIntOp>(loc, last_numel, 64);
+            auto fn_n = builder.create<mlir::arith::MinSIOp>(loc, last_numel_c, n_val);
+            if (isFusedChainVectorizable(ops, op_inputs, ew_arg_numels, (size_t)last_numel)) {
+                buildFusedMultiNodeVectorized(builder, loc, ew_out, fn_n, ops, op_inputs,
+                                              arg_ids, ew_arg_ptrs, ew_arg_numels);
+            } else {
+                buildFusedMultiNode(builder, loc, ew_out, fn_n, ops, op_inputs,
+                                    arg_ids, ew_arg_ptrs, ew_arg_numels);
+            }
+            ci += len - 1;
+            continue;
+        }
         // 确定输出 buffer：输出节点 → 写入 output 平面 buffer 对应段（output_index * elem_n）；
         //   否则写中间 tmp buffer（优先原地复用）。
         mlir::Value out_buf;
@@ -1199,8 +1362,22 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
             auto& tile = currentTileCache();
             int64_t tile_m = (tile.tile_m > 0) ? tile.tile_m : kDefaultTileM;
             int64_t tile_n = (tile.tile_n > 0) ? tile.tile_n : kDefaultTileN;
+
+            // [Prewalk A] 可选 pre-activation 中间值输出（第 2 输出段）：
+            // 当 MatMul 节点同时被标记为额外输出（非主输出段）时，把 preAct 指针接到
+            // 对应输出段（output_index 段号由 graph.outputs() 顺序对齐，见输出分配注释）。
+            // 主输出段（seg==0，即 MatMul 自身是最终结果）时 preAct 与 out 互斥，不接线。
+            mlir::Value pre_act_ptr = nullptr;
+            auto mm_oci = output_index.find(node->id);
+            if (mm_oci != output_index.end() && mm_oci->second != 0 &&
+                mm_oci->second < output_offsets.size()) {
+                mlir::Value seg_off = builder.create<mlir::arith::ConstantIntOp>(
+                    loc, (int64_t)output_offsets[mm_oci->second], 64);
+                pre_act_ptr = builder.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, out_ptr,
+                                                                mlir::ValueRange{seg_off});
+            }
             builder.create<mlir::c3::MatMulOp>(loc, matmul_a_ptr, matmul_b_ptr, out_buf,
-                                               fused_bias_ptr,
+                                               fused_bias_ptr, pre_act_ptr,
                                                matM, matK, matN,
                                                transA, transB, (int)fused_act,
                                                tile_m, tile_n, (int64_t)fused_bias_numel);
@@ -1328,6 +1505,9 @@ static bool tryBuildLinalgElementwise(const Graph& graph, GeneratedKernel& out, 
         return -1;                                  // 其余多维/不支持广播
     };
 
+    bool is_broadcasting = false;
+    std::vector<size_t> lhs_shape, rhs_shape, out_shape;
+
     if (std::holds_alternative<ReLUNode>(op)) {
         eop = ElementwiseOp::ReLU;
     } else if (std::holds_alternative<SigmoidNode>(op)) {
@@ -1341,19 +1521,73 @@ static bool tryBuildLinalgElementwise(const Graph& graph, GeneratedKernel& out, 
     } else if (std::holds_alternative<AddNode>(op)) {
         eop = ElementwiseOp::Add;
         rhs_mod = computeRhsMod(op);
-        if (rhs_mod < 0) eligible = false;
+        if (rhs_mod < 0) {
+            // 检查是否为支持的多维广播
+            lhs_shape = std::get<AddNode>(op).lhs_desc.shape;
+            rhs_shape = std::get<AddNode>(op).rhs_desc.shape;
+            out_shape = compute_node->out_desc.shape;
+            if (!lhs_shape.empty() && !rhs_shape.empty() && !out_shape.empty()) {
+                is_broadcasting = true;
+                eligible = true;
+            } else {
+                eligible = false;
+            }
+        }
     } else if (std::holds_alternative<SubNode>(op)) {
         eop = ElementwiseOp::Sub;
         rhs_mod = computeRhsMod(op);
-        if (rhs_mod < 0) eligible = false;
+        if (rhs_mod < 0) {
+            lhs_shape = std::get<SubNode>(op).lhs_desc.shape;
+            rhs_shape = std::get<SubNode>(op).rhs_desc.shape;
+            out_shape = compute_node->out_desc.shape;
+            if (!lhs_shape.empty() && !rhs_shape.empty() && !out_shape.empty()) {
+                is_broadcasting = true;
+                eligible = true;
+            } else {
+                eligible = false;
+            }
+        }
     } else if (std::holds_alternative<MulNode>(op)) {
         eop = ElementwiseOp::Mul;
         rhs_mod = computeRhsMod(op);
-        if (rhs_mod < 0) eligible = false;
+        if (rhs_mod < 0) {
+            lhs_shape = std::get<MulNode>(op).lhs_desc.shape;
+            rhs_shape = std::get<MulNode>(op).rhs_desc.shape;
+            out_shape = compute_node->out_desc.shape;
+            if (!lhs_shape.empty() && !rhs_shape.empty() && !out_shape.empty()) {
+                is_broadcasting = true;
+                eligible = true;
+            } else {
+                eligible = false;
+            }
+        }
     } else {
         eligible = false;
     }
     if (!eligible) return false;
+
+    if (is_broadcasting) {
+        std::shared_ptr<LinalgBroadcastingKernel> b_kernel;
+        try {
+            b_kernel = getCachedLinalgBroadcastKernel(eop, 3, lhs_shape, rhs_shape, out_shape);
+        } catch (const std::exception& e) {
+            fprintf(stderr, "C3 linalg: broadcasting %s compile failed (%s), fallback to handwritten\n",
+                    elementwiseOpName(eop), e.what());
+            return false;
+        }
+
+        const size_t num_inputs = elementwiseOpNumInputs(eop);
+        out.func = nullptr;
+        out.func_any = [b_kernel, num_inputs, lhs_shape, rhs_shape, out_shape](
+            const float* a, const float* b, float* out_ptr,
+            size_t n, size_t, size_t, size_t) {
+            const float* in_ptrs[2] = {a, b};
+            b_kernel->execute(in_ptrs, out_ptr, lhs_shape, rhs_shape, out_shape);
+        };
+        out.is_matmul = false;
+        out.num_inputs = num_inputs;
+        return true;
+    }
 
     // 编译 linalg kernel（走共享缓存，同一 (op,opt,rhs_mod) 只 JIT 一次）；失败静默回退手写
     std::shared_ptr<LinalgElementwiseKernel> kernel;
