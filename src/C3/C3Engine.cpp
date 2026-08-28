@@ -832,6 +832,15 @@ static std::shared_ptr<CompiledKernel> doCompile(
 
 #ifdef CT_ENABLE_MLIR
         // [2026-08-15] linalg.generic 多核并行/多输出大一统路线
+        // OneShot 当前只承诺 1D flat 逐元素图。多维节点（尤其是被
+        // FusedNode 展开的 backward 图）仍可能包含专用二维 lowering，
+        // 不应进入 OneShot 的 tensor.reshape/bufferize ABI 路径。
+        const bool one_shot_compatible = [&] {
+            for (const auto& n : working_graph.nodes()) {
+                if (n.out_desc.shape.size() > 1) return false;
+            }
+            return true;
+        }();
         if (options.backend == C3Backend::MLIR && isPureElementwiseGraph(working_graph)) {
             std::vector<std::vector<size_t>> out_shapes;
             for (size_t out_id : working_graph.outputs()) {
@@ -854,12 +863,13 @@ static std::shared_ptr<CompiledKernel> doCompile(
 
             std::string cache_key = makeCacheKey(working_graph, options);
             static const bool use_oneshot = [] {
-                // JIT 3.0 (One-Shot Bufferization + Linalg Fusion) 极致优化管线默认全面开启！
-                // 仅在显式设置 C3_LINALG_ONESHOT=0 时才回退至旧版
+                // One-Shot 管线仍有部分多维广播/转换组合无法稳定通过 MLIR
+                // conversion；默认必须走已验证的常规 MLIR 管线。仅显式设置
+                // C3_LINALG_ONESHOT=1 时启用实验路径，避免训练异步编译触发崩溃。
                 const char* v = std::getenv("C3_LINALG_ONESHOT");
-                return v == nullptr || std::string(v) != "0";
+                return v != nullptr && std::string(v) == "1";
             }();
-            if (use_oneshot) {
+            if (use_oneshot && one_shot_compatible) {
                 try {
                     auto linalg_kernel = getCachedLinalgOneShotKernel(working_graph, cache_key, options.opt_level);
                     if (linalg_kernel) {

@@ -165,6 +165,8 @@ struct BinaryTensorOpLowering : public OpRewritePattern<SrcOp> {
         rhs_exprs.reserve(rhs_shape.size());
         out_exprs.reserve(rank);
 
+        if (lhs_shape.size() > rank || rhs_shape.size() > rank)
+            return rewriter.notifyMatchFailure(op, "operand rank exceeds output rank");
         size_t lhs_offset = rank - lhs_shape.size();
         size_t rhs_offset = rank - rhs_shape.size();
 
@@ -201,11 +203,16 @@ struct BinaryTensorOpLowering : public OpRewritePattern<SrcOp> {
             }
         }
 
-        std::vector<AffineMap> indexingMaps = {
-            AffineMap::get(rank, 0, lhs_exprs, ctx),
-            AffineMap::get(rank, 0, rhs_exprs, ctx),
-            AffineMap::get(rank, 0, out_exprs, ctx)
-        };
+        // AffineMap 的结果数必须严格匹配对应 tensor operand 的 rank；
+        // map 的 dim 数仍是输出 rank，用于尾部广播。
+        auto lhsMap = AffineMap::get(rank, 0, lhs_exprs, ctx);
+        auto rhsMap = AffineMap::get(rank, 0, rhs_exprs, ctx);
+        auto outMap = AffineMap::get(rank, 0, out_exprs, ctx);
+        if (lhsMap.getNumResults() != lhsTy.getRank() ||
+            rhsMap.getNumResults() != rhsTy.getRank() ||
+            outMap.getNumResults() != tensorTy.getRank())
+            return rewriter.notifyMatchFailure(op, "broadcast map rank mismatch");
+        std::vector<AffineMap> indexingMaps = {lhsMap, rhsMap, outMap};
 
         std::vector<utils::IteratorType> iterTypes(rank, utils::IteratorType::parallel);
 
@@ -364,22 +371,44 @@ struct GtTensorOpLowering : public OpRewritePattern<mlir::c3::GtTensorOp> {
         auto f32 = rewriter.getF32Type();
         auto tensorTy = mlir::cast<RankedTensorType>(dest.getType());
 
-        AffineExpr d0 = rewriter.getAffineDimExpr(0);
-        auto identityMap = AffineMap::get(1, 0, {d0}, ctx);
-        auto zeroMap = AffineMap::get(1, 0, {getAffineConstantExpr(0, ctx)}, ctx);
-        AffineMap modMap;
-        if (bmod > 1) {
-            modMap = AffineMap::get(1, 0, {d0 % getAffineConstantExpr(bmod, ctx)}, ctx);
-        }
+        // GenericOp 的迭代空间必须与 lhs/dest 的 rank 一致。旧实现固定使用
+        // rank-1 identity map；反向图中的 Gt(z, 0) 往往是二维张量，导致
+        // "operand rank (2) ... indexing_map (1)" verifier 错误。
+        const unsigned rank = static_cast<unsigned>(tensorTy.getRank());
+        if (rank == 0) return rewriter.notifyMatchFailure(op, "Gt requires a ranked tensor");
 
-        std::vector<AffineMap> indexingMaps;
-        if (bmod > 0) {
-            indexingMaps = {identityMap, bmod == 1 ? zeroMap : modMap, identityMap};
-        } else {
-            indexingMaps = {identityMap, identityMap, identityMap};
-        }
+        SmallVector<AffineExpr> dims;
+        dims.reserve(rank);
+        for (unsigned i = 0; i < rank; ++i)
+            dims.push_back(rewriter.getAffineDimExpr(i));
+        auto identityMap = AffineMap::get(rank, 0, dims, ctx);
 
-        std::vector<utils::IteratorType> iterTypes{utils::IteratorType::parallel};
+        // 每个 indexing map 的结果数必须等于对应 operand 的 rank；迭代空间
+        // 可以高于广播 operand 的 rank（例如 lhs/dest 是二维、rhs 是 [1]）。
+        auto rhsTensorTy = mlir::dyn_cast<RankedTensorType>(lhs.getType());
+        if (!rhsTensorTy) return rewriter.notifyMatchFailure(op, "Gt lhs must be ranked");
+        const unsigned lhsRank = static_cast<unsigned>(rhsTensorTy.getRank());
+        auto rhsValueTy = mlir::dyn_cast<RankedTensorType>(rhs.getType());
+        if (!rhsValueTy) return rewriter.notifyMatchFailure(op, "Gt rhs must be ranked");
+        const unsigned rhsRank = static_cast<unsigned>(rhsValueTy.getRank());
+        if (lhsRank != rank || rhsRank == 0 || rhsRank > rank)
+            return rewriter.notifyMatchFailure(op, "unsupported Gt broadcast ranks");
+
+        SmallVector<AffineExpr> rhsExprs;
+        rhsExprs.reserve(rhsRank);
+        const unsigned offset = rank - rhsRank;
+        for (unsigned i = 0; i < rhsRank; ++i)
+            rhsExprs.push_back(dims[offset + i]);
+        if (bmod == 1) {
+            // 标量广播：rhs 通常是 rank-1、长度为 1 的 tensor。
+            rhsExprs.assign(rhsRank, getAffineConstantExpr(0, ctx));
+        } else if (bmod > 1) {
+            rhsExprs.back() = rhsExprs.back() % getAffineConstantExpr(bmod, ctx);
+        }
+        auto rhsMap = AffineMap::get(rank, 0, rhsExprs, ctx);
+        std::vector<AffineMap> indexingMaps = {identityMap, rhsMap, identityMap};
+
+        std::vector<utils::IteratorType> iterTypes(rank, utils::IteratorType::parallel);
 
         auto genericOp = rewriter.create<linalg::GenericOp>(
             loc,
@@ -571,16 +600,11 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildTensorMLIRModule(mlir::MLIRContext
     };
 
     // 辅助函数：根据算子输出获取其真实多维张量类型 (静态/动态)
+    // OneShot 的 ABI 是 flat tensor/memref；纯逐元素图只依赖线性 numel，
+    // 不需要把函数参数 expand/collapse 成多维 tensor。统一使用 1D 类型可
+    // 避免 reshape bufferization 产生 unrealized_conversion_cast。
     auto getMultiDimTensorTypeForNode = [&](size_t node_id) {
-        const auto& shape = graph.node(node_id).out_desc.shape;
-        if (!use_static_shape || shape.empty()) {
-            return mlir::RankedTensorType::get({mlir::ShapedType::kDynamic}, f32);
-        }
-        std::vector<int64_t> static_shape;
-        for (size_t s : shape) {
-            static_shape.push_back(static_cast<int64_t>(s));
-        }
-        return mlir::RankedTensorType::get(static_shape, f32);
+        return getFlatTensorTypeForNode(node_id);
     };
 
     int64_t base_numel = 1;
@@ -621,19 +645,8 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildTensorMLIRModule(mlir::MLIRContext
     for (size_t i = 0; i < num_inputs; ++i) {
         size_t input_id = graph_inputs[i];
         mlir::Value flat_val = entry->getArgument(static_cast<unsigned>(i));
-        const auto& shape = graph.node(input_id).out_desc.shape;
-        if (shape.size() > 1) {
-            std::vector<int64_t> static_shape;
-            for (size_t s : shape) static_shape.push_back(static_cast<int64_t>(s));
-            auto multiTy = mlir::RankedTensorType::get(static_shape, f32);
-            mlir::ReassociationIndices indices;
-            for (size_t d = 0; d < shape.size(); ++d) indices.push_back(static_cast<int64_t>(d));
-            mlir::SmallVector<mlir::ReassociationIndices> reassociation;
-            reassociation.push_back(indices);
-            val_map[input_id] = builder.create<mlir::tensor::ExpandShapeOp>(loc, multiTy, flat_val, reassociation);
-        } else {
-            val_map[input_id] = flat_val;
-        }
+        // 内部保持 flat ABI；不要对入口参数做 tensor.expand_shape。
+        val_map[input_id] = flat_val;
     }
 
     auto createEmptyTensorOfShape = [&](const std::vector<size_t>& shape) -> mlir::Value {
@@ -675,19 +688,9 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildTensorMLIRModule(mlir::MLIRContext
         if (it != graph_outputs.end()) {
             size_t out_idx = std::distance(graph_outputs.begin(), it);
             mlir::Value flat_dest = entry->getArgument(static_cast<unsigned>(num_inputs + out_idx));
-            const auto& shape = node->out_desc.shape;
-            if (shape.size() > 1) {
-                std::vector<int64_t> static_shape;
-                for (size_t s : shape) static_shape.push_back(static_cast<int64_t>(s));
-                auto multiTy = mlir::RankedTensorType::get(static_shape, f32);
-                mlir::ReassociationIndices indices;
-                for (size_t d = 0; d < shape.size(); ++d) indices.push_back(static_cast<int64_t>(d));
-                mlir::SmallVector<mlir::ReassociationIndices> reassociation;
-                reassociation.push_back(indices);
-                dest = builder.create<mlir::tensor::ExpandShapeOp>(loc, multiTy, flat_dest, reassociation);
-            } else {
-                dest = flat_dest;
-            }
+            // 输出也直接使用 flat 参数，避免 expand_shape 在 bufferize/LLVM
+            // 边界留下无法翻译的 unrealized_conversion_cast。
+            dest = flat_dest;
         } else {
             dest = createEmptyTensorOfShape(node->out_desc.shape);
         }
@@ -880,19 +883,8 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildTensorMLIRModule(mlir::MLIRContext
     std::vector<mlir::Value> returns;
     for (size_t out_id : graph_outputs) {
         mlir::Value multi_val = val_map.at(out_id);
-        const auto& shape = graph.node(out_id).out_desc.shape;
-        if (shape.size() > 1) {
-            int64_t node_numel = static_cast<int64_t>(graph.node(out_id).out_desc.numel);
-            auto flatTy = mlir::RankedTensorType::get({node_numel}, f32);
-            mlir::ReassociationIndices indices;
-            for (size_t d = 0; d < shape.size(); ++d) indices.push_back(static_cast<int64_t>(d));
-            mlir::SmallVector<mlir::ReassociationIndices> reassociation;
-            reassociation.push_back(indices);
-            mlir::Value flat_val = builder.create<mlir::tensor::CollapseShapeOp>(loc, flatTy, multi_val, reassociation);
-            returns.push_back(flat_val);
-        } else {
-            returns.push_back(multi_val);
-        }
+        // 内部结果已经是 flat tensor，直接返回，避免 collapse_shape。
+        returns.push_back(multi_val);
     }
 
     builder.create<mlir::func::ReturnOp>(loc, returns);
