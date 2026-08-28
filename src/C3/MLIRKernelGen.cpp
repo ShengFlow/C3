@@ -361,6 +361,34 @@ static bool isFusedChainVectorizable(const std::vector<NodeVariant>& ops,
                                      const std::unordered_map<size_t, int64_t>& arg_numels,
                                      size_t n) {
     if (std::getenv("C3_MLIR_NO_VECTORIZE") != nullptr) return false;
+
+    // [Fix 2026-08-28] 严格线性链校验：buildFusedMultiNodeVectorized 假设
+    //   ① op0 的所有输入都是外部 arg；② 对 op>0，inputs[0] 是上一 op 的输出（内部节点），
+    //   其余 inputs[1:] 都是外部 arg（从 arg_ptrs 加载）。
+    // 分支 DAG（如 sigmoid(x)*tanh(x)，mul 的第二个输入是内部 tanh 节点）会破坏该假设：
+    //   - 内部中间节点不在 arg_ptrs → preloaded_ptrs.at() 抛 out_of_range（崩溃）；
+    //   - op>0 的首输入若是外部 arg（如 tanh 直接读 x）→ 被误当 prev 值，算错。
+    // 故：不满足线性链时返回 false，回退 buildFusedMultiNode（标量，可处理任意图）。
+    for (size_t op_idx = 0; op_idx < op_inputs.size(); ++op_idx) {
+        const auto& inputs = op_inputs[op_idx];
+        for (size_t k = 0; k < inputs.size(); ++k) {
+            const size_t in_id = inputs[k];
+            const bool is_arg = (arg_numels.find(in_id) != arg_numels.end());
+            if (op_idx == 0) {
+                // op0 所有输入必须是外部 arg
+                if (!is_arg) return false;
+            } else {
+                if (k == 0) {
+                    // 首输入必须是上一 op 的输出（内部节点），不能是外部 arg
+                    if (is_arg) return false;
+                } else {
+                    // 其余输入必须是外部 arg（向量化路径只能加载 arg_ptrs）
+                    if (!is_arg) return false;
+                }
+            }
+        }
+    }
+
     for (const auto& inputs : op_inputs) {
         for (size_t in_id : inputs) {
             auto it = arg_numels.find(in_id);
@@ -615,6 +643,7 @@ static void buildFusedMultiNode(mlir::OpBuilder& builder, mlir::Location loc,
                                 const std::vector<size_t>& arg_node_ids,
                                 const std::unordered_map<size_t, mlir::Value>& arg_ptrs,
                                 const std::unordered_map<size_t, int64_t>& arg_numels = {},
+                                const std::vector<size_t>& op_node_ids = {},
                                 int64_t known_numel = 0) {
     auto ptr_type = mlir::LLVM::LLVMPointerType::get(builder.getContext());
     auto f32 = builder.getF32Type();
@@ -684,63 +713,64 @@ static void buildFusedMultiNode(mlir::OpBuilder& builder, mlir::Location loc,
                 return b.create<mlir::LLVM::LoadOp>(loc, f32, elem_addr);
             };
 
-            mlir::Value prev_val;
+            // [Fix 2026-08-28] 支持分支 DAG：维护「op 输出 node_id → SSA 值」映射，
+            // getValue 优先取内部 op 输出，其次才从外部 arg 加载。
+            // 旧实现只用一个 prev_val 携带「上一 op 结果」，遇到分支（如
+            // sigmoid(x)*tanh(x)，mul 需同时取 sigmoid 与 tanh 两个分支）会
+            // 把内部中间节点当外部 arg 去 preloaded_ptrs.at() → 抛 out_of_range。
+            std::unordered_map<size_t, mlir::Value> op_val_map;
+            auto getValue = [&](size_t node_id) -> mlir::Value {
+                auto it = op_val_map.find(node_id);
+                if (it != op_val_map.end()) return it->second;
+                return loadExternal(node_id);
+            };
 
             for (size_t op_idx = 0; op_idx < ops.size(); ++op_idx) {
                 const NodeVariant& op = ops[op_idx];
                 const auto& inputs_for_op = op_inputs[op_idx];
                 bool is_last = (op_idx == ops.size() - 1);
 
-                std::vector<size_t> ext_inputs;
-                for (size_t in_id : inputs_for_op) {
-                    if (op_idx > 0 && in_id == inputs_for_op[0]) continue;
-                    ext_inputs.push_back(in_id);
-                }
-
                 mlir::Value result;
                 std::visit([&](auto&& arg) {
                     using T = std::decay_t<decltype(arg)>;
                     mlir::Value lhs, rhs;
 
+                    auto loadIn = [&](size_t k) -> mlir::Value {
+                        return getValue(inputs_for_op[k]);
+                    };
+
                     if constexpr (std::is_same_v<T, NegNode>) {
-                        lhs = (op_idx > 0) ? prev_val : loadExternal(ext_inputs[0]);
-                        result = b.create<mlir::arith::NegFOp>(loc, lhs);
+                        result = b.create<mlir::arith::NegFOp>(loc, loadIn(0));
                     } else if constexpr (std::is_same_v<T, ReLUNode>) {
-                        lhs = (op_idx > 0) ? prev_val : loadExternal(ext_inputs[0]);
                         mlir::Value zero = mlir::arith::ConstantFloatOp::create(b, loc, f32, llvm::APFloat(0.0f));
-                        result = b.create<mlir::arith::MaxNumFOp>(loc, lhs, zero);
+                        result = b.create<mlir::arith::MaxNumFOp>(loc, loadIn(0), zero);
                     } else if constexpr (std::is_same_v<T, SigmoidNode>) {
-                        lhs = (op_idx > 0) ? prev_val : loadExternal(ext_inputs[0]);
-                        mlir::Value neg_x = b.create<mlir::arith::NegFOp>(loc, lhs);
+                        mlir::Value neg_x = b.create<mlir::arith::NegFOp>(loc, loadIn(0));
                         auto expf_func = getOrDeclareExpf(b, loc);
                         mlir::Value exp_x = b.create<mlir::LLVM::CallOp>(loc, expf_func, mlir::ValueRange{neg_x}).getResult();
                         mlir::Value one = mlir::arith::ConstantFloatOp::create(b, loc, f32, llvm::APFloat(1.0f));
                         mlir::Value denom = b.create<mlir::arith::AddFOp>(loc, one, exp_x);
                         result = b.create<mlir::arith::DivFOp>(loc, one, denom);
                     } else if constexpr (std::is_same_v<T, TanhNode>) {
-                        lhs = (op_idx > 0) ? prev_val : loadExternal(ext_inputs[0]);
+                        mlir::Value in0 = loadIn(0);
                         auto expf_func = getOrDeclareExpf(b, loc);
-                        mlir::Value exp_x = b.create<mlir::LLVM::CallOp>(loc, expf_func, mlir::ValueRange{lhs}).getResult();
-                        mlir::Value neg_x = b.create<mlir::arith::NegFOp>(loc, lhs);
+                        mlir::Value exp_x = b.create<mlir::LLVM::CallOp>(loc, expf_func, mlir::ValueRange{in0}).getResult();
+                        mlir::Value neg_x = b.create<mlir::arith::NegFOp>(loc, in0);
                         mlir::Value exp_neg_x = b.create<mlir::LLVM::CallOp>(loc, expf_func, mlir::ValueRange{neg_x}).getResult();
                         mlir::Value num = b.create<mlir::arith::SubFOp>(loc, exp_x, exp_neg_x);
                         mlir::Value denom = b.create<mlir::arith::AddFOp>(loc, exp_x, exp_neg_x);
                         result = b.create<mlir::arith::DivFOp>(loc, num, denom);
                     } else if constexpr (std::is_same_v<T, AddNode>) {
-                        if (op_idx > 0) { lhs = prev_val; rhs = loadExternal(ext_inputs[0]); }
-                        else { lhs = loadExternal(ext_inputs[0]); rhs = loadExternal(ext_inputs[1]); }
+                        lhs = loadIn(0); rhs = loadIn(1);
                         result = b.create<mlir::arith::AddFOp>(loc, lhs, rhs);
                     } else if constexpr (std::is_same_v<T, SubNode>) {
-                        if (op_idx > 0) { lhs = prev_val; rhs = loadExternal(ext_inputs[0]); }
-                        else { lhs = loadExternal(ext_inputs[0]); rhs = loadExternal(ext_inputs[1]); }
+                        lhs = loadIn(0); rhs = loadIn(1);
                         result = b.create<mlir::arith::SubFOp>(loc, lhs, rhs);
                     } else if constexpr (std::is_same_v<T, MulNode>) {
-                        if (op_idx > 0) { lhs = prev_val; rhs = loadExternal(ext_inputs[0]); }
-                        else { lhs = loadExternal(ext_inputs[0]); rhs = loadExternal(ext_inputs[1]); }
+                        lhs = loadIn(0); rhs = loadIn(1);
                         result = b.create<mlir::arith::MulFOp>(loc, lhs, rhs);
                     } else if constexpr (std::is_same_v<T, DivNode>) {
-                        if (op_idx > 0) { lhs = prev_val; rhs = loadExternal(ext_inputs[0]); }
-                        else { lhs = loadExternal(ext_inputs[0]); rhs = loadExternal(ext_inputs[1]); }
+                        lhs = loadIn(0); rhs = loadIn(1);
                         mlir::Value zero_c = mlir::arith::ConstantFloatOp::create(b, loc, f32, llvm::APFloat(0.0f));
                         mlir::Value is_zero = b.create<mlir::arith::CmpFOp>(loc, mlir::arith::CmpFPredicate::OEQ, rhs, zero_c);
                         auto div_if = b.create<mlir::scf::IfOp>(loc, f32, is_zero, true);
@@ -754,32 +784,31 @@ static void buildFusedMultiNode(mlir::OpBuilder& builder, mlir::Location loc,
                         b.setInsertionPointAfter(div_if);
                         result = div_if.getResult(0);
                     } else if constexpr (std::is_same_v<T, GtNode>) {
-                        if (op_idx > 0) { lhs = prev_val; rhs = loadExternal(ext_inputs[0]); }
-                        else { lhs = loadExternal(ext_inputs[0]); rhs = loadExternal(ext_inputs[1]); }
+                        lhs = loadIn(0); rhs = loadIn(1);
                         mlir::Value zero_v = mlir::arith::ConstantFloatOp::create(b, loc, f32, llvm::APFloat(0.0f));
                         mlir::Value one_v = mlir::arith::ConstantFloatOp::create(b, loc, f32, llvm::APFloat(1.0f));
                         auto cmp = b.create<mlir::arith::CmpFOp>(loc, mlir::arith::CmpFPredicate::OGT, lhs, rhs);
                         result = b.create<mlir::arith::SelectOp>(loc, cmp, one_v, zero_v);
                     } else if constexpr (std::is_same_v<T, ExpNode>) {
-                        lhs = (op_idx > 0) ? prev_val : loadExternal(ext_inputs[0]);
-                        result = b.create<mlir::math::ExpOp>(loc, lhs);
+                        result = b.create<mlir::math::ExpOp>(loc, loadIn(0));
                     } else if constexpr (std::is_same_v<T, LogNode>) {
-                        lhs = (op_idx > 0) ? prev_val : loadExternal(ext_inputs[0]);
-                        result = b.create<mlir::math::LogOp>(loc, lhs);
+                        result = b.create<mlir::math::LogOp>(loc, loadIn(0));
                     }
                     (void)result;
                 }, op);
+
+                if (!op_node_ids.empty())
+                    op_val_map[op_node_ids[op_idx]] = result;
 
                 if (is_last) {
                     mlir::Value out_addr = b.create<mlir::LLVM::GEPOp>(
                         loc, ptr_type, f32, out, mlir::ValueRange{idx_i64});
                     b.create<mlir::LLVM::StoreOp>(loc, result, out_addr);
-                } else {
-                    prev_val = result;
                 }
             }
         });
 }
+
 
 // ======================= 多节点 MLIR 构建 =======================
 
@@ -1219,7 +1248,8 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
                                               fnode.arg_node_ids, fused_arg_ptrs, fused_arg_numels);
             } else {
                 buildFusedMultiNode(builder, loc, out_buf, fn_node_n, fnode.ops, fnode.op_inputs,
-                                    fnode.arg_node_ids, fused_arg_ptrs, fused_arg_numels);
+                                      fnode.arg_node_ids, fused_arg_ptrs, fused_arg_numels,
+                                      fnode.op_node_ids);
             }
             continue;
         }
