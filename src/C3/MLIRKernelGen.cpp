@@ -473,8 +473,10 @@ static bool isFusedChainVectorizable(const std::vector<NodeVariant>& ops,
     for (const auto& inputs : op_inputs) {
         for (size_t in_id : inputs) {
             auto it = arg_numels.find(in_id);
+            // [P0.2.3 2026-08-30 苏璃珞] 允许 numel=1（标量）broadcast（loadExternalVector 已加 mod 短路）
+            // 其他部分广播仍走 scalar 路径（shape-based broadcast 更准）
             if (it != arg_numels.end() && it->second > 0 && it->second < (int64_t)n) {
-                return false;
+                if (it->second != 1) return false;
             }
         }
     }
@@ -561,7 +563,14 @@ static void buildFusedMultiNodeVectorized(mlir::OpBuilder& builder, mlir::Locati
 
     auto loadExternalVector = [&](size_t node_id) -> mlir::Value {
         mlir::Value ptr = preloaded_ptrs.at(node_id);
-        mlir::Value addr = builder.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, ptr, mlir::ValueRange{base});
+        mlir::Value offset = base;
+        // [P0.2.3 2026-08-30 苏璃珞] 支持 broadcast：numel < n 时用 mod 算 source offset
+        // 仅支持 numel=1（标量）广播；其他部分广播留给 scalar 路径（shape-based 更准）
+        auto nit = arg_numels.find(node_id);
+        if (nit != arg_numels.end() && nit->second == 1) {
+            offset = builder.create<mlir::arith::ConstantIntOp>(loc, 0, 64);
+        }
+        mlir::Value addr = builder.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, ptr, mlir::ValueRange{offset});
         return builder.create<mlir::LLVM::LoadOp>(loc, vec_ty, addr);
     };
 
