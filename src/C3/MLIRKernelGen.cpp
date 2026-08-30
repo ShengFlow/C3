@@ -244,8 +244,22 @@ static void buildFused(mlir::OpBuilder& builder, mlir::Location loc,
     }
 
     // 为每个引用的外部输入预加载指针
+    // [P0.2.2 2026-08-30 苏璃珞] 预填全部 arg_node_ids：单 op 路径也可能 prev=arg
     std::unordered_map<size_t, mlir::Value> preloaded_ptrs;
+    for (size_t node_id : arg_node_ids) {
+        auto nit = node_to_arg.find(node_id);
+        if (nit != node_to_arg.end()) {
+            size_t arg_idx = nit->second;
+            mlir::Value kc = builder.create<mlir::arith::ConstantIndexOp>(loc, arg_idx);
+            mlir::Value kc_i64 = indexToI64(builder, loc, kc);
+            mlir::Value ptr_addr = builder.create<mlir::LLVM::GEPOp>(
+                loc, ptr_type, ptr_type, inputs, mlir::ValueRange{kc_i64});
+            mlir::Value ptr = builder.create<mlir::LLVM::LoadOp>(loc, ptr_type, ptr_addr);
+            preloaded_ptrs[node_id] = ptr;
+        }
+    }
     for (size_t node_id : referenced_nodes) {
+        if (preloaded_ptrs.find(node_id) != preloaded_ptrs.end()) continue;
         size_t arg_idx = node_to_arg.at(node_id);
         mlir::Value kc = builder.create<mlir::arith::ConstantIndexOp>(loc, arg_idx);
         mlir::Value kc_i64 = indexToI64(builder, loc, kc);
@@ -493,7 +507,8 @@ static void buildFusedMultiNodeVectorized(mlir::OpBuilder& builder, mlir::Locati
                                           const std::vector<std::vector<size_t>>& op_inputs,
                                           const std::vector<size_t>& arg_node_ids,
                                           const std::unordered_map<size_t, mlir::Value>& arg_ptrs,
-                                          const std::unordered_map<size_t, int64_t>& arg_numels = {}) {
+                                          const std::unordered_map<size_t, int64_t>& arg_numels = {},
+                                          const std::vector<size_t>& op_node_ids = {}) {
     constexpr int64_t VL = 8;
     auto ptr_type = mlir::LLVM::LLVMPointerType::get(builder.getContext());
     auto f32 = builder.getF32Type();
@@ -509,9 +524,18 @@ static void buildFusedMultiNodeVectorized(mlir::OpBuilder& builder, mlir::Locati
     }
 
     std::unordered_map<size_t, mlir::Value> preloaded_ptrs;
-    for (size_t node_id : referenced_nodes) {
+    // [P0.2.2 2026-08-30 苏璃珞] 预填 arg_node_ids 全部（不仅是 referenced_nodes）：
+    //   同一 arg 可能是某 op 的 prev（被 referenced_nodes 跳过），
+    //   但 getValue 仍可能从 op_inputs[k] 调它 → loadExternal 需要能找到
+    for (size_t node_id : arg_node_ids) {
         auto it = arg_ptrs.find(node_id);
         if (it != arg_ptrs.end()) {
+            preloaded_ptrs[node_id] = it->second;
+        }
+    }
+    for (size_t node_id : referenced_nodes) {
+        auto it = arg_ptrs.find(node_id);
+        if (it != arg_ptrs.end() && preloaded_ptrs.find(node_id) == preloaded_ptrs.end()) {
             preloaded_ptrs[node_id] = it->second;
         }
     }
@@ -737,9 +761,18 @@ static void buildFusedMultiNode(mlir::OpBuilder& builder, mlir::Location loc,
 
     // 预加载指针到局部变量（循环不变量提升）
     std::unordered_map<size_t, mlir::Value> preloaded_ptrs;
-    for (size_t node_id : referenced_nodes) {
+    // [P0.2.2 2026-08-30 苏璃珞] 预填 arg_node_ids 全部（不仅是 referenced_nodes）：
+    //   同一 arg 可能是某 op 的 prev（被 referenced_nodes 跳过），
+    //   但 getValue 仍可能从 op_inputs[k] 调它 → loadExternal 需要能找到
+    for (size_t node_id : arg_node_ids) {
         auto it = arg_ptrs.find(node_id);
         if (it != arg_ptrs.end()) {
+            preloaded_ptrs[node_id] = it->second;
+        }
+    }
+    for (size_t node_id : referenced_nodes) {
+        auto it = arg_ptrs.find(node_id);
+        if (it != arg_ptrs.end() && preloaded_ptrs.find(node_id) == preloaded_ptrs.end()) {
             preloaded_ptrs[node_id] = it->second;
         }
     }
@@ -878,6 +911,9 @@ static void buildFusedMultiNode(mlir::OpBuilder& builder, mlir::Location loc,
                     (void)result;
                 }, op);
 
+                // [P0.2.2 2026-08-30 苏璃珞] 总是用 op_node_ids[op_idx] 当 key
+                //   chain 模式：调用方必须传 op_node_ids（每个 op 对应一个 graph id）
+                //   否则 op_val_map 永远空，getValue 全部走 loadExternal → arg 不在 → at() 失败
                 if (!op_node_ids.empty())
                     op_val_map[op_node_ids[op_idx]] = result;
 
@@ -1191,6 +1227,13 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
             for (size_t k = i; k < j; ++k) {
                 if (output_index.count(compute_nodes[k]->id)) { chain_ok = false; break; }
             }
+            // [P0.2.2 2026-08-30 苏璃珞] 链末节点必须是图输出段：
+            //   否则链只跑 forward 部分，存到 output buffer 是中间值（不是 grad）→ 数值错
+            //   例：Sigmoid backward 7-op 图，链检测只取到 forward 4-op（Sub Exp Add Div），
+            //        存到 output buffer 的就是 sigmoid 值，不是 grad
+            if (chain_ok && !output_index.count(compute_nodes[j]->id)) {
+                chain_ok = false;
+            }
             if (chain_ok) {
                 for (size_t k = i; k <= j; ++k) ew_chain_len[k] = (k == i) ? len : 0;
             }
@@ -1250,8 +1293,18 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
             std::unordered_map<size_t, std::vector<int64_t>> ew_arg_shapes;
             for (size_t aid : arg_ids) {
                 ew_arg_ptrs[aid] = getInputPtr(aid);
-                ew_arg_numels[aid] = (int64_t)graph.node(aid).out_desc.numel;
-                const auto& in_shape = graph.node(aid).out_desc.shape;
+                // [P0.2.2 2026-08-30 苏璃珞] graph.node(idx) 是按 index 不是 ID，
+                // 找 ID 需遍历 nodes 列表
+                int64_t numel_v = 0;
+                std::vector<size_t> in_shape;
+                for (size_t i = 0; i < graph.nodeCount(); ++i) {
+                    if (graph.node(i).id == aid) {
+                        numel_v = (int64_t)graph.node(i).out_desc.numel;
+                        in_shape = graph.node(i).out_desc.shape;
+                        break;
+                    }
+                }
+                ew_arg_numels[aid] = numel_v;
                 ew_arg_shapes[aid] = std::vector<int64_t>(in_shape.begin(), in_shape.end());
             }
             // [P0.2.1] 链末输出 shape（element-wise 链所有成员同形 → 用 last 即可）
@@ -1286,14 +1339,20 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
             int64_t last_numel = (int64_t)last->out_desc.numel;
             auto last_numel_c = builder.create<mlir::arith::ConstantIntOp>(loc, last_numel, 64);
             auto fn_n = builder.create<mlir::arith::MinSIOp>(loc, last_numel_c, n_val);
+            // [P0.2.2 2026-08-30 苏璃珞] 收集 op_node_ids（每个 chain op 对应的 graph id）
+            //   不传 → op_val_map 永远空 → getValue 全部走 loadExternal → arg 不在 → at() 失败
+            std::vector<size_t> ew_op_node_ids;
+            ew_op_node_ids.reserve(len);
+            for (size_t k = 0; k < len; ++k) ew_op_node_ids.push_back(compute_nodes[ci + k]->id);
             if (isFusedChainVectorizable(ops, op_inputs, ew_arg_numels, (size_t)last_numel)) {
                 buildFusedMultiNodeVectorized(builder, loc, ew_out, fn_n, ops, op_inputs,
-                                              arg_ids, ew_arg_ptrs, ew_arg_numels);
+                                              arg_ids, ew_arg_ptrs, ew_arg_numels,
+                                              ew_op_node_ids);
             } else {
                 // [P0.2.1 2026-08-30 苏璃珞] 传 arg_shapes + out_shape 启用 shape-based 广播
                 buildFusedMultiNode(builder, loc, ew_out, fn_n, ops, op_inputs,
                                     arg_ids, ew_arg_ptrs, ew_arg_numels,
-                                    /*op_node_ids=*/{}, /*known_numel=*/0,
+                                    ew_op_node_ids, /*known_numel=*/0,
                                     ew_arg_shapes, ew_out_shape_i64);
             }
             ci += len - 1;
@@ -1808,7 +1867,26 @@ mlir::OwningOpRef<mlir::ModuleOp> buildMLIRModule(
 {
     // 多节点图：使用多节点 MLIR kernel
     if (countComputeNodesMLIR(graph) > 1) {
-        auto module = buildMultiNodeMLIR(context, graph);
+        mlir::OwningOpRef<mlir::ModuleOp> module;
+        try {
+            module = buildMultiNodeMLIR(context, graph);
+        } catch (const std::out_of_range& e) {
+            fprintf(stderr, "[DBG-AT] buildMultiNodeMLIR out_of_range: %s\n", e.what());
+            fprintf(stderr, "  graph nodes (%zu):\n", graph.nodeCount());
+            for (size_t i = 0; i < graph.nodeCount(); ++i) {
+                const auto& n = graph.node(i);
+                fprintf(stderr, "    [%zu] id=%zu op_idx=%d inputs=[", i, n.id, (int)n.op.index());
+                for (size_t k = 0; k < n.inputs.size(); ++k) {
+                    if (k > 0) fprintf(stderr, ",");
+                    fprintf(stderr, "%zu", n.inputs[k]);
+                }
+                fprintf(stderr, "] numel=%zu\n", n.out_desc.numel);
+            }
+            fprintf(stderr, "  graph inputs:");
+            for (auto in : graph.inputs()) fprintf(stderr, " %zu", in);
+            fprintf(stderr, "\n");
+            throw;
+        }
         if (mlir::failed(mlir::verify(*module))) {
             module->emitError();
             module->dump();

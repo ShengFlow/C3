@@ -1494,6 +1494,10 @@ void C3BackwardCapture::compileFusedBackwardAsync(const BackwardSequence& seq) {
                     ms_since("START MLIR compile...");
                     kernel = C3Engine::getInstance().compile(fused_graph, opts_mlir);
                     ms_since(kernel ? "MLIR compile SUCCESS" : "MLIR returned nullptr");
+                } catch (const std::out_of_range& e) {
+                    mlir_err = e.what();
+                    kernel = nullptr;
+                    ms_since(("MLIR out_of_range: " + mlir_err).c_str());
                 } catch (const std::exception& e) {
                     mlir_err = e.what();
                     kernel = nullptr;
