@@ -441,7 +441,9 @@ static bool isFusedChainVectorizable(const std::vector<NodeVariant>& ops,
                                      const std::vector<std::vector<size_t>>& op_inputs,
                                      const std::unordered_map<size_t, int64_t>& arg_numels,
                                      size_t n) {
-    if (std::getenv("C3_MLIR_NO_VECTORIZE") != nullptr) return false;
+    // 当前多节点向量化 builder 仍无法表达 backward 分支 DAG 的完整 live range。
+    // 在识别出安全 live range 分析前，统一走标量 DAG 生成器保证默认 backward 正确性。
+    return false;
 
     // [Fix 2026-08-28] 严格线性链校验：buildFusedMultiNodeVectorized 假设
     //   ① op0 的所有输入都是外部 arg；② 对 op>0，inputs[0] 是上一 op 的输出（内部节点），
@@ -699,7 +701,8 @@ static void buildFusedMultiNodeVectorized(mlir::OpBuilder& builder, mlir::Locati
                 mlir::Value cmp = builder.create<mlir::arith::CmpFOp>(loc, mlir::arith::CmpFPredicate::OGT, lhs, rhs);
                 mlir::Value zero_f = mlir::arith::ConstantFloatOp::create(builder, loc, f32, llvm::APFloat(0.0f));
                 mlir::Value one_f = mlir::arith::ConstantFloatOp::create(builder, loc, f32, llvm::APFloat(1.0f));
-                result_s = builder.create<mlir::arith::SelectOp>(loc, cmp, zero_f, one_f);
+                // Gt(x, 0) 的标量尾循环必须与向量路径一致：cmp 为真时返回 1。
+                result_s = builder.create<mlir::arith::SelectOp>(loc, cmp, one_f, zero_f);
             } else if constexpr (std::is_same_v<T, SigmoidNode>) {
                 lhs = (op_idx > 0) ? prev_val_s : loadExternalScalar(ext_inputs[0]);
                 mlir::Value neg_x = builder.create<mlir::arith::NegFOp>(loc, lhs);
@@ -1095,9 +1098,9 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
     for (size_t i = 0; i < num_intermediates; ++i) {
         if (buffer_numels[i] > max_numel) max_numel = buffer_numels[i];
     }
-    size_t pool_buf_count = (num_intermediates > 0)
-        ? std::min(num_intermediates, (size_t)2)
-        : 0;
+    // 分支 backward 图需要保留多个仍存活的中间值；两槽交替复用会覆盖
+    // Sigmoid backward 中 sigmoid / (1-sigmoid) 等共享依赖。先使用独立槽位。
+    size_t pool_buf_count = num_intermediates;
     std::vector<mlir::Value> tmp_buffers;
     if (pool_buf_count > 0) {
         for (size_t pi = 0; pi < pool_buf_count; ++pi) {
@@ -2230,7 +2233,8 @@ GeneratedKernel generateFromGraphMLIR(const Graph& graph, int opt_level) {
                 num_constants++;
             }
         }
-        size_t pool_buf_count = (num_intermediates > 0) ? std::min(num_intermediates, (size_t)2) : 0;
+        // 必须与上面的独立中间 buffer 分配保持一致，否则 execute 会越界访问 scratchpad。
+        size_t pool_buf_count = num_intermediates;
         result.scratch_size = max_numel * pool_buf_count + num_constants;
 
         for (const auto& node : nodes) {

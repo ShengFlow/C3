@@ -94,8 +94,16 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteBackward(
         std::lock_guard<std::mutex> lock(stats_mutex_);
         backward_attempt_count_++;
     }
+    // backward C3 默认启用；保留 C3_ENABLE_BACKWARD=0 作为显式关闭方式。
+    // CTORCH_DISABLE_C3_BACKWARD=1 或 C3_DISABLE_BACKWARD=1 仍由上方统一开关处理。
+    const char* enable_backward = std::getenv("C3_ENABLE_BACKWARD");
+    if (enable_backward && std::string(enable_backward) == "0") {
+        return std::nullopt;
+    }
 
     // ===== 统一 MIMO 融合反向 (梯度传导 + 激活求导 + 权重收缩) 🌟 =====
+    const char* enable_mimo = std::getenv("C3_ENABLE_MIMO_BACKWARD");
+    if (enable_mimo && std::string(enable_mimo) == "1") {
     {
         std::unique_lock<std::shared_mutex> lock(intercepted_mutex_);
         auto it = pending_mimo_intercepted_.find(node);
@@ -109,6 +117,7 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteBackward(
     if (mimo_res.has_value()) {
         return mimo_res;
     }
+    }
 
     // ===== Phase 2: 先尝试反向融合（整段序列一次性执行） =====
     // 注意：融合 kernel 是单输出的（对应序列首节点 input_index=0 的梯度），
@@ -121,7 +130,7 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteBackward(
     if (n_inputs == 0) n_inputs = 1;
     const std::string type_name = std::string(typeid(*node).name());
 
-    if (n_inputs == 1) {
+    if (n_inputs == 1 && !(enable_mimo && std::string(enable_mimo) == "1")) {
         auto fused = tryExecuteFusedBackward(node, grad, forward_inputs);
         if (fused.has_value()) {
             std::vector<Tensor> out;
@@ -527,10 +536,9 @@ std::optional<C3BackwardCapture::BackwardGraph> C3BackwardCapture::buildBackward
         return buildLogBackwardGraph(grad_desc, input_descs[0]);
 
     } else if (node_type.find("SoftmaxNode") != std::string::npos) {
-        // [P0.2 2026-08-30 苏璃珞] Softmax 是单输入节点（dim 是 attribute，不是 operand）
-        // axis 暂固定 1（与 buildSoftmaxBackwardGraph 内的 hardcoded 一致）
-        if (input_index != 0 || input_descs.size() < 1) return std::nullopt;
-        return buildSoftmaxBackwardGraph(grad_desc, input_descs[0]);
+        // Softmax backward 暂保守回退 eager。多归约图的临时 buffer
+        // 生命周期/广播路径尚未满足 C3 命中条件，不能生成不可靠 kernel。
+        return std::nullopt;
 
     } else if (node_type.find("CrossEntropyNode") != std::string::npos) {
         // [P0.2 2026-08-30 苏璃珞] CrossEntropy 是双输入节点（logits + target）
@@ -570,7 +578,7 @@ bool C3BackwardCapture::supportsNodeType(const std::string& node_type) {
     // 先从支持列表移除，一律回退 eager，保证 Test 4-7 数值正确性。
     // 后续单独修多输入单节点 kernel，验证正确后再加回。
     return node_type.find("ReLUNode") != std::string::npos ||
-           node_type.find("SigmoidNode") != std::string::npos ||
+           // Sigmoid backward 在复合链中仍存在输入/梯度映射异常，暂回退 eager。
            node_type.find("TanhNode") != std::string::npos ||
            node_type.find("NegNode") != std::string::npos ||
            node_type.find("GELUNode") != std::string::npos ||
@@ -582,8 +590,8 @@ bool C3BackwardCapture::supportsNodeType(const std::string& node_type) {
            node_type.find("LogNode") != std::string::npos ||
            node_type.find("MinNode") != std::string::npos ||
            node_type.find("MaxNode") != std::string::npos ||
-           // [P0.2 2026-08-30 苏璃珞] Softmax 是单输入节点（dim 是 attribute，axis 固定 1）
-           node_type.find("SoftmaxNode") != std::string::npos ||
+           // Softmax backward 暂回退 eager：其多归约图的临时 buffer 生命周期
+           // 仍需单独修复，不能在数值不稳定时命中 C3。
            // [P0.2 2026-08-30 苏璃珞] CrossEntropy 双输入节点（logits + target）
            // target 不需 grad（input_index=1 返回 nullopt）；仅 input_index=0 走 buildCrossEntropyBackwardGraph
            node_type.find("CrossEntropyNode") != std::string::npos;
@@ -694,6 +702,8 @@ C3BackwardCapture::BackwardGraph C3BackwardCapture::buildSigmoidBackwardGraph(
 //   4. diff = grad - sum_grad_y  (Sub)
 //   5. grad_x = y * diff        (Mul)
 //
+// 当前状态：该构图函数保留作后续实现基础，但 supportsNodeType() 暂不放行
+// Softmax backward；调用方会回退 eager，避免多归约临时 buffer 的生命周期问题。
 // 已知限制：
 //   - axis 暂固定 1（行 softmax），axis=0 不支持（编译时不支持广播）
 //   - 数值稳定版（max-subtraction）未做——后续可加 Neg + Max + Sub
@@ -1590,6 +1600,15 @@ std::optional<Tensor> C3BackwardCapture::tryExecuteFusedBackward(
     const Tensor& grad,
     const std::vector<Tensor>& forward_inputs)
 {
+    // 多输出 backward fusion 的 intercepted 结果当前仍存在确定性的数值错误：
+    // ReLU→Sigmoid / ReLU→ReLU 在异步 kernel 安装后会把错误的 upstream grad
+    // 回填到后续节点。先隔离执行入口，保留单节点 backward C3；编译/统计代码
+    // 留待修复输出段与节点生命周期后重新启用。正确性优先于融合命中率。
+    (void)node;
+    (void)grad;
+    (void)forward_inputs;
+    return std::nullopt;
+
     // ========== 路径 A：当前节点已在 pending 拦截队列中（融合已在下游节点 N0 时提前算出）
     //            直接取出对应的 upstream grad 作为本节点 backward 的结果返回。
     //            ComputeCore 流程零修改，grad pack 分发 100% 对齐。
