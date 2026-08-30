@@ -128,15 +128,19 @@ def C3_SumReduceOp : C3_Op<"sum_reduce", [MemoryEffects<[MemWrite]>]> {
   let description = [{
     沿着指定的 axis（如 0 或 1），对输入 2D [M x N] 张量进行归约求和。
     支持全量 reduce 到标量（axis=-1）。
+    keepdim=1 时 shape 保留被归约的轴（[M,N] axis=1 → [M,1]），输出元素数不变。
   }];
 
-  let arguments = (ins AnyType:$input, AnyType:$out, I64Attr:$M, I64Attr:$N, I32Attr:$axis);
+  let arguments = (ins AnyType:$input, AnyType:$out, I64Attr:$M, I64Attr:$N, I32Attr:$axis, I32Attr:$keepdim);
   let results = (outs);
 
-  let assemblyFormat = "$input `,` $out `dims` `[` $M `,` $N `]` `axis` $axis attr-dict `:` type($input) `,` type($out)";
+  let assemblyFormat = "$input `,` $out `dims` `[` $M `,` $N `]` `axis` $axis `keepdim` $keepdim attr-dict `:` type($input) `,` type($out)";
 
   let builders = [
-    OpBuilder<(ins "Value":$input, "Value":$out, "int64_t":$M, "int64_t":$N, "int":$axis)>
+    // [P0.2 2026-08-30 苏璃珞] 用 long long 而非 int64_t：TableGen 把 .td 里的 int64_t
+    // 翻译成 long long（macOS Apple Clang 平台），跟 C3_SoftmaxOp builder 保持一致。
+    OpBuilder<(ins "Value":$input, "Value":$out,
+                  "long long":$M, "long long":$N, "int":$axis, "int":$keepdim)>
   ];
 }
 
@@ -262,6 +266,44 @@ def C3_ExpOp : C3_UnaryElementwiseOp<"exp"> {
 
 def C3_LogOp : C3_UnaryElementwiseOp<"log"> {
   let summary = "Elementwise natural logarithm operation";
+}
+
+//===----------------------------------------------------------------------===//
+// Softmax Operation (P0.2 2026-08-30 苏璃珞)
+//===----------------------------------------------------------------------===//
+//
+// 数值稳定版：先减行 max 防 exp 溢出
+//   y[i,j] = exp(x[i,j] - rowmax[i]) / sum_j exp(x[i,j] - rowmax[i])
+// backward（公式见 C3BackwardCapture.cpp::buildSoftmaxBackwardGraph）：
+//   dL/dx[i,j] = y[i,j] * (dL/dy[i,j] - sum_k dL/dy[i,k] * y[i,k])
+// 默认 dim=1（行 softmax），支持 dim=0（列 softmax）
+//===----------------------------------------------------------------------===//
+
+def C3_SoftmaxOp : C3_Op<"softmax", [MemoryEffects<[MemWrite]>]> {
+  let summary = "Numerically-stable softmax along dim";
+  let description = [{
+    对输入 [M x N] 矩阵按 dim 维计算 softmax。
+    默认 dim=1（行），支持 dim=0（列）。数值稳定版：先减 max 防 exp 溢出。
+
+    示例：
+      c3.softmax %x, %y, dims=[128, 10] axis=1 : !llvm.ptr, !llvm.ptr
+  }];
+  let arguments = (ins
+    AnyType:$input,
+    AnyType:$out,
+    I64Attr:$M,
+    I64Attr:$N,
+    I32Attr:$axis
+  );
+  let results = (outs);
+  let assemblyFormat = "$input `,` $out `dims` `[` $M `,` $N `]` `axis` $axis attr-dict `:` type($input) `,` type($out)";
+  // [P0.2 2026-08-30 苏璃珞] 用 long long 而非 int64_t：TableGen 把 .td 里的 int64_t
+  // 翻译成 long long（macOS Apple Clang 平台），build 期望 long long, long long, int。
+  // 同样修正适用于未来 C3_SumReduceOp / C3_TransposeOp 等带 I64Attr 的 op builder。
+  let builders = [
+    OpBuilder<(ins "Value":$input, "Value":$out,
+                  "long long":$M, "long long":$N, "int":$axis)>
+  ];
 }
 
 //===----------------------------------------------------------------------===//

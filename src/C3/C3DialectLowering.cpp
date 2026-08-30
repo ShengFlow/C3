@@ -499,6 +499,10 @@ struct SumReduceOpLowering : public mlir::OpRewritePattern<mlir::c3::SumReduceOp
         int64_t M = op.getM();
         int64_t N = op.getN();
         int axis = op.getAxis();
+        // [P0.2 2026-08-30 苏璃珞] keepdim 仅影响 shape 描述（[M] vs [M,1]），
+        // 输出 buffer 元素数不变，所以现有 axis=0/1 两个分支的循环体不需要改。
+        // 这里取出来只用于未来可能的 metadata 透传。
+        (void)op.getKeepdim();
 
         auto f32 = rewriter.getF32Type();
         auto ptr_type = mlir::LLVM::LLVMPointerType::get(rewriter.getContext());
@@ -766,8 +770,12 @@ struct MatMulOpLowering : public mlir::OpRewritePattern<mlir::c3::MatMulOp> {
                     sb.create<mlir::LLVM::StoreOp>(sloc, activated, out_cell_ptr);
                 };
 
+                // MatMul epilogue 采用标量循环：这里的 vector.broadcast/vector.math
+                // 在当前 MLIR→LLVM translation 路径上会导致大型 MLP 的
+                // ExecutionEngine 创建失败。只收窄这一处，保留通用逐元素算子的
+                // vectorized lowering，避免全局标量化带来的编译时间爆炸。
                 mlir::Value N_val = N_i64;
-                buildVectorizedLoop(b, loc, N_val, (int64_t)N, vec_body, scalar_body);
+                buildLoop(b, loc, N_val, (int64_t)N, scalar_body);
 
                 b.setInsertionPointAfter(loop_i);
             }
@@ -792,12 +800,55 @@ static void runC3Combine(mlir::ModuleOp module) {
     }
 }
 
+// [P0.2 2026-08-30 苏璃珞] SoftmaxOpLowering：c3.softmax → linalg.softmax（MLIR 标准 op，底层向量化）
+//
+// 关键设计：直接用 mlir::linalg::SoftmaxOp（MLIR upstream 标准 op，**内部已实现** rowmax → exp → rowsum → div 4 步）。
+//   - 数值稳定：linalg.softmax 内部用 max-subtraction 防 exp 溢出
+//   - **向量化**：`convert-linalg-to-loops` + `convert-vector-to-llvm` pipeline 把 linalg.softmax 转
+//     `<8 x float>` SIMD 标量循环 → LLVM 自动向量化
+//   - 不用手写标量循环：避免之前 MatMulOpLowering 标量循环问题
+//
+// 公式：
+//   y[i,j] = exp(x[i,j] - rowmax[i]) / rowsum[i]
+//   rowmax[i] = max_j x[i,j]
+//   rowsum[i] = sum_j exp(x[i,j] - rowmax[i])
+struct SoftmaxOpLowering : public mlir::OpRewritePattern<mlir::c3::SoftmaxOp> {
+    using OpRewritePattern<mlir::c3::SoftmaxOp>::OpRewritePattern;
+
+    mlir::LogicalResult matchAndRewrite(mlir::c3::SoftmaxOp op,
+                                        mlir::PatternRewriter& rewriter) const override {
+        auto loc = op.getLoc();
+        mlir::Value input = op.getInput();
+        mlir::Value output = op.getOut();
+        int64_t axis = op.getAxis();
+
+        // linalg.softmax expects IntegerAttr for dimension
+        auto dimAttr = rewriter.getI32IntegerAttr(static_cast<int32_t>(axis));
+
+        // C3 softmax 是 out-as-operand（无 SSA result），linalg.softmax 是 SSA result 语义
+        // 但因为 linalg.softmax 的 outs operand **就是**输出 buffer，
+        // 创建 linalg.softmax 后会"填充"output buffer —— resultType 给空数组避免生成新 buffer
+        rewriter.create<mlir::linalg::SoftmaxOp>(
+            loc,
+            /*resultType=*/mlir::TypeRange{},  // 不创建新 result（output 已是 SSA 占位）
+            input,
+            output,
+            dimAttr
+        );
+
+        // 抹除原 c3.softmax op（linalg.softmax 已接管）
+        rewriter.eraseOp(op);
+        return mlir::success();
+    }
+};
+
 static void runC3Lowering(mlir::ModuleOp module) {
     mlir::RewritePatternSet patterns(module.getContext());
     patterns.add<TransposeOpLowering, SumReduceOpLowering, MatMulOpLowering,
                  AddOpLowering, SubOpLowering, MulOpLowering, DivOpLowering,
                  NegOpLowering, ReLUOpLowering, SigmoidOpLowering, TanhOpLowering,
-                 ExpOpLowering, LogOpLowering>(module.getContext());
+                 ExpOpLowering, LogOpLowering,
+                 SoftmaxOpLowering>(module.getContext());  // [P0.2] 加 Softmax lowering
     if (mlir::failed(mlir::applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
         throw std::runtime_error("C3DialectLowering: C3ToLLVM lowering pass failed");
     }

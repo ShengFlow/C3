@@ -43,6 +43,36 @@ C3BackwardCapture& C3BackwardCapture::getInstance() {
     return instance;
 }
 
+// [P0.1 配套实装 2026-08-30 苏璃珞]
+// 头文件声明了 shutdown() / taskStarted() / taskFinished() 三个函数（+active_tasks_ 字段）
+// 但 .cpp 从未实装。之前 P0.1 改动只改了 .h 没改 .cpp——之前 build 成功只是因为
+// `~C3BackwardCapture() { shutdown(); }` 析构**未实例化**（没人调 getInstance 后又让
+// 静态析构触发）。P0.6B 改动显式调 taskStarted() 触发 linker 错。这里补实装。
+//
+// 行为：shutdown() 等所有 in-flight detached compile tasks 完成才返回（防止析构期
+// 任务访问已销毁的 this）。taskStarted/Finished 是配套计数器。
+bool C3BackwardCapture::taskStarted() {
+    std::lock_guard<std::mutex> lock(task_mutex_);
+    if (shutting_down_.load(std::memory_order_acquire)) return false;
+    active_tasks_.fetch_add(1, std::memory_order_acq_rel);
+    return true;
+}
+
+void C3BackwardCapture::taskFinished() {
+    if (active_tasks_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        std::lock_guard<std::mutex> lock(task_mutex_);
+        task_cv_.notify_all();
+    }
+}
+
+void C3BackwardCapture::shutdown() {
+    std::unique_lock<std::mutex> lock(task_mutex_);
+    shutting_down_.store(true, std::memory_order_release);
+    task_cv_.wait(lock, [this] {
+        return active_tasks_.load(std::memory_order_acquire) == 0;
+    });
+}
+
 // ======================= 公共接口 =======================
 
 std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteBackward(
@@ -58,6 +88,12 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteBackward(
         return !backwardFusionEnabled();
     }();
     if (disabled) return std::nullopt;
+
+    // [P0.1 2026-08-30 苏璃珞] 真正开始尝试 C3 backward 路径（不算用户禁用场景）
+    {
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        backward_attempt_count_++;
+    }
 
     // ===== 统一 MIMO 融合反向 (梯度传导 + 激活求导 + 权重收缩) 🌟 =====
     {
@@ -149,6 +185,20 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteBackward(
                             (base_key + "|in:" + std::to_string(i)).c_str());
             }
             compileBackwardAsyncForInput(node, grad, i);
+            // [P0.6B 2026-08-30 苏璃珞 重做] miss 后等所有 in-flight async 编译完成
+            //
+            // 历史：之前 compileBackwardAsyncForInput 启动 std::thread + .detach()
+            //       不等完成。miss 路径立即 return std::nullopt。**下次同 key 调用**
+            //       时大概率前一次 async 还在编译（5-50ms）→ backward_entries_ 仍空
+            //       → 重复 fallback。实测覆盖率 6.25%。
+            //
+            // 修复（最安全方案，不改任何函数体）：miss 后**同步等**所有 in-flight
+            //       编译任务完成。**主线程阻塞** 5-50ms × N（in-flight 数），
+            //       但**之后**同 key 必命中。
+            //
+            // 不改 compileBackwardAsyncForInput 函数体：避免触发 static const 初始化
+            //       时序问题（之前 P0.6B inline 同步版本 hang 根因未知）。
+            getInstance().waitForPendingCompiles();
             return std::nullopt;
         }
         out.push_back(std::move(result->at(0)));
@@ -475,6 +525,12 @@ std::optional<C3BackwardCapture::BackwardGraph> C3BackwardCapture::buildBackward
     } else if (node_type.find("LogNode") != std::string::npos) {
         if (input_index != 0 || input_descs.size() < 1) return std::nullopt;
         return buildLogBackwardGraph(grad_desc, input_descs[0]);
+
+    } else if (node_type.find("SoftmaxNode") != std::string::npos) {
+        // [P0.2 2026-08-30 苏璃珞] Softmax 是单输入节点（dim 是 attribute，不是 operand）
+        // axis 暂固定 1（与 buildSoftmaxBackwardGraph 内的 hardcoded 一致）
+        if (input_index != 0 || input_descs.size() < 1) return std::nullopt;
+        return buildSoftmaxBackwardGraph(grad_desc, input_descs[0]);
     }
 
     // 不支持的节点类型
@@ -514,7 +570,9 @@ bool C3BackwardCapture::supportsNodeType(const std::string& node_type) {
            node_type.find("ExpNode") != std::string::npos ||
            node_type.find("LogNode") != std::string::npos ||
            node_type.find("MinNode") != std::string::npos ||
-           node_type.find("MaxNode") != std::string::npos;
+           node_type.find("MaxNode") != std::string::npos ||
+           // [P0.2 2026-08-30 苏璃珞] Softmax 是单输入节点（dim 是 attribute，axis 固定 1）
+           node_type.find("SoftmaxNode") != std::string::npos;
 }
 
 C3BackwardCapture::Stats C3BackwardCapture::getStats() const {
@@ -603,6 +661,76 @@ C3BackwardCapture::BackwardGraph C3BackwardCapture::buildSigmoidBackwardGraph(
 
     g.markOutput(result);
     // [Fix 2026-08-11 最小集 build] 图输入 [grad, x]，x 对应 forward_inputs[0]
+    return {std::move(g), {0}};
+}
+
+// [P0.2 2026-08-30 苏璃珞] Softmax backward graph construction
+//
+// 公式（axis=1 行 softmax）：
+//   dL/dx[i,j] = y[i,j] * (dL/dy[i,j] - sum_k dL/dy[i,k] * y[i,k])
+//   其中 y = softmax(x, dim=1)
+//
+// 实现步骤（7 op）：
+//   1. y = softmax(x, dim=1)  —— 重算（forward y 不暴露，c3 softmax 是 out-as-operand）
+//      a) exp_x = exp(x)         (Exp)
+//      b) sum_exp = sum(exp_x, dim=1, keepdim=true)  (SumReduce)
+//      c) y = exp_x / sum_exp     (Div)
+//   2. grad_y = grad * y         (Mul)
+//   3. sum_grad_y = sum(grad_y, dim=1, keepdim=true)  (SumReduce)
+//   4. diff = grad - sum_grad_y  (Sub)
+//   5. grad_x = y * diff        (Mul)
+//
+// 已知限制：
+//   - axis 暂固定 1（行 softmax），axis=0 不支持（编译时不支持广播）
+//   - 数值稳定版（max-subtraction）未做——后续可加 Neg + Max + Sub
+//   - forward y 不在输入里——这里重算（重复 exp 一次）
+C3BackwardCapture::BackwardGraph C3BackwardCapture::buildSoftmaxBackwardGraph(
+    const TensorDesc& grad_desc,
+    const TensorDesc& input_desc)
+{
+    Graph g;
+
+    // 输入: [grad, x]（grad = dL/dy, x = forward 输入）
+    size_t grad_in = g.addInput(grad_desc);
+    size_t x_in = g.addInput(input_desc);
+
+    TensorDesc same_desc = TensorDesc::fromShape(input_desc.shape);
+
+    // 1a) exp(x)
+    size_t exp_x = g.addNode(ExpNode{same_desc}, {x_in}, same_desc);
+
+    // 1b) sum(exp(x), dim=1, keepdim=true)  → [M, 1] 形状
+    TensorDesc scalar_desc = TensorDesc::fromShape(
+        input_desc.shape.size() > 0 ?
+            std::vector<size_t>{input_desc.shape[0], 1} :
+            std::vector<size_t>{1});
+    size_t sum_exp = g.addNode(
+        SumReduceNode{same_desc, 1, true},  // axis=1, keepdim=true
+        {exp_x}, scalar_desc);
+
+    // 1c) y = exp(x) / sum_exp  (广播 [M,1] → [M,N])
+    size_t y = g.addNode(
+        DivNode{same_desc, scalar_desc}, {exp_x, sum_exp}, same_desc);
+
+    // 2) grad * y
+    size_t grad_y = g.addNode(
+        MulNode{grad_desc, same_desc}, {grad_in, y}, same_desc);
+
+    // 3) sum(grad_y, dim=1, keepdim=true)
+    size_t sum_grad_y = g.addNode(
+        SumReduceNode{same_desc, 1, true},
+        {grad_y}, scalar_desc);
+
+    // 4) grad - sum_grad_y  (广播 [M,1] → [M,N])
+    size_t diff = g.addNode(
+        SubNode{grad_desc, scalar_desc}, {grad_in, sum_grad_y}, same_desc);
+
+    // 5) y * diff = grad_x
+    size_t grad_x = g.addNode(
+        MulNode{same_desc, same_desc}, {y, diff}, same_desc);
+
+    g.markOutput(grad_x);
+    // 图输入 [grad, x]，x 对应 forward_inputs[0]
     return {std::move(g), {0}};
 }
 

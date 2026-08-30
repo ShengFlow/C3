@@ -133,6 +133,12 @@ public:
     /// 因为 HotPathManager 的后台任务会调用 C3Engine 编译接口。
     /// 完整退出序列：HotPathManager::shutdown() → C3Engine::shutdown() → C3Engine::clearCache()
     void shutdown() {
+        // shutdown 可能同时由显式清理和静态析构触发；只允许第一次执行清理。
+        bool expected = false;
+        if (!shutdown_started_.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel)) {
+            return;
+        }
         // 1. 设置关闭标志，阻止新任务提交
         shutting_down_.store(true, std::memory_order_release);
 
@@ -828,14 +834,12 @@ private:
             g.markOutput(prev_node_id);
         }
 
-        // [Prewalk A] 暴露 MatMul 中间值（preAct）作为第二个输出：
-        // 对 MatMul + 单激活（ReLU/Sigmoid/Tanh）融合模式，把 MatMul 节点也标记为输出，
-        // 让生成器把 pre-activation 值写到独立输出段。backward 直接复用，避免物化重算。
-        // 仅当存在 MatMul 且不是最后一个节点（有 epilogue 激活）时启用。
+        // 对 MatMul + bias + activation 融合暴露 MatMul 输出作为第二输出，
+        // 供 LazyBox/preAct 回填复用。输出顺序由 graph.outputs() 保持为主输出在前、
+        // preAct 在后；生成器和 MultiNodeCompiledKernel 必须使用同一顺序。
         if (matmul_node_id != SIZE_MAX && matmul_node_id != prev_node_id) {
             g.markOutput(matmul_node_id);
         }
-
         return g;
     }
 
@@ -1161,6 +1165,7 @@ private:
     std::atomic<size_t> compilations_triggered_{0};
     std::atomic<size_t> pending_compiles_{0};
     std::atomic<bool> shutting_down_{false};
+    std::atomic<bool> shutdown_started_{false};
     size_t cooldown_hits_ = 0;
     size_t backpressure_hits_ = 0;
 };

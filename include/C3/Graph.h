@@ -132,6 +132,15 @@ struct ReLUNode {
     TensorDesc in_desc;
 };
 
+// [P0.2 2026-08-30 苏璃珞] Softmax 节点：C3 Graph 端到端 Softmax 支持的开始
+// forward: y = softmax(x, dim)
+// backward: dL/dx = y * (dL/dy - sum(dL/dy * y, dim, keepdim))
+struct SoftmaxNode {
+    static constexpr const char* name = "Softmax";
+    TensorDesc in_desc;
+    int axis = 1;  // softmax 维度：0=列 / 1=行（默认 1 = 行）
+};
+
 /**
  * @struct SigmoidNode
  * @brief 一元 Sigmoid 激活节点：out = 1 / (1 + exp(-x))
@@ -167,12 +176,14 @@ struct GtNode {
  * @brief 求和降维节点：out = sum(input, axis) 或全 reduce
  * @details 用于 backward 中广播梯度的收缩（如 AddNode 的 broadcast 反向）。
  *          axis = -1 表示对所有维度求和（降维到标量 1 元素张量）。
- *          输出形状根据 input 形状移除指定 axis 得到。
+ *          输出形状根据 input 形状移除指定 axis 得到（keepdim=false）或保持秩（keepdim=true）。
+ *          keepdim=true 时 [M,N] axis=1 → [M,1]（元素数仍为 M，shape 描述变化）。
  */
 struct SumReduceNode {
     static constexpr const char* name = "SumReduce";
     TensorDesc in_desc;
-    int axis = -1;  ///< 求和维度，-1 表示全 reduce
+    int axis = -1;       ///< 求和维度，-1 表示全 reduce
+    bool keepdim = false; ///< [P0.2 2026-08-30 苏璃珞] 是否保留被归约的轴（shape 描述层面）
 };
 
 /**
@@ -231,7 +242,7 @@ struct FusedNode;
  *          - 图遍历（canonicalize）使用 std::visit 比虚函数模式更高效且显式
  *          - 新增算子类型只需扩展 variant，不破坏现有代码
  */
-using NodeVariant = std::variant<AddNode, SubNode, MulNode, DivNode, MatMulNode, NegNode, ReLUNode, SigmoidNode, TanhNode, GtNode, SumReduceNode, TransposeNode, ExpNode, LogNode, ConstNode, FusedNode>;
+using NodeVariant = std::variant<AddNode, SubNode, MulNode, DivNode, MatMulNode, NegNode, ReLUNode, SigmoidNode, TanhNode, GtNode, SumReduceNode, TransposeNode, ExpNode, LogNode, ConstNode, FusedNode, SoftmaxNode>;
 
 /**
  * @struct FusedNode

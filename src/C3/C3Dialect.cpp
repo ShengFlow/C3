@@ -38,7 +38,7 @@ void TransposeOp::build(::mlir::OpBuilder &odsBuilder, ::mlir::OperationState &o
 
 void SumReduceOp::build(::mlir::OpBuilder &odsBuilder, ::mlir::OperationState &odsState,
                         ::mlir::Value input, ::mlir::Value out,
-                        int64_t M, int64_t N, int axis) {
+                        int64_t M, int64_t N, int axis, int keepdim) {
   odsState.addOperands(input);
   odsState.addOperands(out);
   auto i64 = odsBuilder.getI64Type();
@@ -46,6 +46,8 @@ void SumReduceOp::build(::mlir::OpBuilder &odsBuilder, ::mlir::OperationState &o
   odsState.getOrAddProperties<SumReduceOp::Properties>().M = odsBuilder.getIntegerAttr(i64, M);
   odsState.getOrAddProperties<SumReduceOp::Properties>().N = odsBuilder.getIntegerAttr(i64, N);
   odsState.getOrAddProperties<SumReduceOp::Properties>().axis = odsBuilder.getIntegerAttr(i32, axis);
+  // [P0.2 2026-08-30 苏璃珞] keepdim 仅描述 shape（[M] vs [M,1]），不改变输出元素数
+  odsState.getOrAddProperties<SumReduceOp::Properties>().keepdim = odsBuilder.getIntegerAttr(i32, keepdim);
 }
 
 void MatMulOp::build(::mlir::OpBuilder &odsBuilder, ::mlir::OperationState &odsState,

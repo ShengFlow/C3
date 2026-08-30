@@ -717,6 +717,11 @@ struct EngineState {
     /// 使用独立 mutex 保护，避免与 cache.mutex 互锁
     mutable std::mutex last_error_mutex;
     std::string last_compile_error;
+    // [P0.5 2026-08-30 苏璃珞] compile 失败原因统计
+    // 复用 last_error_mutex 保护；count 用 atomic 单独算
+    std::atomic<size_t> compile_failure_count_{0};                 ///< 总失败次数
+    std::unordered_map<std::string, size_t> compile_failure_reasons_;  ///< prefix → count
+    std::atomic<size_t> last_error_size_{0};                       ///< 最近一次错误字符数
     /// 编译超时配置（ADR-011），独立 mutex 保护
     mutable std::mutex config_mutex;
     uint32_t compile_timeout_ms = 30000;  // 默认 30s
@@ -737,6 +742,12 @@ static void recordEngineError(EngineState& state, const std::string& prefix,
     std::string full = prefix.empty() ? err : (prefix + ": " + err);
     std::lock_guard<std::mutex> lock(state.last_error_mutex);
     state.last_compile_error = truncateErrorMsg(full);
+    // [P0.5 2026-08-30 苏璃珞] 计数 + 原因分类
+    // 用 last_error_mutex 保护 map（避免新 mutex 互锁）
+    state.compile_failure_count_.fetch_add(1, std::memory_order_relaxed);
+    state.last_error_size_.store(state.last_compile_error.size(), std::memory_order_relaxed);
+    const std::string& key = prefix.empty() ? std::string("(sync)") : prefix;
+    state.compile_failure_reasons_[key]++;
     CtorchError::log(ErrorLevel::WARN, ErrorPlatform::kGENERAL,
         ErrorType::KERNEL_LAUNCH,
         "C3Engine: compile error recorded: " + state.last_compile_error);
@@ -1659,6 +1670,18 @@ void C3Engine::recordCompileError(const std::string& prefix, const std::string& 
     recordEngineError(getState(), prefix, err);
 }
 
+// [P0.5 2026-08-30 苏璃珞] compile 失败原因统计 API
+// 复用 last_error_mutex 保护 map 拷贝；atomic 直接 load
+C3CompileErrorStats C3Engine::getCompileErrorStats() const {
+    auto& state = getState();
+    C3CompileErrorStats s;
+    s.total_failures = state.compile_failure_count_.load(std::memory_order_relaxed);
+    s.last_error_size = state.last_error_size_.load(std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lock(state.last_error_mutex);
+    s.reasons = state.compile_failure_reasons_;  // map 拷贝
+    return s;
+}
+
 void C3Engine::setCompileTimeoutMs(uint32_t ms) {
     auto& state = getState();
     std::lock_guard<std::mutex> lock(state.config_mutex);
@@ -1773,17 +1796,8 @@ void C3Engine::autoTune(const AutoTunerConfig& config) {
 // 跨进程复用改由 JITCache 承担，见 STATUS_CONTEXT 4.12。
 
 void C3Engine::shutdown() {
-    // 正确的退出顺序：HotPathManager::shutdown() → PGO::shutdown() → C3Engine::shutdown()
-    // 1. HotPathManager 必须最先关闭：它的后台 std::async task 持有 ConcreteCompiledKernel
-    //    （含 MLIR ExecutionEngine 引用），析构顺序在 LLVM GDBJITRegistrationListener mutex
-    //    之前会触发 system_error → recursive_mutex 死锁 → std::terminate
-    // 2. PGO 在 HotPathManager 之后关闭：PGO 的 std::async task 通过 C3Engine::compile() 拿 state
-    try {
-        ct::c3::C3HotPathManager::instance().shutdown();
-    } catch (...) {
-        // best-effort
-    }
-
+    // HotPathManager 由统一的 C3Cleanup::shutdownAll() 先关闭；这里不再重复调用。
+    // 重复 shutdown 会再次移动/销毁异步 future，并在静态析构阶段触发 recursive_mutex 错误。
     // 等待 PGO 后台编译完成（PGO 内部 PGOCompiledKernel 可能 lock 自己的 compile_mutex，
     // 但其 triggerCompilationChain 也会访问 PGOManager 的 mutex_/queue_mutex_）。
     try {

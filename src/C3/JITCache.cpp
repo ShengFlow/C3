@@ -46,9 +46,59 @@ namespace c3 {
 // ======================= JIT backend version =======================
 
 const char* JITCache::currentJITVersion() {
-    // v1 -> v2: 修复 buildTiledMatMulWithEpilogue 中 2D bias 索引（改用 modulo 广播），
-    // 使旧的错误缓存失效
-    return "jit_v2";
+    // [P1.4 2026-08-30 苏璃珞] 加平台 + 编译器 + 指令集字段
+    //
+    // 之前：只返回 "jit_v2" 字面常量 → 跨环境（macOS / Linux、不同 march、不同 MLIR
+    //       版本）可能误复用 bitcode（虽然 .meta 文件存了 version 但 key 派生只用
+    //       "jit_v2" 字符串，理论上 platform/march 不影响 key）。
+    //
+    // 实际 .meta 文件（L292 写入）有 version 字段做 sanity check，**但** L242 比较时
+    // 只比 currentJITVersion() —— 即"jit_v2"——所以跨环境如果 hash 撞上会复用错。
+    //
+    // 现在：返回的字符串**包含**平台 + 编译器 + 指令集，让 makeKey 派生时把环境
+    //       差异编进 hash。
+    //
+    // 字段：
+    //   - "jit_v2"        : 版本号
+    //   - "macos" / "linux" / "windows" : OS
+    //   - "arm64" / "x86_64" : arch
+    //   - "clang17.0.6" / "gcc13.2" : 编译器
+    //   - "neon" / "avx2" / "avx512" : 指令集
+    // 字段变化 → key 变化 → 旧 cache 自动失效（不需要额外清理）
+    static const std::string v = []() {
+        std::string s = "jit_v2";
+#if defined(__APPLE__)
+        s += "_macos";
+#elif defined(__linux__)
+        s += "_linux";
+#elif defined(_WIN32)
+        s += "_windows";
+#endif
+#if defined(__aarch64__)
+        s += "_arm64";
+#elif defined(__x86_64__)
+        s += "_x86_64";
+#endif
+#if defined(__clang__)
+        s += "_clang";
+        s += std::to_string(__clang_major__) + ".";
+        s += std::to_string(__clang_minor__) + ".";
+        s += std::to_string(__clang_patchlevel__);
+#elif defined(__GNUC__)
+        s += "_gcc";
+        s += std::to_string(__GNUC__) + ".";
+        s += std::to_string(__GNUC_MINOR__);
+#endif
+#if defined(__ARM_NEON)
+        s += "_neon";
+#elif defined(__AVX512F__)
+        s += "_avx512";
+#elif defined(__AVX2__)
+        s += "_avx2";
+#endif
+        return s;
+    }();
+    return v.c_str();
 }
 
 // ======================= Cache directory =======================

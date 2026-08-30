@@ -621,9 +621,22 @@ Graph Graph::fuse() const {
             // 非输出节点且有多消费者，不能融合
             if (consumer_count[current] > 1 && current != out_id) break;
 
+            // 安全护栏：当前 fuse 表示和后端的线性链假设不能吞掉分支。
+            // 如果一个节点有多个尚未融合的逐元素前驱，沿第一个前驱继续会
+            // 把其它分支留在 FusedNode::op_inputs 中却不放入 ops，最终造成
+            // 错误计算或 unordered_map::at 崩溃。此时放弃该融合候选，保留
+            // 原始 DAG 交给普通 lowering 处理。
+            size_t elementwise_predecessors = 0;
+            for (size_t in_id : node.inputs) {
+                if (!validNodeId(in_id) || fused[in_id]) continue;
+                if (std::holds_alternative<ConstNode>(nodes_[in_id].op)) continue;
+                if (is_elementwise(nodes_[in_id].op)) ++elementwise_predecessors;
+            }
+            if (elementwise_predecessors > 1) break;
+
             chain.push_back(current);
 
-            // 继续向前遍历第一个非 Const 输入
+            // 继续向前遍历唯一的逐元素前驱
             bool found_next = false;
             for (size_t in_id : node.inputs) {
                 if (!validNodeId(in_id)) continue;
@@ -631,6 +644,7 @@ Graph Graph::fuse() const {
                 if (fused[in_id]) continue;
                 // 如果前驱节点有多个消费者，停止向前
                 if (consumer_count[in_id] > 1) continue;
+                if (!is_elementwise(nodes_[in_id].op)) continue;
                 current = in_id;
                 found_next = true;
                 break;

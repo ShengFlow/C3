@@ -36,6 +36,8 @@
 #ifndef CTORCH_C3_BACKWARD_CAPTURE_H
 #define CTORCH_C3_BACKWARD_CAPTURE_H
 
+#include <atomic>
+#include <condition_variable>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -43,6 +45,7 @@
 #include <shared_mutex>
 #include <string>
 #include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 #include "C3Engine.h"
@@ -71,6 +74,13 @@ public:
 
     /** @brief 获取 C3BackwardCapture 单例实例 */
     static C3BackwardCapture& getInstance();
+
+    /**
+     * @brief 等待所有后台反向编译任务结束。
+     * @details 后台任务使用 detached thread 以避免 std::future 析构阻塞；
+     *          调用本方法可在 C3/LLVM 静态资源释放前安全回收这些任务。
+     */
+    void shutdown();
 
     /**
      * @brief 清除反向融合捕获器中的所有临时状态与缓存。
@@ -188,6 +198,22 @@ public:
      */
     static bool supportsNodeType(const std::string& node_type);
 
+    /**
+     * @brief 等待所有 in-flight 反向编译任务完成（轮询实现，简单可靠）
+     * @details [P0.6B 2026-08-30 苏璃珞 重做] miss 后等所有 pending_compiles_
+     *          任务 erase 完才返回。**主线程阻塞** 但保证之后同 key 必命中。
+     *          实测：test_c3_backward 6 ReLU + 6 Sigmoid 全跑完 < 1s。
+     *          替代方案：CV 实现（需要新 condition_variable）—— 留给后续。
+     */
+    void waitForPendingCompiles() {
+        while (true) {
+            std::unique_lock<std::mutex> lock(pending_mutex_);
+            if (pending_compiles_.empty()) return;
+            lock.unlock();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
     /** @brief 获取编译统计信息 */
     struct Stats {
         size_t capture_count = 0;      ///< 捕获次数
@@ -203,6 +229,19 @@ public:
         size_t mimo_miss_count = 0;     ///< MIMO 尝试未命中(无已编译 kernel)次数
         uint64_t mimo_exec_us = 0;      ///< MIMO kernel->execute() 累计耗时(us)
         uint64_t mimo_keybuild_us = 0;  ///< MIMO cache key 字符串构建累计耗时(us)
+
+        // ========== [P0.1 2026-08-30 苏璃珞] backward fallback 覆盖率统计 ==========
+        // 目的：量化 C3 backward 真实覆盖率（C3 命中 vs eager fallback），给 P0/P1 提供数据基线
+        // 之前洛锦的批判性评估指出："C3 backward 不是完整自动微分后端"，但**没有量化数据**。
+        // 这两个字段让"覆盖率"可测量、可追踪、可报告。
+        size_t backward_attempt_count = 0;            ///< tryExecuteBackward 总调用次数
+        size_t backward_c3_attempt_count = 0;        ///< 走 C3 路径（compile + execute kernel）
+        size_t backward_eager_fallback_count = 0;    ///< fallback 到 eager 的次数
+        /// fallback 原因分类（unsupported_node_type / kernel_not_found / shape_mismatch / ...）
+        /// key = 原因字符串，value = 出现次数
+        std::unordered_map<std::string, size_t> backward_fallback_reasons;
+        /// backward fallback 覆盖率 = 1 - eager_fallback / attempt
+        /// 计算：getStats() 调用方算，Stats 不缓存派生指标
     };
 
     Stats getStats() const;
@@ -239,6 +278,12 @@ public:
 
 private:
     C3BackwardCapture() = default;
+    ~C3BackwardCapture() { shutdown(); }
+    C3BackwardCapture(const C3BackwardCapture&) = delete;
+    C3BackwardCapture& operator=(const C3BackwardCapture&) = delete;
+
+    bool taskStarted();
+    void taskFinished();
 
     // ======================= 反向 Graph 构建助手 =======================
 
@@ -358,6 +403,21 @@ private:
                                  const TensorDesc& input_desc);
 
     /**
+     * @brief Softmax 反向 Graph（单输入节点：dim 是 attribute，axis 固定 1）
+     * @param grad_desc 下游梯度描述符（与 y 同形）
+     * @param input_desc forward 输入描述符
+     * @return C3 Graph: y * (grad - sum(grad*y, dim=1, keepdim))
+     * @details 7 op 分解：
+     *          1) 重算 y = softmax(x)  （exp + sum_reduce[keepdim] + div）
+     *          2) grad * y            （mul）
+     *          3) sum_reduce[keepdim]  （axis=1, keepdim=true → [M, 1]）
+     *          4) grad - sum          （sub, 广播 [M,1] → [M,N]）
+     *          5) y * diff            （mul）
+     */
+    BackwardGraph buildSoftmaxBackwardGraph(const TensorDesc& grad_desc,
+                                 const TensorDesc& input_desc);
+
+    /**
      * @brief 根据节点类型字符串构建 backward Graph（用于融合编译）
      * @param node_type 节点类型字符串（如 "ReLUNode", "AddNode"）
      * @param grad_desc 下游梯度描述符
@@ -404,6 +464,13 @@ private:
     // 去重 map：正在编译中的 (node_type + shape_hash)
     std::mutex pending_mutex_;
     std::unordered_map<std::string, bool> pending_compiles_;
+
+    // detached 后台编译任务的生命周期护栏：shutdown() 等待 active_tasks_ 归零，
+    // 防止任务在单例/LLVM 资源析构后继续访问 this。
+    std::mutex task_mutex_;
+    std::condition_variable task_cv_;
+    std::atomic<size_t> active_tasks_{0};
+    std::atomic<bool> shutting_down_{false};
 
     // ======================= 反向融合检测 (Phase 2) =======================
 
@@ -510,6 +577,13 @@ private:
     size_t mimo_miss_count_ = 0;    ///< MIMO 尝试未命中次数
     uint64_t mimo_exec_ns_ = 0;     ///< MIMO kernel->execute() 累计耗时(ns, stats_mutex_ 保护)
     uint64_t mimo_keybuild_ns_ = 0; ///< MIMO cache key 构建累计耗时(ns, stats_mutex_ 保护)
+
+    // ========== [P0.1 2026-08-30 苏璃珞] backward fallback 覆盖率统计 ==========
+    // stats_mutex_ 保护；Stats::backward_fallback_reasons 是拷贝（map），保证 Stats 是 const-safe
+    size_t backward_attempt_count_ = 0;             ///< tryExecuteBackward 总调用次数
+    size_t backward_c3_attempt_count_ = 0;         ///< 走 C3 路径（compile + execute kernel）
+    size_t backward_eager_fallback_count_ = 0;     ///< fallback 到 eager 的次数
+    std::unordered_map<std::string, size_t> backward_fallback_reasons_;  ///< fallback 原因分类
 };
 
 } // namespace c3

@@ -13,6 +13,7 @@
 #define CTORCH_C3_C3CLEANUP_H
 
 #include "C3Engine.h"
+#include "C3BackwardCapture.h"
 #include "C3HotPathManager.h"
 #include "RegionFusion.h"
 
@@ -33,6 +34,8 @@ namespace c3 {
  */
 inline void shutdownAll() {
     C3HotPathManager::instance().shutdown();
+    // 反向捕获器仍可能有 detached 编译任务；必须在 Engine/LLVM 资源释放前等待。
+    C3BackwardCapture::getInstance().shutdown();
     C3Engine::getInstance().shutdown();
     C3Engine::getInstance().clearCache();
     RegionFusionRegistry::getInstance().clear();

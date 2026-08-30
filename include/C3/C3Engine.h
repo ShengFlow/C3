@@ -18,6 +18,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "Ctools.h"
@@ -103,6 +104,25 @@ struct C3CacheStats {
     size_t async_completions = 0;
     /** @brief 异步编译失败数 */
     size_t async_failures = 0;
+};
+
+// [P0.5 2026-08-30 苏璃珞] compile 失败原因统计
+// 目的：给 C3 完善提供量化基线——之前 STATUS 描述 "反向全走 eager" 实际根因是
+// compile 失败（kernel==nullptr）→ installBackward 不调 → backward_entries_ 空。
+// 错误信息已通过 recordCompileError(prefix, err) 分类（6 个 prefix），但**没有 count**。
+// 加 count 后能直接看到：哪类 prefix 失败最多，从而有针对性地修。
+struct C3CompileErrorStats {
+    size_t total_failures = 0;                       ///< 总失败次数
+    /// 失败原因分类（prefix → 次数），prefix 来自 recordCompileError：
+    ///   ""             : sync compile 异常
+    ///   "async"        : async compile 异常
+    ///   "async-timeout": async compile 看门狗超时
+    ///   "merge"        : merge graph 异常
+    ///   "merge-pgo"    : merge + PGO 异常
+    ///   "async-merge"  : async merge 异常
+    ///   "o2" / "ofast" : PGO O2/Ofast 编译异常（被 PGOCompiledKernel 调用）
+    std::unordered_map<std::string, size_t> reasons;
+    size_t last_error_size = 0;                       ///< 最近一次错误的字符数（用于 sanity check）
 };
 
 /**
@@ -539,6 +559,13 @@ public:
      *          错误信息最大 1KB，超出截断。
      */
     void recordCompileError(const std::string& prefix, const std::string& err);
+
+    /**
+     * @brief 获取编译失败原因统计
+     * @return C3CompileErrorStats 包含 total_failures + reasons map + last_error_size
+     * @details 线程安全：内部 mutex 保护。P0.5 2026-08-30 苏璃珞新增。
+     */
+    [[nodiscard]] C3CompileErrorStats getCompileErrorStats() const;
 
     /**
      * @brief 查询最近一次 async compile 是否因 watchdog 超时返回 nullptr（P0-3 修复）

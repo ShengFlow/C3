@@ -320,7 +320,8 @@ public:
      * @param shapes 形状签名（含 fused_pattern）
      */
     void installFused(std::shared_ptr<CompiledKernel> kernel,
-                      op op_type, const KernelShapeInfo& shapes);
+                      op op_type, const KernelShapeInfo& shapes,
+                      DeviceType dev = DeviceType::kCPU);
 
     /**
      * @brief 尝试执行融合 kernel（声明，实现在 .cpp 中）
@@ -408,12 +409,15 @@ public:
      */
     void uninstallFused(op op_type, const KernelShapeInfo& shapes) {
         std::lock_guard<std::mutex> lock(mutex_);
-        std::string key = makeFusedKey(op_type, shapes);
-        auto it = fused_entries_.find(key);
-        if (it != fused_entries_.end()) {
-            it->second.active = false;
-            fused_entries_.erase(it);
-            uninstall_count_.fetch_add(1, std::memory_order_release);
+        const std::string prefix = makeFusedKey(op_type, shapes) + "|dev:";
+        for (auto it = fused_entries_.begin(); it != fused_entries_.end();) {
+            if (it->first.rfind(prefix, 0) == 0) {
+                it->second.active = false;
+                it = fused_entries_.erase(it);
+                uninstall_count_.fetch_add(1, std::memory_order_release);
+            } else {
+                ++it;
+            }
         }
     }
 
@@ -447,6 +451,7 @@ private:
     struct FusedEntry {
         std::shared_ptr<CompiledKernel> kernel;
         KernelShapeInfo shapes;
+        DeviceType device = DeviceType::kCPU;
         bool active = false;
     };
 

@@ -54,6 +54,7 @@ extern "C" {
 #include <mlir/Dialect/Math/IR/Math.h>
 #include <mlir/Dialect/MemRef/IR/MemRef.h>
 #include <mlir/Dialect/SCF/IR/SCF.h>
+#include <mlir/Dialect/Vector/IR/VectorOps.h>
 #include <mlir/Pass/PassManager.h>
 #include <mlir/Transforms/Passes.h>
 #include <mlir/Conversion/ArithToLLVM/ArithToLLVM.h>
@@ -1442,7 +1443,21 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
             const auto& sr = std::get<SumReduceNode>(op);
             int64_t M = sr.in_desc.shape.size() > 0 ? sr.in_desc.shape[0] : 1;
             int64_t N = sr.in_desc.shape.size() > 1 ? sr.in_desc.shape[1] : 1;
-            builder.create<mlir::c3::SumReduceOp>(loc, in_ptrs[0], out_buf, M, N, sr.axis);
+            builder.create<mlir::c3::SumReduceOp>(loc, in_ptrs[0], out_buf, M, N, sr.axis, sr.keepdim);
+        } else if (std::holds_alternative<SoftmaxNode>(op)) {
+            // [P0.2 2026-08-30 苏璃珞] Softmax forward kernel generation
+            // c3.softmax M N axis 编译成 MLIR 标准 op，lowering 阶段转 linalg.softmax
+            // （linalg.softmax 内部实现 rowmax → exp → rowsum → div 4 步 + 数值稳定）
+            // 后续 convert-linalg-to-loops + LLVM 自动向量化保证 SIMD 标量循环
+            const auto& sm = std::get<SoftmaxNode>(op);
+            int64_t M = sm.in_desc.shape.size() > 0 ? sm.in_desc.shape[0] : 1;
+            int64_t N = sm.in_desc.shape.size() > 1 ? sm.in_desc.shape[1] : 1;
+            // [P0.2 fix] TableGen 生成的 build 期望 IntegerAttr 而非 long long/int
+            // 直接传原始类型会 link 失败（SumReduceOp 之前无调用，所以没暴露）
+            auto M_attr = builder.getI64IntegerAttr(M);
+            auto N_attr = builder.getI64IntegerAttr(N);
+            auto axis_attr = builder.getI32IntegerAttr(sm.axis);
+            builder.create<mlir::c3::SoftmaxOp>(loc, in_ptrs[0], out_buf, M_attr, N_attr, axis_attr);
         } else if (std::holds_alternative<TransposeNode>(op)) {
             const auto& tr = std::get<TransposeNode>(op);
             int64_t M = tr.in_desc.shape.size() > 0 ? tr.in_desc.shape[0] : 1;
@@ -1805,7 +1820,7 @@ mlir::OwningOpRef<mlir::ModuleOp> buildMLIRModule(
             const auto& sr = std::get<SumReduceNode>(op);
             int64_t M = sr.in_desc.shape.size() > 0 ? sr.in_desc.shape[0] : 1;
             int64_t N = sr.in_desc.shape.size() > 1 ? sr.in_desc.shape[1] : 1;
-            builder.create<mlir::c3::SumReduceOp>(loc, a, out, M, N, sr.axis);
+            builder.create<mlir::c3::SumReduceOp>(loc, a, out, M, N, sr.axis, sr.keepdim);
         }
         else if (std::holds_alternative<TransposeNode>(op)) {
             const auto& tr = std::get<TransposeNode>(op);
@@ -1855,6 +1870,7 @@ GeneratedKernel generateFromGraphMLIR(const Graph& graph, int opt_level) {
     reg.insert<mlir::arith::ArithDialect>();
     reg.insert<mlir::math::MathDialect>();
     reg.insert<mlir::scf::SCFDialect>();
+    reg.insert<mlir::vector::VectorDialect>();
     reg.insert<mlir::func::FuncDialect>();
     reg.insert<mlir::memref::MemRefDialect>();
     reg.insert<mlir::LLVM::LLVMDialect>();
@@ -1869,6 +1885,7 @@ GeneratedKernel generateFromGraphMLIR(const Graph& graph, int opt_level) {
         context->getOrLoadDialect<mlir::arith::ArithDialect>();
         context->getOrLoadDialect<mlir::math::MathDialect>();
         context->getOrLoadDialect<mlir::scf::SCFDialect>();
+        context->getOrLoadDialect<mlir::vector::VectorDialect>();
         context->getOrLoadDialect<mlir::func::FuncDialect>();
         context->getOrLoadDialect<mlir::memref::MemRefDialect>();
         context->getOrLoadDialect<mlir::LLVM::LLVMDialect>();

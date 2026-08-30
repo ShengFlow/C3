@@ -84,8 +84,14 @@ Tensor C3KernelRegistry::executeFusedWithInputs(
 // executeFusedWithInputs(kernel, ...) 直接调用,不走本入口。
 // 保留接口以备 region fusion 启用后通过 op_type + inputs 快速 dispatch。
 std::optional<Tensor> C3KernelRegistry::tryExecuteFused(
-    op /*op_type*/, const std::vector<Tensor>& /*inputs*/) {
-    return std::nullopt;
+    op op_type, const std::vector<Tensor>& inputs) {
+    if (inputs.empty()) return std::nullopt;
+    const DeviceType dev = inputs.front().device();
+    const auto match = findFusedKernelForFirstOp(op_type, inputs.front().shape(), dev);
+    if (!match.has_value()) return std::nullopt;
+    Tensor out = executeFusedWithInputs(match->first, inputs, match->second);
+    if (out.storage().empty()) return std::nullopt;
+    return out;
 }
 
 // ======================= 二元/一元 forward kernel 执行 =======================
@@ -341,21 +347,71 @@ std::optional<std::vector<Tensor>> C3KernelRegistry::tryExecuteBackward(
 
 // ======================= 序列/首 op 模糊匹配 =======================
 
-// TODO(region-fusion): 用于按 op 序列模糊匹配已注册的融合 kernel（备选 path A）。
-// 当前 stub 返回 nullopt → 调度器继续走精确匹配或 eager。
+namespace {
+const char* fusedOpName(op value) {
+    switch (value) {
+        case op::Add: return "Add"; case op::Sub: return "Sub";
+        case op::Neg: return "Neg"; case op::Mul: return "Mul";
+        case op::Div: return "Div"; case op::MatMul: return "MatMul";
+        case op::ReLU: return "ReLU"; case op::Tanh: return "Tanh";
+        case op::Sigmoid: return "Sigmoid"; case op::Softmax: return "Softmax";
+        case op::Exp: return "Exp"; case op::Log: return "Log";
+        case op::Abs: return "Abs"; case op::GELU: return "GELU";
+        case op::Min: return "Min"; case op::Max: return "Max";
+        default: return nullptr;
+    }
+}
+
+bool patternMatches(const std::string& pattern, const std::vector<op>& sequence) {
+    size_t begin = 0;
+    for (size_t i = 0; i < sequence.size(); ++i) {
+        const size_t end = pattern.find('+', begin);
+        const std::string token = pattern.substr(begin, end == std::string::npos
+                                                          ? std::string::npos : end - begin);
+        const char* expected = fusedOpName(sequence[i]);
+        if (!expected || token != expected) return false;
+        if (end == std::string::npos) return i + 1 == sequence.size();
+        begin = end + 1;
+    }
+    return begin == pattern.size();
+}
+} // namespace
+
 std::optional<std::pair<std::shared_ptr<CompiledKernel>, KernelShapeInfo>>
 C3KernelRegistry::findFusedKernelForSequence(
-    const std::vector<op>& /*op_seq*/, DeviceType /*dev*/,
-    const std::vector<size_t>& /*first_input_shape*/) {
+    const std::vector<op>& op_seq, DeviceType dev,
+    const std::vector<size_t>& first_input_shape) {
+    if (op_seq.empty()) return std::nullopt;
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& item : fused_entries_) {
+        const FusedEntry& entry = item.second;
+        if (!entry.active || !entry.kernel || entry.shapes.lhs_shape.empty()) continue;
+        if (entry.shapes.lhs_shape != first_input_shape && !first_input_shape.empty()) continue;
+        if (entry.shapes.lhs_shape.empty() || entry.shapes.out_shape.empty()) continue;
+        // Fused entries do not carry a separate device field; kernels are only
+        // valid for the device encoded by their shape tensors.
+        if (entry.device != dev) continue;
+        if (entry.shapes.fused_pattern.empty() || !patternMatches(entry.shapes.fused_pattern, op_seq)) continue;
+        return std::make_pair(entry.kernel, entry.shapes);
+    }
     return std::nullopt;
 }
 
-// TODO(region-fusion): 用于按首 op 匹配融合 kernel。
-// 当前 stub 返回 nullopt。
 std::optional<std::pair<std::shared_ptr<CompiledKernel>, KernelShapeInfo>>
 C3KernelRegistry::findFusedKernelForFirstOp(
-    op /*op_type*/, const std::vector<size_t>& /*input_shape*/,
-    DeviceType /*dev*/) {
+    op op_type, const std::vector<size_t>& input_shape, DeviceType dev) {
+    const char* name = fusedOpName(op_type);
+    if (!name) return std::nullopt;
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto& item : fused_entries_) {
+        const FusedEntry& entry = item.second;
+        if (!entry.active || !entry.kernel || entry.device != dev || entry.shapes.fused_pattern.empty()) continue;
+        if (!input_shape.empty() && entry.shapes.lhs_shape != input_shape) continue;
+        const size_t plus = entry.shapes.fused_pattern.find('+');
+        if (entry.shapes.fused_pattern.substr(0, plus) != name) continue;
+        (void)dev;
+        return std::make_pair(entry.kernel, entry.shapes);
+    }
     return std::nullopt;
 }
 
@@ -385,16 +441,17 @@ void C3KernelRegistry::install(op op_type, DeviceType dev,
 }
 
 void C3KernelRegistry::installFused(std::shared_ptr<CompiledKernel> kernel,
-                                    op op_type, const KernelShapeInfo& shapes) {
+                                    op op_type, const KernelShapeInfo& shapes,
+                                    DeviceType dev) {
     std::lock_guard<std::mutex> lock(mutex_);
-    std::string key = makeFusedKey(op_type, shapes);
+    std::string key = makeFusedKey(op_type, shapes) + "|dev:" + std::to_string(static_cast<int>(dev));
     auto it = fused_entries_.find(key);
     if (it != fused_entries_.end() && it->second.active && it->second.kernel) {
         if (kernel->optLevel() <= it->second.kernel->optLevel()) {
             return;
         }
     }
-    fused_entries_[key] = {std::move(kernel), shapes, true};
+    fused_entries_[key] = {std::move(kernel), shapes, dev, true};
     install_count_.fetch_add(1, std::memory_order_release);
 }
 
