@@ -357,6 +357,72 @@ static void buildFused(mlir::OpBuilder& builder, mlir::Location loc,
 
 // ======================= 多节点融合 Kernel 构建 =======================
 
+/// [P0.2.1 2026-08-30 苏璃珞] Shape-based broadcast source index
+/// @details 把输出 flat 索引 `out_idx` 转成输入 flat 索引 `source_idx`。
+///          旧实现用 `out_idx % numel`，对 numel=1 (scalar) 正确，对 numel==n 正确，
+///          但对 numel < n（部分广播，如 [M,1] → [M,N]）会返回错位。
+///          新实现按 shape 维度逐维算：
+///            for d in 0..rank(out_shape):
+///              in_dim  = padded_in_shape[d]   (1 if broadcast)
+///              out_dim = out_shape[d]
+///              idx_d   = (out_idx / out_stride) % out_dim
+///              source_idx += (idx_d if in_dim == out_dim else 0) * in_stride
+///          其中 in_stride = ∏_{d' > d} padded_in_shape[d']
+/// @return 生成的 MLIR Value（i64 类型）作为 GEP 偏移；scalar 输入直接返回 0 常量
+static mlir::Value computeBroadcastSourceIdx(
+    mlir::OpBuilder& b, mlir::Location loc,
+    mlir::Value out_idx_i64,
+    const std::vector<int64_t>& out_shape,
+    const std::vector<int64_t>& in_shape)
+{
+    // scalar 输入：numel=1，source 永远 0
+    int64_t in_numel = 1;
+    for (int64_t d : in_shape) in_numel *= d;
+    if (in_numel == 1) {
+        return b.create<mlir::arith::ConstantIntOp>(loc, 0, 64);
+    }
+    // 形状完全相同：直接用 out_idx
+    if (in_shape == out_shape) {
+        return out_idx_i64;
+    }
+    // 维度不一致：左边 pad 1
+    std::vector<int64_t> padded_in = in_shape;
+    while ((int64_t)padded_in.size() < (int64_t)out_shape.size()) {
+        padded_in.insert(padded_in.begin(), 1);
+    }
+    // 逐维算（row-major：最内维 stride=1，向外递增）
+    mlir::Value source_idx = b.create<mlir::arith::ConstantIntOp>(loc, 0, 64);
+    int64_t rank = (int64_t)out_shape.size();
+    int64_t out_stride = 1;  // 当前 dim 在 row-major 下的 stride（d=rank-1 时为 1）
+    int64_t in_stride = 1;   // 同理，padded_in 的 stride
+    for (int64_t d = rank - 1; d >= 0; --d) {
+        int64_t in_dim = padded_in[d];
+        int64_t out_dim = out_shape[d];
+        if (in_dim == out_dim) {
+            // idx_d = (out_idx / out_stride) % out_dim
+            mlir::Value div_val = b.create<mlir::arith::ConstantIntOp>(loc, out_stride, 64);
+            mlir::Value div_op = b.create<mlir::arith::DivUIOp>(loc, out_idx_i64, div_val);
+            mlir::Value mod_val = b.create<mlir::arith::ConstantIntOp>(loc, out_dim, 64);
+            mlir::Value idx_d = b.create<mlir::arith::RemUIOp>(loc, div_op, mod_val);
+            if (in_stride > 1) {
+                mlir::Value stride_v = b.create<mlir::arith::ConstantIntOp>(loc, in_stride, 64);
+                mlir::Value contrib = b.create<mlir::arith::MulIOp>(loc, idx_d, stride_v);
+                source_idx = b.create<mlir::arith::AddIOp>(loc, source_idx, contrib);
+            } else {
+                source_idx = b.create<mlir::arith::AddIOp>(loc, source_idx, idx_d);
+            }
+        } else if (in_dim == 1) {
+            // 广播：贡献 0
+        } else {
+            // 不兼容：抛错（理论上前置 caller 已校验过兼容性）
+            throw std::runtime_error("MLIRKernelGen: incompatible broadcast shapes");
+        }
+        out_stride *= out_dim;
+        in_stride *= in_dim;
+    }
+    return source_idx;
+}
+
 static bool isFusedChainVectorizable(const std::vector<NodeVariant>& ops,
                                      const std::vector<std::vector<size_t>>& op_inputs,
                                      const std::unordered_map<size_t, int64_t>& arg_numels,
@@ -637,6 +703,8 @@ static void buildFusedMultiNodeVectorized(mlir::OpBuilder& builder, mlir::Locati
 /// 在多节点 MLIR kernel 中生成融合节点的循环代码
 /// @details 每个融合节点包含一个 element-wise 操作链，在单次循环中按顺序执行。
 ///          输入指针已由调用方解析（可能是外部输入或中间缓冲区），直接使用。
+/// @param arg_shapes [P0.2.1 2026-08-30 苏璃珞] 每个 arg 的 shape（用于 shape-based 广播索引）
+///                   若 arg_shapes 为空则回退到旧 numel-based 行为
 static void buildFusedMultiNode(mlir::OpBuilder& builder, mlir::Location loc,
                                 mlir::Value out, mlir::Value n,
                                 const std::vector<NodeVariant>& ops,
@@ -645,7 +713,9 @@ static void buildFusedMultiNode(mlir::OpBuilder& builder, mlir::Location loc,
                                 const std::unordered_map<size_t, mlir::Value>& arg_ptrs,
                                 const std::unordered_map<size_t, int64_t>& arg_numels = {},
                                 const std::vector<size_t>& op_node_ids = {},
-                                int64_t known_numel = 0) {
+                                int64_t known_numel = 0,
+                                const std::unordered_map<size_t, std::vector<int64_t>>& arg_shapes = {},
+                                const std::vector<int64_t>& out_shape = {}) {
     auto ptr_type = mlir::LLVM::LLVMPointerType::get(builder.getContext());
     auto f32 = builder.getF32Type();
 
@@ -696,18 +766,28 @@ static void buildFusedMultiNode(mlir::OpBuilder& builder, mlir::Location loc,
                 mlir::Value load_idx = idx_i64;
                 auto it = arg_numels.find(node_id);
                 if (it != arg_numels.end() && it->second > 0) {
-                    mlir::Value node_numel = b.create<mlir::arith::ConstantIntOp>(
-                        loc, it->second, 64);
-                    mlir::Value need_broadcast = b.create<mlir::arith::CmpIOp>(
-                        loc, mlir::arith::CmpIPredicate::ult, node_numel, n);
-                    auto if_broadcast = b.create<mlir::scf::IfOp>(loc, b.getI64Type(), need_broadcast, true);
-                    b.setInsertionPointToStart(&if_broadcast.getThenRegion().front());
-                    mlir::Value mod_idx = b.create<mlir::arith::RemUIOp>(loc, idx_i64, node_numel);
-                    b.create<mlir::scf::YieldOp>(loc, mod_idx);
-                    b.setInsertionPointToStart(&if_broadcast.getElseRegion().front());
-                    b.create<mlir::scf::YieldOp>(loc, idx_i64);
-                    b.setInsertionPointAfter(if_broadcast);
-                    load_idx = if_broadcast.getResult(0);
+                    // [P0.2.1 2026-08-30 苏璃珞] shape-based broadcast
+                    // 若 arg_shapes 含此 node 的 shape，用维度逐维算 source_idx（处理 [M,1]→[M,N] 等部分广播）
+                    // 否则回退旧 numel-based `idx % numel`（仅对 numel=1 或 numel==n 正确）
+                    auto shape_it = arg_shapes.find(node_id);
+                    if (shape_it != arg_shapes.end() && !out_shape.empty()) {
+                        // shape-based：直接生成 source_idx 表达式
+                        load_idx = computeBroadcastSourceIdx(b, loc, idx_i64, out_shape, shape_it->second);
+                    } else {
+                        // 旧 numel-based fallback
+                        mlir::Value node_numel = b.create<mlir::arith::ConstantIntOp>(
+                            loc, it->second, 64);
+                        mlir::Value need_broadcast = b.create<mlir::arith::CmpIOp>(
+                            loc, mlir::arith::CmpIPredicate::ult, node_numel, n);
+                        auto if_broadcast = b.create<mlir::scf::IfOp>(loc, b.getI64Type(), need_broadcast, true);
+                        b.setInsertionPointToStart(&if_broadcast.getThenRegion().front());
+                        mlir::Value mod_idx = b.create<mlir::arith::RemUIOp>(loc, idx_i64, node_numel);
+                        b.create<mlir::scf::YieldOp>(loc, mod_idx);
+                        b.setInsertionPointToStart(&if_broadcast.getElseRegion().front());
+                        b.create<mlir::scf::YieldOp>(loc, idx_i64);
+                        b.setInsertionPointAfter(if_broadcast);
+                        load_idx = if_broadcast.getResult(0);
+                    }
                 }
                 mlir::Value elem_addr = b.create<mlir::LLVM::GEPOp>(
                     loc, ptr_type, f32, ptr, mlir::ValueRange{load_idx});
@@ -1096,7 +1176,11 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
                isFusableEW(compute_nodes[j + 1]->op) &&
                compute_nodes[j]->out_desc.numel == compute_nodes[j + 1]->out_desc.numel &&
                compute_nodes[j + 1]->inputs.size() >= 1 &&
-               compute_nodes[j + 1]->inputs[0] == compute_nodes[j]->id &&
+               // [P0.2.1 2026-08-30 苏璃珞] 放宽：op[i+1].inputs 任意位置含 op[i].id 即视为链延续
+               // （之前只查 inputs[0]，导致 `Mul(grad, y)` 这类「链前驱在 inputs[1]」的图构型断链）
+               std::find(compute_nodes[j + 1]->inputs.begin(),
+                         compute_nodes[j + 1]->inputs.end(),
+                         compute_nodes[j]->id) != compute_nodes[j + 1]->inputs.end() &&
                in_consumer_count[compute_nodes[j]->id] == 1) {
             ++j;
         }
@@ -1114,13 +1198,11 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
         i = j + 1;
     }
 
-    // 实验开关 C3_EW_CHAIN_FUSION=1 开启生成层 elementwise 链融合（默认关闭）。
-    // 实测（MNIST 5ep，Gt/Exp/Log 补齐后）开启≈关闭（264.65 vs 264.72ms/epoch），
-    // 因 MIMO 多输出反向图里链检测匹配不到可融合链 → 无收益。故默认关闭保持原行为，
-    // 保留此实验开关以备在有真正线性 elementwise 链的模型上二次验证。
+    // [P0.2.1 2026-08-30 苏璃珞] 链检测放宽（任意 input 位置查前驱）后，Softmax/MLP 等
+    // 含 [M,1]→[M,N] 广播的图也能命中 → 默认开启。环境变量 C3_EW_CHAIN_FUSION=0 可关。
     static const bool ew_chain_fusion_on = [] {
         const char* v = std::getenv("C3_EW_CHAIN_FUSION");
-        return v != nullptr && std::string(v) == "1";
+        return v == nullptr || std::string(v) != "0";
     }();
 
     for (size_t ci = 0; ci < compute_nodes.size(); ++ci) {
@@ -1144,18 +1226,37 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
             for (size_t k = 0; k < len; ++k) {
                 const Node* cn = compute_nodes[ci + k];
                 ops.push_back(cn->op);
-                op_inputs.push_back(cn->inputs);
-                for (size_t in_id : cn->inputs) {
+                // [P0.2.1 2026-08-30 苏璃珞] 把"链前驱"挪到 inputs[0]（放宽链检测后前驱可能不在 [0]）
+                // 链构建代码 `if (op_idx > 0 && in_id == op_inputs[op_idx][0]) continue;` 依赖此布局
+                std::vector<size_t> inputs = cn->inputs;
+                if (k > 0 && !inputs.empty()) {
+                    size_t pred_id = compute_nodes[ci + k - 1]->id;
+                    auto pred_it = std::find(inputs.begin(), inputs.end(), pred_id);
+                    if (pred_it != inputs.end()) {
+                        std::iter_swap(inputs.begin(), pred_it);
+                    }
+                }
+                op_inputs.push_back(inputs);
+                // [P0.2.1 2026-08-30 苏璃珞] 用 reordered inputs（不是 cn->inputs 原序），
+                // 否则 chain 外的 arg 可能丢失 → buildFusedMultiNode 内部 arg_ptrs.at(key) 抛 key not found
+                for (size_t in_id : inputs) {
                     if (!chain_ids.count(in_id)) arg_set.insert(in_id);
                 }
             }
             std::vector<size_t> arg_ids(arg_set.begin(), arg_set.end());
             std::unordered_map<size_t, mlir::Value> ew_arg_ptrs;
             std::unordered_map<size_t, int64_t> ew_arg_numels;
+            // [P0.2.1 2026-08-30 苏璃珞] 同步收集 arg 的 shape（shape-based 广播必备）
+            std::unordered_map<size_t, std::vector<int64_t>> ew_arg_shapes;
             for (size_t aid : arg_ids) {
                 ew_arg_ptrs[aid] = getInputPtr(aid);
                 ew_arg_numels[aid] = (int64_t)graph.node(aid).out_desc.numel;
+                const auto& in_shape = graph.node(aid).out_desc.shape;
+                ew_arg_shapes[aid] = std::vector<int64_t>(in_shape.begin(), in_shape.end());
             }
+            // [P0.2.1] 链末输出 shape（element-wise 链所有成员同形 → 用 last 即可）
+            std::vector<int64_t> ew_out_shape_i64;
+            for (size_t d : last->out_desc.shape) ew_out_shape_i64.push_back((int64_t)d);
 
             // 链末节点输出 buffer（复用主循环 out_buf 语义）
             mlir::Value ew_out;
@@ -1189,8 +1290,11 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
                 buildFusedMultiNodeVectorized(builder, loc, ew_out, fn_n, ops, op_inputs,
                                               arg_ids, ew_arg_ptrs, ew_arg_numels);
             } else {
+                // [P0.2.1 2026-08-30 苏璃珞] 传 arg_shapes + out_shape 启用 shape-based 广播
                 buildFusedMultiNode(builder, loc, ew_out, fn_n, ops, op_inputs,
-                                    arg_ids, ew_arg_ptrs, ew_arg_numels);
+                                    arg_ids, ew_arg_ptrs, ew_arg_numels,
+                                    /*op_node_ids=*/{}, /*known_numel=*/0,
+                                    ew_arg_shapes, ew_out_shape_i64);
             }
             ci += len - 1;
             continue;
@@ -1232,6 +1336,10 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
             // 为每个 arg_node_id 获取输入指针（外部输入或中间缓冲区）
             std::unordered_map<size_t, mlir::Value> fused_arg_ptrs;
             std::unordered_map<size_t, int64_t> fused_arg_numels;
+            // [P0.2.1 2026-08-30 苏璃珞] shape-based 广播：arg shape + output shape
+            std::unordered_map<size_t, std::vector<int64_t>> fused_arg_shapes;
+            std::vector<int64_t> fused_out_shape_i64;
+            for (size_t d : node->out_desc.shape) fused_out_shape_i64.push_back((int64_t)d);
             for (size_t aidx = 0; aidx < fnode.arg_node_ids.size(); ++aidx) {
                 size_t nid = fnode.arg_node_ids[aidx];
                 fused_arg_ptrs[nid] = getInputPtr(nid);
@@ -1239,6 +1347,8 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
                 for (const auto& gn : nodes) {
                     if (gn.id == nid) {
                         fused_arg_numels[nid] = (int64_t)gn.out_desc.numel;
+                        const auto& in_s = gn.out_desc.shape;
+                        fused_arg_shapes[nid] = std::vector<int64_t>(in_s.begin(), in_s.end());
                         break;
                     }
                 }
@@ -1248,9 +1358,11 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
                 buildFusedMultiNodeVectorized(builder, loc, out_buf, fn_node_n, fnode.ops, fnode.op_inputs,
                                               fnode.arg_node_ids, fused_arg_ptrs, fused_arg_numels);
             } else {
+                // [P0.2.1 2026-08-30 苏璃珞] 传 arg_shapes + out_shape
                 buildFusedMultiNode(builder, loc, out_buf, fn_node_n, fnode.ops, fnode.op_inputs,
                                       fnode.arg_node_ids, fused_arg_ptrs, fused_arg_numels,
-                                      fnode.op_node_ids);
+                                      fnode.op_node_ids, /*known_numel=*/0,
+                                      fused_arg_shapes, fused_out_shape_i64);
             }
             continue;
         }
