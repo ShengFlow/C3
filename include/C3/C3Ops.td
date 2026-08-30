@@ -145,6 +145,37 @@ def C3_SumReduceOp : C3_Op<"sum_reduce", [MemoryEffects<[MemWrite]>]> {
 }
 
 //===----------------------------------------------------------------------===//
+// [P0.2 2026-08-30 苏璃珞] CrossEntropyOp：CE = -1/M * sum_i sum_c target_ic * log(softmax(logits)_ic)
+// 语义：target 是 [M, N] 概率/one-hot 形式（与现有 CE_SIMD_kernel 一致，line 107-108）
+// 输出：单元素标量（1 个 float）—— mean loss
+//===----------------------------------------------------------------------===//
+
+def C3_CrossEntropyOp : C3_Op<"cross_entropy", [MemoryEffects<[MemWrite]>]> {
+  let summary = "Cross-entropy loss (mean over batch) with one-hot/probability target";
+  let description = [{
+    计算 -1/M * sum_i sum_c target_ic * log(softmax(logits)_ic)，M=batch size, N=num classes。
+    logits 形状 [M, N]，target 形状 [M, N]（one-hot 或 soft probability），
+    输出单元素 mean loss。
+  }];
+
+  let arguments = (ins
+    AnyType:$logits,
+    AnyType:$target,
+    AnyType:$out,
+    I64Attr:$M,
+    I64Attr:$N
+  );
+  let results = (outs);
+
+  let assemblyFormat = "$logits `,` $target `,` $out `dims` `[` $M `,` $N `]` attr-dict `:` type($logits) `,` type($target) `,` type($out)";
+
+  let builders = [
+    OpBuilder<(ins "Value":$logits, "Value":$target, "Value":$out,
+                  "long long":$M, "long long":$N)>
+  ];
+}
+
+//===----------------------------------------------------------------------===//
 // Elementwise Operations Base Classes
 //===----------------------------------------------------------------------===//
 

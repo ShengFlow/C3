@@ -141,6 +141,17 @@ struct SoftmaxNode {
     int axis = 1;  // softmax 维度：0=列 / 1=行（默认 1 = 行）
 };
 
+// [P0.2 2026-08-30 苏璃珞] CrossEntropy 节点：多输入（logits + target 都是 [M, N]）
+// forward: out[0] = -1/M * sum_i sum_c target_ic * log(softmax(logits)_ic)  (标量)
+// backward: grad_logits = softmax(logits) - target  ([M, N])
+// backward 副产物：target 不需要 grad（input_index=1 返回 nullopt）
+// target 语义：one-hot 或 soft probability（与现有 CE_SIMD_kernel 一致）
+struct CrossEntropyNode {
+    static constexpr const char* name = "CrossEntropy";
+    TensorDesc logits_desc;
+    TensorDesc target_desc;
+};
+
 /**
  * @struct SigmoidNode
  * @brief 一元 Sigmoid 激活节点：out = 1 / (1 + exp(-x))
@@ -242,7 +253,7 @@ struct FusedNode;
  *          - 图遍历（canonicalize）使用 std::visit 比虚函数模式更高效且显式
  *          - 新增算子类型只需扩展 variant，不破坏现有代码
  */
-using NodeVariant = std::variant<AddNode, SubNode, MulNode, DivNode, MatMulNode, NegNode, ReLUNode, SigmoidNode, TanhNode, GtNode, SumReduceNode, TransposeNode, ExpNode, LogNode, ConstNode, FusedNode, SoftmaxNode>;
+using NodeVariant = std::variant<AddNode, SubNode, MulNode, DivNode, MatMulNode, NegNode, ReLUNode, SigmoidNode, TanhNode, GtNode, SumReduceNode, TransposeNode, ExpNode, LogNode, ConstNode, FusedNode, SoftmaxNode, CrossEntropyNode>;
 
 /**
  * @struct FusedNode

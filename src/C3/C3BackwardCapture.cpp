@@ -531,6 +531,17 @@ std::optional<C3BackwardCapture::BackwardGraph> C3BackwardCapture::buildBackward
         // axis 暂固定 1（与 buildSoftmaxBackwardGraph 内的 hardcoded 一致）
         if (input_index != 0 || input_descs.size() < 1) return std::nullopt;
         return buildSoftmaxBackwardGraph(grad_desc, input_descs[0]);
+
+    } else if (node_type.find("CrossEntropyNode") != std::string::npos) {
+        // [P0.2 2026-08-30 苏璃珞] CrossEntropy 是双输入节点（logits + target）
+        // 仅 input_index==0（logits）有意义；target 不需 grad，input_index==1 返回 nullopt
+        if (input_index == 0) {
+            if (input_descs.size() < 2) return std::nullopt;
+            return buildCrossEntropyBackwardGraph(grad_desc, input_descs[0], input_descs[1]);
+        } else if (input_index == 1) {
+            return std::nullopt;  // target 无需梯度
+        }
+        return std::nullopt;
     }
 
     // 不支持的节点类型
@@ -572,7 +583,10 @@ bool C3BackwardCapture::supportsNodeType(const std::string& node_type) {
            node_type.find("MinNode") != std::string::npos ||
            node_type.find("MaxNode") != std::string::npos ||
            // [P0.2 2026-08-30 苏璃珞] Softmax 是单输入节点（dim 是 attribute，axis 固定 1）
-           node_type.find("SoftmaxNode") != std::string::npos;
+           node_type.find("SoftmaxNode") != std::string::npos ||
+           // [P0.2 2026-08-30 苏璃珞] CrossEntropy 双输入节点（logits + target）
+           // target 不需 grad（input_index=1 返回 nullopt）；仅 input_index=0 走 buildCrossEntropyBackwardGraph
+           node_type.find("CrossEntropyNode") != std::string::npos;
 }
 
 C3BackwardCapture::Stats C3BackwardCapture::getStats() const {
@@ -732,6 +746,64 @@ C3BackwardCapture::BackwardGraph C3BackwardCapture::buildSoftmaxBackwardGraph(
     g.markOutput(grad_x);
     // 图输入 [grad, x]，x 对应 forward_inputs[0]
     return {std::move(g), {0}};
+}
+
+// [P0.2 2026-08-30 苏璃珞] CrossEntropy backward graph construction
+//
+// 公式（axis=1 行 softmax，target 是 [M, N] one-hot / soft probability）：
+//   dL/d_logits[i, j] = softmax(logits)[i, j] - target[i, j]
+//
+// 实现步骤（4 op）：
+//   1. exp_x = exp(logits)              (Exp)
+//   2. sum_exp = sum(exp_x, axis=1, keepdim=true)  → [M, 1]  (SumReduce[keepdim])
+//   3. y = exp_x / sum_exp              (Div)  → softmax(logits)
+//   4. grad_logits = y - target         (Sub)  → [M, N]
+//
+// 已知限制（同 Softmax backward）：
+//   - 依赖 broadcast shape-based 修复（P0.2.1 立项）—— 当前 numel-based `idx % M`
+//     对非平凡尺寸（如 M=4, N=8）返回错位
+//   - 数值稳定：forward 走 CrossEntropyOpLowering 内部 max-subtraction，
+//                backward 这里是朴素 exp（与 forward 行为不同）
+//                后续可让 backward 也用 c3.softmax op（linalg.softmax 内部稳定）
+C3BackwardCapture::BackwardGraph C3BackwardCapture::buildCrossEntropyBackwardGraph(
+    const TensorDesc& grad_desc,
+    const TensorDesc& input_descs_0,  // logits_desc
+    const TensorDesc& input_descs_1)  // target_desc
+{
+    (void)grad_desc;  // CE 反向下游 grad 是常数 1/M（mean reduction）或 1，公式不需要它
+    Graph g;
+
+    // 输入: [logits, target]
+    size_t logits_in = g.addInput(input_descs_0);
+    size_t target_in = g.addInput(input_descs_1);
+
+    TensorDesc same_desc = TensorDesc::fromShape(input_descs_0.shape);
+
+    // 1) exp(logits)
+    size_t exp_logits = g.addNode(ExpNode{same_desc}, {logits_in}, same_desc);
+
+    // 2) sum(exp(logits), axis=1, keepdim=true)  → [M, 1]
+    TensorDesc scalar_desc = TensorDesc::fromShape(
+        input_descs_0.shape.size() > 0 ?
+            std::vector<size_t>{input_descs_0.shape[0], 1} :
+            std::vector<size_t>{1});
+    size_t sum_exp = g.addNode(
+        SumReduceNode{same_desc, 1, true},  // axis=1, keepdim=true
+        {exp_logits}, scalar_desc);
+
+    // 3) y = exp(logits) / sum_exp  (广播 [M,1] → [M,N])
+    size_t y = g.addNode(
+        DivNode{same_desc, scalar_desc}, {exp_logits, sum_exp}, same_desc);
+
+    // 4) grad_logits = y - target  → [M, N]
+    size_t grad_x = g.addNode(
+        SubNode{same_desc, same_desc}, {y, target_in}, same_desc);
+
+    g.markOutput(grad_x);
+    // 图输入 [logits, target]：
+    //   logits   —— forward_inputs[0]
+    //   target   —— forward_inputs[1]（不需 grad）
+    return {std::move(g), {0, 1}};
 }
 
 C3BackwardCapture::BackwardGraph C3BackwardCapture::buildTanhBackwardGraph(

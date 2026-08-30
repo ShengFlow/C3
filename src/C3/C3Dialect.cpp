@@ -50,6 +50,19 @@ void SumReduceOp::build(::mlir::OpBuilder &odsBuilder, ::mlir::OperationState &o
   odsState.getOrAddProperties<SumReduceOp::Properties>().keepdim = odsBuilder.getIntegerAttr(i32, keepdim);
 }
 
+// [P0.2 2026-08-30 苏璃珞] CrossEntropyOp 手写 build：与 SumReduceOp 同样的 I64Attr 模式
+// 解决 TableGen 生成的 build 用 IntegerAttr 包装，与 mlir::c3::CrossEntropyOp::build 期望不一致
+void CrossEntropyOp::build(::mlir::OpBuilder &odsBuilder, ::mlir::OperationState &odsState,
+                           ::mlir::Value logits, ::mlir::Value target, ::mlir::Value out,
+                           int64_t M, int64_t N) {
+  odsState.addOperands(logits);
+  odsState.addOperands(target);
+  odsState.addOperands(out);
+  auto i64 = odsBuilder.getI64Type();
+  odsState.getOrAddProperties<CrossEntropyOp::Properties>().M = odsBuilder.getIntegerAttr(i64, M);
+  odsState.getOrAddProperties<CrossEntropyOp::Properties>().N = odsBuilder.getIntegerAttr(i64, N);
+}
+
 void MatMulOp::build(::mlir::OpBuilder &odsBuilder, ::mlir::OperationState &odsState,
                      ::mlir::Value lhs, ::mlir::Value rhs, ::mlir::Value out,
                      ::mlir::Value bias,

@@ -842,13 +842,160 @@ struct SoftmaxOpLowering : public mlir::OpRewritePattern<mlir::c3::SoftmaxOp> {
     }
 };
 
+// [P0.2 2026-08-30 苏璃珞] CrossEntropyOpLowering：c3.cross_entropy → 手写 fused loop
+//
+// 公式：out[0] = -1/M * sum_i sum_c target_ic * log(softmax(logits)_ic)
+//
+// 数值稳定版（max-subtraction）：
+//   对每行 i：
+//     max_i = max_j logits[i, j]
+//     sum_exp_i = sum_j exp(logits[i, j] - max_i)
+//     loss_i = -sum_j target[i, j] * log(exp(logits[i, j] - max_i) / sum_exp_i + eps)
+//   out[0] = sum_i loss_i / M
+//
+// 选 fused loop 而非 linalg.softmax + linalg.elementwise + linalg.reduce 是因为：
+//   - 一次 row 扫描即可同时算 max/sum_exp/loss（3 个不同算子合并为 1 个 3 级 nested loop）
+//   - 避免中间分配 exp(logits) 临时 buffer
+//   - 现有 LinalgOneShotGen 缺多输入（logits+target）elementwise + softmax fused 的 op
+//     支持，需要新加 linalg generic 比较麻烦
+//   - 当前 C3 已有手写 fused 循环的先例（MatMulOpLowering，cblas sgemm 内联等）
+struct CrossEntropyOpLowering : public mlir::OpRewritePattern<mlir::c3::CrossEntropyOp> {
+    using OpRewritePattern<mlir::c3::CrossEntropyOp>::OpRewritePattern;
+
+    mlir::LogicalResult matchAndRewrite(mlir::c3::CrossEntropyOp op,
+                                        mlir::PatternRewriter& rewriter) const override {
+        auto loc = op.getLoc();
+        mlir::Value logits = op.getLogits();
+        mlir::Value target = op.getTarget();
+        mlir::Value out = op.getOut();
+        int64_t M = op.getM();
+        int64_t N = op.getN();
+
+        auto f32 = rewriter.getF32Type();
+        auto ptr_type = mlir::LLVM::LLVMPointerType::get(rewriter.getContext());
+        auto i64_type = rewriter.getI64Type();
+
+        mlir::Value M_v = rewriter.create<mlir::arith::ConstantIndexOp>(loc, M);
+        mlir::Value N_v = rewriter.create<mlir::arith::ConstantIndexOp>(loc, N);
+        mlir::Value c0 = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 0);
+        mlir::Value c1 = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 1);
+
+        // 1) 清零 out[0] = 0
+        mlir::Value zero_idx = rewriter.create<mlir::arith::ConstantIntOp>(loc, 0, 64);
+        mlir::Value out_ptr0 = rewriter.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, out,
+            mlir::ValueRange{zero_idx});
+        mlir::Value fzero = rewriter.create<mlir::arith::ConstantFloatOp>(loc, f32, llvm::APFloat(0.0f));
+        rewriter.create<mlir::LLVM::StoreOp>(loc, fzero, out_ptr0);
+
+        // 2) 外层 for i = 0..M, carry 累加 loss
+        auto init_loss = fzero;
+        auto outer_loop = rewriter.create<mlir::scf::ForOp>(loc, c0, M_v, c1,
+            mlir::ValueRange{init_loss});
+        rewriter.setInsertionPointToStart(outer_loop.getBody());
+        mlir::Value i_idx = outer_loop.getInductionVar();
+        mlir::Value i_i64 = indexToI64(rewriter, loc, i_idx);
+        mlir::Value loss_carry = outer_loop.getRegionIterArgs()[0];
+
+        // 3) 中层 for j = 0..N, 计算 max_i = max_j logits[i, j]（carry = max）
+        //    初值用一个非常小的负数（-1e30 等价 -INFINITY）
+        mlir::Value neg_inf = rewriter.create<mlir::arith::ConstantFloatOp>(loc, f32,
+            llvm::APFloat(-1.0e30f));
+        auto max_loop = rewriter.create<mlir::scf::ForOp>(loc, c0, N_v, c1,
+            mlir::ValueRange{neg_inf});
+        rewriter.setInsertionPointToStart(max_loop.getBody());
+        mlir::Value j1_idx = max_loop.getInductionVar();
+        mlir::Value j1_i64 = indexToI64(rewriter, loc, j1_idx);
+        mlir::Value max_carry = max_loop.getRegionIterArgs()[0];
+        mlir::Value row_off1 = rewriter.create<mlir::arith::MulIOp>(loc, i_i64,
+            rewriter.create<mlir::arith::ConstantIntOp>(loc, N, 64));
+        mlir::Value idx1 = rewriter.create<mlir::arith::AddIOp>(loc, row_off1, j1_i64);
+        mlir::Value p1 = rewriter.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, logits,
+            mlir::ValueRange{idx1});
+        mlir::Value v1 = rewriter.create<mlir::LLVM::LoadOp>(loc, f32, p1);
+        // max(a, b) 用 arith.maximumf（与 0 比较 NaN-safe）
+        mlir::Value new_max = rewriter.create<mlir::arith::MaximumFOp>(loc, max_carry, v1);
+        rewriter.create<mlir::scf::YieldOp>(loc, mlir::ValueRange{new_max});
+
+        rewriter.setInsertionPointAfter(max_loop);
+        mlir::Value row_max = max_loop.getResult(0);
+
+        // 4) 中层 for j = 0..N, 计算 sum_exp_i = sum_j exp(logits[i, j] - max_i)
+        auto sumexp_loop = rewriter.create<mlir::scf::ForOp>(loc, c0, N_v, c1,
+            mlir::ValueRange{fzero});
+        rewriter.setInsertionPointToStart(sumexp_loop.getBody());
+        mlir::Value j2_idx = sumexp_loop.getInductionVar();
+        mlir::Value j2_i64 = indexToI64(rewriter, loc, j2_idx);
+        mlir::Value sum_carry = sumexp_loop.getRegionIterArgs()[0];
+        mlir::Value row_off2 = rewriter.create<mlir::arith::MulIOp>(loc, i_i64,
+            rewriter.create<mlir::arith::ConstantIntOp>(loc, N, 64));
+        mlir::Value idx2 = rewriter.create<mlir::arith::AddIOp>(loc, row_off2, j2_i64);
+        mlir::Value p2 = rewriter.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, logits,
+            mlir::ValueRange{idx2});
+        mlir::Value v2 = rewriter.create<mlir::LLVM::LoadOp>(loc, f32, p2);
+        mlir::Value v2_shift = rewriter.create<mlir::arith::SubFOp>(loc, v2, row_max);
+        mlir::Value ev2 = rewriter.create<mlir::math::ExpOp>(loc, v2_shift);
+        mlir::Value new_sum = rewriter.create<mlir::arith::AddFOp>(loc, sum_carry, ev2);
+        rewriter.create<mlir::scf::YieldOp>(loc, mlir::ValueRange{new_sum});
+
+        rewriter.setInsertionPointAfter(sumexp_loop);
+        mlir::Value sum_exp = sumexp_loop.getResult(0);
+        // inv_sum = 1 / sum_exp（用 reciprocalf；sum_exp > 0 因为 exp 至少有一个 e^0 = 1）
+        mlir::Value fone = rewriter.create<mlir::arith::ConstantFloatOp>(loc, f32, llvm::APFloat(1.0f));
+        mlir::Value inv_sum = rewriter.create<mlir::arith::DivFOp>(loc, fone, sum_exp);
+
+        // 5) 中层 for j = 0..N, 计算 loss_i = -sum_j target[i, j] * log(exp(logits[i, j] - max_i) * inv_sum + eps)
+        mlir::Value eps = rewriter.create<mlir::arith::ConstantFloatOp>(loc, f32,
+            llvm::APFloat(1.0e-7f));
+        auto loss_loop = rewriter.create<mlir::scf::ForOp>(loc, c0, N_v, c1,
+            mlir::ValueRange{loss_carry});
+        rewriter.setInsertionPointToStart(loss_loop.getBody());
+        mlir::Value j3_idx = loss_loop.getInductionVar();
+        mlir::Value j3_i64 = indexToI64(rewriter, loc, j3_idx);
+        mlir::Value loss_carry_inner = loss_loop.getRegionIterArgs()[0];
+        mlir::Value row_off3 = rewriter.create<mlir::arith::MulIOp>(loc, i_i64,
+            rewriter.create<mlir::arith::ConstantIntOp>(loc, N, 64));
+        // logits[i, j] 再次加载
+        mlir::Value idx3 = rewriter.create<mlir::arith::AddIOp>(loc, row_off3, j3_i64);
+        mlir::Value p3 = rewriter.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, logits,
+            mlir::ValueRange{idx3});
+        mlir::Value v3 = rewriter.create<mlir::LLVM::LoadOp>(loc, f32, p3);
+        mlir::Value v3_shift = rewriter.create<mlir::arith::SubFOp>(loc, v3, row_max);
+        mlir::Value ev3 = rewriter.create<mlir::math::ExpOp>(loc, v3_shift);
+        mlir::Value p_ij = rewriter.create<mlir::arith::MulFOp>(loc, ev3, inv_sum);
+        mlir::Value p_ij_safe = rewriter.create<mlir::arith::MaximumFOp>(loc, p_ij, eps);
+        mlir::Value log_p = rewriter.create<mlir::math::LogOp>(loc, p_ij_safe);
+        // target[i, j]
+        mlir::Value pt = rewriter.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, target,
+            mlir::ValueRange{idx3});
+        mlir::Value t_ij = rewriter.create<mlir::LLVM::LoadOp>(loc, f32, pt);
+        mlir::Value product = rewriter.create<mlir::arith::MulFOp>(loc, t_ij, log_p);
+        mlir::Value new_loss = rewriter.create<mlir::arith::SubFOp>(loc, loss_carry_inner, product);
+        rewriter.create<mlir::scf::YieldOp>(loc, mlir::ValueRange{new_loss});
+
+        rewriter.setInsertionPointAfter(loss_loop);
+        mlir::Value new_loss_carry = loss_loop.getResult(0);
+        rewriter.create<mlir::scf::YieldOp>(loc, mlir::ValueRange{new_loss_carry});
+
+        rewriter.setInsertionPointAfter(outer_loop);
+        // 6) loss_total = outer_loop.result, out[0] = loss_total / M
+        mlir::Value loss_total = outer_loop.getResult(0);
+        mlir::Value M_f = rewriter.create<mlir::arith::SIToFPOp>(loc, f32,
+            rewriter.create<mlir::arith::ConstantIntOp>(loc, M, 64));
+        mlir::Value mean_loss = rewriter.create<mlir::arith::DivFOp>(loc, loss_total, M_f);
+        rewriter.create<mlir::LLVM::StoreOp>(loc, mean_loss, out_ptr0);
+
+        rewriter.eraseOp(op);
+        return mlir::success();
+    }
+};
+
 static void runC3Lowering(mlir::ModuleOp module) {
     mlir::RewritePatternSet patterns(module.getContext());
     patterns.add<TransposeOpLowering, SumReduceOpLowering, MatMulOpLowering,
                  AddOpLowering, SubOpLowering, MulOpLowering, DivOpLowering,
                  NegOpLowering, ReLUOpLowering, SigmoidOpLowering, TanhOpLowering,
                  ExpOpLowering, LogOpLowering,
-                 SoftmaxOpLowering>(module.getContext());  // [P0.2] 加 Softmax lowering
+                 SoftmaxOpLowering, CrossEntropyOpLowering>(module.getContext());  // [P0.2] 加 Softmax + CrossEntropy lowering
     if (mlir::failed(mlir::applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
         throw std::runtime_error("C3DialectLowering: C3ToLLVM lowering pass failed");
     }

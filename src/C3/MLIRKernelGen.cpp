@@ -1458,6 +1458,22 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
             auto N_attr = builder.getI64IntegerAttr(N);
             auto axis_attr = builder.getI32IntegerAttr(sm.axis);
             builder.create<mlir::c3::SoftmaxOp>(loc, in_ptrs[0], out_buf, M_attr, N_attr, axis_attr);
+        } else if (std::holds_alternative<CrossEntropyNode>(op)) {
+            // [P0.2 2026-08-30 苏璃珞] CrossEntropy forward kernel generation
+            // 双输入节点：logits + target，输出 1 元素标量（mean loss over batch）
+            // 走 c3.cross_entropy op → CrossEntropyOpLowering（手写 3 级 nested loop
+            // + max-subtraction 数值稳定）。不向量化（输出标量，标量循环已是单次写）。
+            const auto& ce = std::get<CrossEntropyNode>(op);
+            int64_t M = ce.logits_desc.shape.size() > 0 ? ce.logits_desc.shape[0] : 1;
+            int64_t N = ce.logits_desc.shape.size() > 1 ? ce.logits_desc.shape[1] : 1;
+            // in_ptrs[0] = logits, in_ptrs[1] = target（要求 node->inputs 按 [logits, target] 顺序）
+            if (node->inputs.size() < 2) {
+                throw std::runtime_error("MLIRKernelGen: CrossEntropyNode needs 2 inputs (logits, target)");
+            }
+            auto M_attr = builder.getI64IntegerAttr(M);
+            auto N_attr = builder.getI64IntegerAttr(N);
+            builder.create<mlir::c3::CrossEntropyOp>(loc,
+                in_ptrs[0], in_ptrs[1], out_buf, M_attr, N_attr);
         } else if (std::holds_alternative<TransposeNode>(op)) {
             const auto& tr = std::get<TransposeNode>(op);
             int64_t M = tr.in_desc.shape.size() > 0 ? tr.in_desc.shape[0] : 1;

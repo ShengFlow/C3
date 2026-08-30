@@ -418,6 +418,19 @@ private:
                                  const TensorDesc& input_desc);
 
     /**
+     * @brief CrossEntropy 反向 Graph（双输入节点：logits + target 都是 [M, N]）
+     * @param grad_desc 下游梯度描述符（CE 反向通常为常数 1/M 或 1，公式不依赖）
+     * @param input_descs_0 logits 描述符
+     * @param input_descs_1 target 描述符（one-hot / soft probability，[M, N]）
+     * @return C3 Graph: softmax(logits) - target  （4 op：Exp + SumReduce[keepdim] + Div + Sub）
+     * @details target 不需要 grad，input_index=1 应返回 std::nullopt。
+     *          仅 input_index=0（logits 的梯度）有意义。
+     */
+    BackwardGraph buildCrossEntropyBackwardGraph(const TensorDesc& grad_desc,
+                                 const TensorDesc& input_descs_0,
+                                 const TensorDesc& input_descs_1);
+
+    /**
      * @brief 根据节点类型字符串构建 backward Graph（用于融合编译）
      * @param node_type 节点类型字符串（如 "ReLUNode", "AddNode"）
      * @param grad_desc 下游梯度描述符
