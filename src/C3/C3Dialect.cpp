@@ -63,6 +63,21 @@ void CrossEntropyOp::build(::mlir::OpBuilder &odsBuilder, ::mlir::OperationState
   odsState.getOrAddProperties<CrossEntropyOp::Properties>().N = odsBuilder.getIntegerAttr(i64, N);
 }
 
+// [2026-08-31] 补 SoftmaxOp 手写 build：C3_SoftmaxOp 在 ODS 里声明了 long long/int 版
+// builder，但之前只实现了 Transpose/SumReduce/CrossEntropy/MatMul，漏掉 Softmax，
+// 导致整个 C3 MLIR 路径（MLIRKernelGen 生成 softmax）链接失败（SoftmaxOp::build 未定义）。
+void SoftmaxOp::build(::mlir::OpBuilder &odsBuilder, ::mlir::OperationState &odsState,
+                      ::mlir::Value input, ::mlir::Value out,
+                      long long M, long long N, int axis) {
+  odsState.addOperands(input);
+  odsState.addOperands(out);
+  auto i64 = odsBuilder.getI64Type();
+  auto i32 = odsBuilder.getI32Type();
+  odsState.getOrAddProperties<SoftmaxOp::Properties>().M = odsBuilder.getIntegerAttr(i64, M);
+  odsState.getOrAddProperties<SoftmaxOp::Properties>().N = odsBuilder.getIntegerAttr(i64, N);
+  odsState.getOrAddProperties<SoftmaxOp::Properties>().axis = odsBuilder.getIntegerAttr(i32, axis);
+}
+
 void MatMulOp::build(::mlir::OpBuilder &odsBuilder, ::mlir::OperationState &odsState,
                      ::mlir::Value lhs, ::mlir::Value rhs, ::mlir::Value out,
                      ::mlir::Value bias,

@@ -102,8 +102,10 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteBackward(
     }
 
     // ===== 统一 MIMO 融合反向 (梯度传导 + 激活求导 + 权重收缩) 🌟 =====
-    const char* enable_mimo = std::getenv("C3_ENABLE_MIMO_BACKWARD");
-    if (enable_mimo && std::string(enable_mimo) == "1") {
+    // [2026-08-31 恢复] 去掉 C3_ENABLE_MIMO_BACKWARD opt-in 门控，MIMO 默认开启
+    //   （历史黄金态默认开：mimo_compile=2, hit=4678/epoch, MIMO bwd ~57ms/ep）。
+    //   保留 f8161c6 的正确性守卫（Gt SelectOp / pool buffer 独立槽位 /
+    //   Softmax·Sigmoid 回退 eager / tryExecuteFusedBackward 短路）。
     {
         std::unique_lock<std::shared_mutex> lock(intercepted_mutex_);
         auto it = pending_mimo_intercepted_.find(node);
@@ -117,7 +119,6 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteBackward(
     if (mimo_res.has_value()) {
         return mimo_res;
     }
-    }
 
     // ===== Phase 2: 先尝试反向融合（整段序列一次性执行） =====
     // 注意：融合 kernel 是单输出的（对应序列首节点 input_index=0 的梯度），
@@ -130,7 +131,7 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteBackward(
     if (n_inputs == 0) n_inputs = 1;
     const std::string type_name = std::string(typeid(*node).name());
 
-    if (n_inputs == 1 && !(enable_mimo && std::string(enable_mimo) == "1")) {
+    if (n_inputs == 1) {
         auto fused = tryExecuteFusedBackward(node, grad, forward_inputs);
         if (fused.has_value()) {
             std::vector<Tensor> out;
@@ -536,8 +537,7 @@ std::optional<C3BackwardCapture::BackwardGraph> C3BackwardCapture::buildBackward
         return buildLogBackwardGraph(grad_desc, input_descs[0]);
 
     } else if (node_type.find("SoftmaxNode") != std::string::npos) {
-        // Softmax backward 暂保守回退 eager。多归约图的临时 buffer
-        // 生命周期/广播路径尚未满足 C3 命中条件，不能生成不可靠 kernel。
+        // Softmax backward 暂保守回退 eager；多归约图仍未通过生命周期验证。
         return std::nullopt;
 
     } else if (node_type.find("CrossEntropyNode") != std::string::npos) {
@@ -578,7 +578,8 @@ bool C3BackwardCapture::supportsNodeType(const std::string& node_type) {
     // 先从支持列表移除，一律回退 eager，保证 Test 4-7 数值正确性。
     // 后续单独修多输入单节点 kernel，验证正确后再加回。
     return node_type.find("ReLUNode") != std::string::npos ||
-           // Sigmoid backward 在复合链中仍存在输入/梯度映射异常，暂回退 eager。
+           // Sigmoid backward 暂回退 eager，待 live-range coloring 稳定后重新启用。
+
            node_type.find("TanhNode") != std::string::npos ||
            node_type.find("NegNode") != std::string::npos ||
            node_type.find("GELUNode") != std::string::npos ||
@@ -590,8 +591,8 @@ bool C3BackwardCapture::supportsNodeType(const std::string& node_type) {
            node_type.find("LogNode") != std::string::npos ||
            node_type.find("MinNode") != std::string::npos ||
            node_type.find("MaxNode") != std::string::npos ||
-           // Softmax backward 暂回退 eager：其多归约图的临时 buffer 生命周期
-           // 仍需单独修复，不能在数值不稳定时命中 C3。
+           // Softmax backward 暂回退 eager，避免多归约临时 buffer 生命周期风险。
+
            // [P0.2 2026-08-30 苏璃珞] CrossEntropy 双输入节点（logits + target）
            // target 不需 grad（input_index=1 返回 nullopt）；仅 input_index=0 走 buildCrossEntropyBackwardGraph
            node_type.find("CrossEntropyNode") != std::string::npos;
