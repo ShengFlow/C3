@@ -441,8 +441,9 @@ static bool isFusedChainVectorizable(const std::vector<NodeVariant>& ops,
                                      const std::vector<std::vector<size_t>>& op_inputs,
                                      const std::unordered_map<size_t, int64_t>& arg_numels,
                                      size_t n) {
-    // 当前多节点向量化 builder 仍无法表达 backward 分支 DAG 的完整 live range。
-    // 在识别出安全 live range 分析前，统一走标量 DAG 生成器保证默认 backward 正确性。
+    // backward 图可能包含共享依赖的分支 DAG；当前调用链没有可靠的
+    // graph-kind 标记，因此统一走标量 DAG 生成器，避免向量化线性链假设
+    // 误用于 backward。后续 live-range 完成后再按 graph 属性精确放行。
     return false;
 
     // [Fix 2026-08-28] 严格线性链校验：buildFusedMultiNodeVectorized 假设
@@ -1098,9 +1099,12 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
     for (size_t i = 0; i < num_intermediates; ++i) {
         if (buffer_numels[i] > max_numel) max_numel = buffer_numels[i];
     }
-    // 分支 backward 图需要保留多个仍存活的中间值；两槽交替复用会覆盖
-    // Sigmoid backward 中 sigmoid / (1-sigmoid) 等共享依赖。先使用独立槽位。
-    size_t pool_buf_count = num_intermediates;
+    // 保守分配：每个中间节点独占槽位（f8161c6 为多归约图正确性）。
+    // [2026-08-31 实验] Sigmoid/Softmax backward 已回退 eager，多归约 DAG 不再触达
+    //   此处；恢复 2 槽复用以贴近黄金态分配，实测是否消除 MIMO 标量化性能回归。
+    size_t pool_buf_count = (num_intermediates == 0) ? 0 : std::min(num_intermediates, (size_t)2);
+    std::vector<size_t> logical_to_pool(num_intermediates, SIZE_MAX);
+    for (size_t i = 0; i < num_intermediates; ++i) logical_to_pool[i] = (pool_buf_count == 0) ? SIZE_MAX : (i % pool_buf_count);
     std::vector<mlir::Value> tmp_buffers;
     if (pool_buf_count > 0) {
         for (size_t pi = 0; pi < pool_buf_count; ++pi) {
@@ -1119,13 +1123,6 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
         mlir::Value offset_val = builder.create<mlir::arith::ConstantIntOp>(loc, offset, 64);
         mlir::Value buf = builder.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, scratchpad_ptr, mlir::ValueRange{offset_val});
         tmp_buffers.push_back(buf);
-    }
-
-    // 逻辑 buffer → pool buffer 的映射（交替分配，确保串行图的正确性）
-    // logical_buf_idx → pool_buf_idx (0 或 1)
-    std::vector<size_t> logical_to_pool(num_intermediates, SIZE_MAX);
-    for (size_t i = 0; i < num_intermediates; ++i) {
-        logical_to_pool[i] = i % std::max(pool_buf_count, (size_t)1);
     }
 
     // 写入所有常量节点的初始值
@@ -2233,8 +2230,8 @@ GeneratedKernel generateFromGraphMLIR(const Graph& graph, int opt_level) {
                 num_constants++;
             }
         }
-        // 必须与上面的独立中间 buffer 分配保持一致，否则 execute 会越界访问 scratchpad。
-        size_t pool_buf_count = num_intermediates;
+        // 与 buildMultiNodeMLIR 的 2 槽复用分配保持一致。
+        size_t pool_buf_count = (num_intermediates == 0) ? 0 : std::min(num_intermediates, (size_t)2);
         result.scratch_size = max_numel * pool_buf_count + num_constants;
 
         for (const auto& node : nodes) {
