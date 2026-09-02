@@ -94,6 +94,40 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteBackward(
         std::lock_guard<std::mutex> lock(stats_mutex_);
         backward_attempt_count_++;
     }
+
+    // [BW-SEG2 2026-09-02] C3_BW_SEG2=1：对 tryExecuteBackward 整体分段，
+    //   确认「非内核编排」overhead 到底落在哪一步（区别于 MIMO-SEG 管 MIMO 内部、
+    //   PHASE1-MISS 管 miss）。
+    //   分段语义（每段的是「该步骤耗时」，用相邻 mark 差分累加）：
+    //     prefix  : disabled/开关检查 + MIMO pending 拦截 mutex 查找
+    //     mimo    : tryExecuteUnifiedMIMOBackward 整体调用（含 MIMO-SEG 内部）
+    //     phase2  : tryExecuteFusedBackward（单输入融合反向）
+    //     phase1  : Phase1 逐输入 kernel key 构建 + 查找 + 执行循环
+    //     miss    : 任一输入 miss → compileBackwardAsyncForInput + wait 同步等待
+    //     wrap    : 结果组装 + 统计 + 返回
+    static const bool bw_seg2 = [] {
+        const char* e = std::getenv("C3_BW_SEG2");
+        return e && std::string(e) == "1";
+    }();
+    static struct {
+        std::atomic<uint64_t> n[7], c[7];
+    } beseg;
+    auto beprev = std::chrono::steady_clock::now();
+    auto bemark = [&beprev](int seg) {
+        if (!bw_seg2) return;
+        auto now = std::chrono::steady_clock::now();
+        uint64_t d = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(now - beprev).count();
+        beseg.n[seg] += d; beseg.c[seg]++;
+        beprev = now;
+        static thread_local size_t beacc = 0;
+        if ((++beacc) % 400 == 0) {
+            const char* nm[7] = {"prefix","mimo","phase2","phase1","miss","wrap","other"};
+            fprintf(stderr, "[BW-SEG2]");
+            for (int i = 0; i < 7; ++i)
+                fprintf(stderr, " %s=%.2fms/%llu", nm[i], beseg.n[i]*1e-3, (unsigned long long)beseg.c[i]);
+            fprintf(stderr, "\n");
+        }
+    };
     // backward C3 默认启用；保留 C3_ENABLE_BACKWARD=0 作为显式关闭方式。
     // CTORCH_DISABLE_C3_BACKWARD=1 或 C3_DISABLE_BACKWARD=1 仍由上方统一开关处理。
     const char* enable_backward = std::getenv("C3_ENABLE_BACKWARD");
@@ -115,7 +149,9 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteBackward(
             return grads;
         }
     }
+    bemark(0); // prefix 段结束 → 进入 mimo 段
     auto mimo_res = tryExecuteUnifiedMIMOBackward(node, grad, forward_inputs);
+    bemark(1); // mimo 段结束（无论 hit/miss，此时间点后进入后续逻辑或返回）
     if (mimo_res.has_value()) {
         return mimo_res;
     }
@@ -130,6 +166,17 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteBackward(
     size_t n_inputs = forward_inputs.empty() ? node->getInputs().size() : forward_inputs.size();
     if (n_inputs == 0) n_inputs = 1;
     const std::string type_name = std::string(typeid(*node).name());
+
+    // [BW-FIX 2026-09-02] CrossEntropy 是末端双输入节点，其 eager backward
+    //   (CrossEntropyNode::backward) 只给 logits(upstream[0]) 投 1 个梯度、**不给 target 投梯度**。
+    //   C3 逐输入协议却强制 out.size()==fwd_inputs.size()（含 target）且逐输入 shape 匹配，
+    //   两者语义冲突：强行让 in:0 命中并在 in:1 补零梯度，会把错误形状的梯度投给 target 上游，
+    //   导致 GradBucket::add 的 Add_SIMD 形状不兼容崩溃（已实测）。故 CE 反向应始终静默走 eager，
+    //   在此**直接短路 return nullopt**，彻底摘除 CE 的逐输入查找/execute/miss 链路——既符合
+    //   语义，也消除了 CE 历史上每 batch ~399 次「已装表 key 但仍 execute 失败」的表观 miss。
+    if (type_name.find("CrossEntropyNode") != std::string::npos) {
+        return std::nullopt;
+    }
 
     if (n_inputs == 1) {
         auto fused = tryExecuteFusedBackward(node, grad, forward_inputs);
@@ -154,6 +201,7 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteBackward(
     // ===== Phase 1: 逐输入单输出 kernel 查找（多输入节点全覆盖） =====
     // 构建查找 key 前缀：node_type|grad:shape|inputs:shape
 
+    bemark(2); // phase2 段结束 → 进入 phase1 段
     std::stringstream ss;
     ss << type_name << "|grad:";
     for (size_t s : grad.sizes()) ss << s << ",";
@@ -168,6 +216,19 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteBackward(
     std::vector<Tensor> out;
     out.reserve(n_inputs);
     for (size_t i = 0; i < n_inputs; ++i) {
+        // [BW-FIX 2026-09-02] Add 反向「无广播侧」是恒等 passthrough：当目标输入形状 ==
+        // grad 形状（如 bias 加的激活侧 in:0，grad:128,256 → dx0=grad），完全不需要 kernel。
+        // 历史 bug：buildAddBackwardGraph 对它产出「无算力节点」图 → worker 在
+        // nodeCount<=inputCount 处跳过、从不装表 → 每批都重起线程 + waitForPendingCompiles
+        // 忙轮询白等 ~646µs（约占 backward 85%）。这里直接返回 grad，砍掉整条链路。
+        if (type_name.find("AddNode") != std::string::npos) {
+            const auto& in0 =
+                (!forward_inputs.empty()) ? forward_inputs[i] : node->getInputs()[i];
+            if (in0.sizes() == grad.sizes()) {
+                out.push_back(grad);
+                continue; // 该输入无需 kernel；其余输入（如广播 bias 侧）继续正常编译
+            }
+        }
         auto result = C3KernelRegistry::getInstance().tryExecuteBackward(
             base_key + "|in:" + std::to_string(i), grad, forward_inputs);
         if (!result.has_value() || result->empty()) {
@@ -182,25 +243,43 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteBackward(
                 return e && std::string(e) == "1";
             }();
             if (miss_trace) {
+                // [BW-MISS 2026-09-02] 从「仅打印首次 key」升级为「按 key 统计累计 miss 次数」，
+                //   定期输出 top 来源，以区分「首轮 miss 后即命中」vs「每 batch 稳定 miss」。
                 static std::mutex mt_mu;
-                static std::unordered_set<size_t> mt_seen;
-                size_t kh = std::hash<std::string>{}(base_key + "|in:" + std::to_string(i));
-                bool first = false;
+                static std::unordered_map<std::string, uint64_t> mt_count;
+                static uint64_t mt_total = 0;
+                std::string mkey = base_key + "|in:" + std::to_string(i);
+                bool report = false;
                 {
                     std::lock_guard<std::mutex> mk(mt_mu);
-                    first = mt_seen.insert(kh).second;
+                    mt_total++;
+                    mt_count[mkey]++;
+                    report = (mt_total % 500) == 0; // 每 500 次 miss 汇报一次 top（含首次累积）
                 }
-                if (first)
-                    fprintf(stderr, "[BW-MISS] key=%s\n",
-                            (base_key + "|in:" + std::to_string(i)).c_str());
+                if (report) {
+                    std::lock_guard<std::mutex> mk(mt_mu);
+                    fprintf(stderr, "[BW-MISS-TOP] total=%llu\n", (unsigned long long)mt_total);
+                    // 降序 top 8
+                    std::vector<std::pair<uint64_t, std::string>> v;
+                    v.reserve(mt_count.size());
+                    for (auto& kv : mt_count) v.emplace_back(kv.second, kv.first);
+                    std::sort(v.begin(), v.end(),
+                              [](auto& a, auto& b) { return a.first > b.first; });
+                    for (size_t k = 0; k < v.size() && k < 8; ++k)
+                        fprintf(stderr, "  %llu  hasKey=%d  %s\n",
+                                (unsigned long long)v[k].first,
+                                (int)C3KernelRegistry::getInstance().hasBackwardKey(v[k].second),
+                                v[k].second.c_str());
+                }
             }
+            bemark(3); // phase1 段结束（此调用命中 miss）→ 进入 miss 段
             compileBackwardAsyncForInput(node, grad, i);
             // [P0.6B 2026-08-30 苏璃珞 重做] miss 后等所有 in-flight async 编译完成
             //
             // 历史：之前 compileBackwardAsyncForInput 启动 std::thread + .detach()
             //       不等完成。miss 路径立即 return std::nullopt。**下次同 key 调用**
             //       时大概率前一次 async 还在编译（5-50ms）→ backward_entries_ 仍空
-            //       → 重复 fallback。实测覆盖率 6.25%。
+            //        → 重复 fallback。实测覆盖率 6.25%。
             //
             // 修复（最安全方案，不改任何函数体）：miss 后**同步等**所有 in-flight
             //       编译任务完成。**主线程阻塞** 5-50ms × N（in-flight 数），
@@ -208,11 +287,42 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteBackward(
             //
             // 不改 compileBackwardAsyncForInput 函数体：避免触发 static const 初始化
             //       时序问题（之前 P0.6B inline 同步版本 hang 根因未知）。
-            getInstance().waitForPendingCompiles();
+            {
+                // [PHASE1-MISS 2026-09-02] C3_PH1_MISS=1：量化非 ReLU 节点 miss 后
+                //   compileBackwardAsyncForInput + waitForPendingCompiles 的同步等待开销。
+                static const bool ph1_miss = [] {
+                    const char* e = std::getenv("C3_PH1_MISS");
+                    return e && std::string(e) == "1";
+                }();
+                if (ph1_miss) {
+                    static std::atomic<uint64_t> s_compile_us{0}, s_wait_us{0}, s_calls{0};
+                    auto t0 = std::chrono::steady_clock::now();
+                    compileBackwardAsyncForInput(node, grad, i);
+                    auto t1 = std::chrono::steady_clock::now();
+                    getInstance().waitForPendingCompiles();
+                    auto t2 = std::chrono::steady_clock::now();
+                    s_compile_us += (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+                    s_wait_us    += (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
+                    s_calls++;
+                    static size_t acc = 0;
+                    if ((++acc) % 200 == 0)
+                        fprintf(stderr, "[PHASE1-MISS] compile=%.2fms/%llu wait=%.2fms/%llu calls=%llu\n",
+                                s_compile_us.load()*1e-3, (unsigned long long)s_calls.load(),
+                                s_wait_us.load()*1e-3, (unsigned long long)s_calls.load(),
+                                (unsigned long long)s_calls.load());
+                } else {
+                    compileBackwardAsyncForInput(node, grad, i);
+                    getInstance().waitForPendingCompiles();
+                }
+                bemark(4); // miss 段结束（compile+wait 完成）→ 返回前
+            }
             return std::nullopt;
         }
         out.push_back(std::move(result->at(0)));
     }
+
+    bemark(3); // phase1 段结束（未命中 miss，全部输入都取到 kernel）→ 进入 wrap 段
+    bemark(5); // wrap 段结束（累积本身很短，仅作调用计数）
 
     std::lock_guard<std::mutex> lock(stats_mutex_);
     cache_hit_count_++;
@@ -395,8 +505,22 @@ void C3BackwardCapture::compileBackwardAsyncForInput(
 
     // 【修复】不能用 std::async → future 析构会阻塞 → 变相同步
     std::thread([this, type, input_index, grad_desc, input_descs, per_key]() {
+        // [BW-DIAG 2026-09-02] C3_BW_DIAG=1：定位「支持但装不上」的 per-key 编译失败原因
+        static const bool bw_diag = [] {
+            const char* e = std::getenv("C3_BW_DIAG");
+            return e && std::string(e) == "1";
+        }();
+        static std::mutex diag_mu;
+        static std::unordered_set<std::string> diag_seen;
+        auto diag = [&](const char* reason) {
+            if (!bw_diag) return;
+            std::lock_guard<std::mutex> k(diag_mu);
+            if (!diag_seen.insert(per_key).second) return;
+            fprintf(stderr, "[BW-DIAG] key=%s reason=%s\n", per_key.c_str(), reason);
+        };
         auto graph_opt = buildBackwardGraphForTypeAndIndex(type, input_index, grad_desc, input_descs);
         if (!graph_opt.has_value()) {
+            diag("buildGraph=nullopt");
             std::lock_guard<std::mutex> lock(pending_mutex_);
             pending_compiles_.erase(per_key);
             return;
@@ -405,6 +529,7 @@ void C3BackwardCapture::compileBackwardAsyncForInput(
         Graph& graph = graph_pair.first;
         const std::vector<size_t>& fwd_input_map = graph_pair.second;
         if (graph.nodeCount() <= graph.inputCount()) {
+            diag("no-compute (nodeCount<=inputCount)");
             std::lock_guard<std::mutex> lock(pending_mutex_);
             pending_compiles_.erase(per_key);
             return;
@@ -438,18 +563,11 @@ void C3BackwardCapture::compileBackwardAsyncForInput(
 #endif
                 std::lock_guard<std::mutex> lock(stats_mutex_);
                 compile_count_++;
+            } else {
+                diag("compile=kernel-null");
             }
-#ifdef CT_DEBUG
-            else {
-                std::cerr << "[C3-BW-DEBUG-FOR-INPUT] compile returned nullptr key=" << per_key << std::endl;
-                std::cerr.flush();
-            }
-#endif
         } catch (const std::exception& e) {
-#ifdef CT_DEBUG
-            std::cerr << "[C3-BW-DEBUG-FOR-INPUT] compile threw: " << e.what() << " key=" << per_key << std::endl;
-            std::cerr.flush();
-#endif
+            diag(std::string("compile-threw: ").append(e.what()).c_str());
             (void)e;
         }
         std::lock_guard<std::mutex> lock(pending_mutex_);
@@ -1998,6 +2116,31 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteUnifiedMIMOBackw
     const ::Node* node, const Tensor& grad,
     const std::vector<Tensor>& forward_inputs)
 {
+    // [MIMO-SEG 2026-09-02] C3_MIMO_SEG=1：稳态 HIT 命中路径内部五段耗时分布
+    //   checks / keybuild / hitlookup / inbuild(输入向量拷贝) / exec / wrap(输出+插表)。
+    //   定位 mimo guard ~600ms/ep 中「非内核」的编排开销到底出在哪一段。
+    static const bool mimo_seg = [] {
+        const char* e = std::getenv("C3_MIMO_SEG");
+        return e && std::string(e) == "1";
+    }();
+    static struct { std::atomic<uint64_t> n[6], c[6]; } mseg;
+    auto tprev = std::chrono::steady_clock::now();
+    auto mark = [&tprev](int seg) {
+        if (!mimo_seg) return;
+        auto now = std::chrono::steady_clock::now();
+        uint64_t d = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(now - tprev).count();
+        mseg.n[seg] += d; mseg.c[seg]++;
+        tprev = now;
+        static thread_local size_t acc = 0;
+        if ((++acc) % 300 == 0) {
+            const char* nm[6] = {"checks","keybuild","hitlookup","inbuild","exec","wrap"};
+            fprintf(stderr, "[MIMO-SEG]");
+            for (int i = 0; i < 6; ++i)
+                fprintf(stderr, " %s=%.2fms/%llu", nm[i], mseg.n[i]*1e-3, (unsigned long long)mseg.c[i]);
+            fprintf(stderr, "\n");
+        }
+    };
+
     // 检查是否为支持的激活节点
     std::string current_type = std::string(typeid(*node).name());
     bool is_act = (current_type.find("ReLUNode") != std::string::npos ||
@@ -2023,6 +2166,8 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteUnifiedMIMOBackw
     const Tensor& X = matmul_node->getInputs()[0];
     const Tensor& W = matmul_node->getInputs()[1];
 
+    mark(0); // checks: typeid + 上游匹配 + 张量取址
+
     // 构建 MIMO cache key
     auto t_key0 = std::chrono::steady_clock::now();
     std::stringstream ss;
@@ -2041,6 +2186,7 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteUnifiedMIMOBackw
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - t_key0).count());
     }
+    mark(1); // keybuild
 
     // 检查是否有已编译的 JIT kernel
     auto& registry = C3KernelRegistry::getInstance();
@@ -2068,8 +2214,12 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteUnifiedMIMOBackw
                         dns / 1000.0);
             }
         }
+        mark(2); // hitlookup: hasBackwardKey
+
         // 收集输入：[z, X, W]，不重复包含 grad，配合 fwd_input_map {0, 1, 2}
         std::vector<Tensor> inputs = {z, X, W};
+        mark(3); // inbuild: 输入向量拷贝
+
         auto t_exec0 = std::chrono::steady_clock::now();
         auto result = registry.tryExecuteBackward(mimo_key, grad, inputs);
         if (result.has_value() && result->size() == 4) {
@@ -2085,6 +2235,7 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteUnifiedMIMOBackw
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now() - t_exec0).count());
             }
+            mark(4); // exec: kernel 实际执行
 
             // 存入 pending_mimo_intercepted_
             {
@@ -2101,6 +2252,7 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteUnifiedMIMOBackw
 
             // ReLU_Grad returns `grad_z`
             std::vector<Tensor> act_res = {grad_z};
+            mark(5); // wrap: 输出 vector + 插 pending 表
             return act_res;
         }
     }
