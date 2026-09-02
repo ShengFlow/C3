@@ -185,6 +185,20 @@ public:
           num_outputs_(num_outputs), out_shapes_(std::move(out_shapes)),
           scratch_size_(scratch_size) {
         opt_level_ = opt_level;
+        // [MIMO setup 优化] out_shapes_ 编译期固定：把每输出的平坦偏移与总元素数预计算成
+        // 成员，快路径直接复用，消除 execute() 热路径上每调用的多次 shape 向量分配/拷贝。
+        if (out_shapes_.empty()) default_out_shape_ = {elem_n_};
+        const size_t seg_n = (num_outputs_ > 0) ? num_outputs_ : 1;
+        out_offsets_.reserve(seg_n);
+        size_t acc = 0;
+        for (size_t k = 0; k < seg_n; ++k) {
+            out_offsets_.push_back(acc);
+            const auto& shape = (k < out_shapes_.size()) ? out_shapes_[k] : default_out_shape_;
+            size_t n = 1;
+            for (auto s : shape) n *= s;
+            acc += n;
+        }
+        total_out_numel_ = acc;
     }
 
     ~MultiNodeCompiledKernel() override {
@@ -201,24 +215,22 @@ public:
         // [MIMO 深挖] setup(输入指针收集 + 平坦输出分配 + 输出 Tensor 构造) vs func_(cargo) 分桶
         auto t_mn0 = std::chrono::steady_clock::now();
 
+        // [MIMO 优化探针] C3_MN_SETUP_TRACE=1：把 setup 拆成 data_read / 输出分配 / Tensor构造 三段
+        // 定向看出 mn_setup_us≈184ms/ep 的最大块，默认关无开销。static 缓存 env 读取。
+        static const bool mn_setup_trace = (std::getenv("C3_MN_SETUP_TRACE") != nullptr);
+
         // 收集输入指针
         std::vector<const float*> in_ptrs;
         for (size_t i = 0; i < num_inputs_; ++i) {
             in_ptrs.push_back(inputs[i].data_read<float>());
         }
+        auto t_mn0_read = std::chrono::steady_clock::now();
 
         // 多输出支持：直接进行零拷贝输出分配
+        // [MIMO setup 优化] 偏移量/总元素数已按 out_shapes_ 在构造期预计算，热路径直接复用。
         const size_t seg_n = (num_outputs_ > 0) ? num_outputs_ : 1;
-        size_t total_out_numel = 0;
-        std::vector<size_t> out_offsets;
-        for (size_t k = 0; k < seg_n; ++k) {
-            out_offsets.push_back(total_out_numel);
-            std::vector<size_t> shape = (k < out_shapes_.size()) ? out_shapes_[k]
-                                                                 : std::vector<size_t>{elem_n_};
-            size_t n = 1;
-            for (auto s : shape) n *= s;
-            total_out_numel += n;
-        }
+        const auto& out_offsets = out_offsets_;
+        const size_t total_out_numel = total_out_numel_;
 
         // 1. 分配一个平面 contiguous Storage
         // [MIMO/多节点输出分配池] CPU 路径走池化复用 flat 缓冲（引用归零自动归还），
@@ -237,12 +249,38 @@ public:
         std::vector<Tensor> outs;
         outs.reserve(seg_n);
         for (size_t k = 0; k < seg_n; ++k) {
-            std::vector<size_t> shape = (k < out_shapes_.size()) ? out_shapes_[k]
-                                                                 : std::vector<size_t>{elem_n_};
+            // [MIMO setup 优化] 复用构造期预计算的 shape 引用，避免每次向量拷贝
+            const auto& shape = (k < out_shapes_.size()) ? out_shapes_[k] : default_out_shape_;
             Tensor t(ShapeTag{}, shape, DType::kFloat, device_);
             t.storage() = out_storage;
             t.set_storage_offset(out_offsets[k]);
             outs.push_back(std::move(t));
+        }
+        auto t_mn0_tns = std::chrono::steady_clock::now();
+
+        // [MIMO setup 探针] 聚合 data_read / (offset+pool) / Tensor构造 三段耗时，每 500 次打印。
+        // 仅 C3_MN_SETUP_TRACE=1 生效；static 缓存，默认零开销。
+        if (mn_setup_trace) {
+            static std::mutex slock;
+            static uint64_t s_read_ns=0, s_pool_ns=0, s_tns_ns=0, s_tot_ns=0, s_calls=0;
+            { std::lock_guard<std::mutex> lk(slock);
+              s_read_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  t_mn0_read - t_mn0).count();
+              s_pool_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  t_mn0_tns - t_mn0_read).count();
+              s_tns_ns  += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - t_mn0_tns).count();
+              s_tot_ns  += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - t_mn0).count();
+              if ((++s_calls) % 500 == 0) {
+                fprintf(stderr, "[MN-SETUP] calls=%llu total_setup_us=%.1f | data_read=%.1fus "
+                        "(%.1f%%) | offset+pool=%.1fus (%.1f%%) | tensor_ctor=%.1fus (%.1f%%)\n",
+                        (unsigned long long)s_calls,
+                        s_tot_ns/1e3, s_read_ns/1e3, 100.0*s_read_ns/s_tot_ns,
+                        s_pool_ns/1e3, 100.0*s_pool_ns/s_tot_ns,
+                        s_tns_ns/1e3, 100.0*s_tns_ns/s_tot_ns);
+              }
+            }
         }
 
         // 设定并行阈值 (Threshold Gate)
@@ -312,9 +350,28 @@ public:
         }
 
         // 记录 cargo(func_) 耗时（覆盖串行与并行两分支）
-        g_mn_func_ns.fetch_add(
-            (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now() - t_mn_func).count(), std::memory_order_relaxed);
+        uint64_t this_func_ns = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t_mn_func).count();
+        g_mn_func_ns.fetch_add(this_func_ns, std::memory_order_relaxed);
+
+        // [MIMO 优化探针] C3_MN_DETAIL=1：按 elem_n 聚合 func_ 每次调用的规模与时耗，
+        // 定向分离「哪个规模的 MIMO kernel」吃掉最多时间。默认关，无开销。
+        if (getenv("C3_MN_DETAIL") != nullptr) {
+            static std::mutex dlock;
+            static std::unordered_map<uint64_t, std::pair<uint64_t, uint64_t>> agg; // elem -> {count, func_ns}
+            { std::lock_guard<std::mutex> lk(dlock);
+              agg[elem_n_].first += 1;
+              agg[elem_n_].second += this_func_ns; }
+            static uint64_t calls_since_print = 0;
+            if ((++calls_since_print) % 500 == 0) {
+                std::lock_guard<std::mutex> lk(dlock);
+                for (const auto& [elem, p] : agg)
+                    fprintf(stderr, "[MN-DETAIL] elem_n=%llu count=%llu total_func_us=%.1f avg_us=%.1f\n",
+                            (unsigned long long)elem, (unsigned long long)p.first,
+                            p.second / 1e3, (p.second / 1e3) / (double)p.first);
+                fprintf(stderr, "[MN-DETAIL] ---\n");
+            }
+        }
 
         return outs;
     }
@@ -346,6 +403,9 @@ private:
     size_t elem_n_;
     size_t num_outputs_;
     std::vector<std::vector<size_t>> out_shapes_;
+    std::vector<size_t> out_offsets_;    // 预计算：每输出的平坦偏移
+    size_t total_out_numel_ = 0;          // 预计算：所有输出元素总数
+    std::vector<size_t> default_out_shape_; // 多输出为 0 时回退 {elem_n_}
     size_t scratch_size_ = 0;
 };
 
@@ -921,6 +981,13 @@ static std::shared_ptr<CompiledKernel> doCompile(
                 gen.elem_n, out_shapes.size(), out_shapes,
                 gen.scratch_size, options.opt_level
             );
+            if (getenv("C3_MN_DETAIL") != nullptr) {
+                fprintf(stderr, "[MN-CFG] is_multi_node M=%zu K=%zu N=%zu elem_n=%zu num_in=%zu n_out=%zu scratch=%zu out_shapes=",
+                        (size_t)gen.M, (size_t)gen.K, (size_t)gen.N, (size_t)gen.elem_n,
+                        (size_t)gen.num_inputs, out_shapes.size(), (size_t)gen.scratch_size);
+                for (auto& s : out_shapes) { fprintf(stderr, "["); for (auto d : s) fprintf(stderr, "%zu,", d); fprintf(stderr, "]"); }
+                fprintf(stderr, "\n");
+            }
         } else if (gen.is_fused) {
             kernel = std::make_shared<FusedCompiledKernel>(
                 gen.fused_func, gen.deleter, makeCacheKey(working_graph, options),

@@ -441,10 +441,9 @@ static bool isFusedChainVectorizable(const std::vector<NodeVariant>& ops,
                                      const std::vector<std::vector<size_t>>& op_inputs,
                                      const std::unordered_map<size_t, int64_t>& arg_numels,
                                      size_t n) {
-    // backward 图可能包含共享依赖的分支 DAG；当前调用链没有可靠的
-    // graph-kind 标记，因此统一走标量 DAG 生成器，避免向量化线性链假设
-    // 误用于 backward。后续 live-range 完成后再按 graph 属性精确放行。
-    return false;
+    // backward 图可能包含共享依赖的分支 DAG；为诊断启用向量化（默认开，
+    // 可用 C3_MLIR_NO_VECTORIZE=1 逃生关闭）。详见下方严格线性链校验。
+    if (std::getenv("C3_MLIR_NO_VECTORIZE") != nullptr) return false;
 
     // [Fix 2026-08-28] 严格线性链校验：buildFusedMultiNodeVectorized 假设
     //   ① op0 的所有输入都是外部 arg；② 对 op>0，inputs[0] 是上一 op 的输出（内部节点），
@@ -470,6 +469,26 @@ static bool isFusedChainVectorizable(const std::vector<NodeVariant>& ops,
                     if (!is_arg) return false;
                 }
             }
+        }
+    }
+
+    // [Fix 2026-08-31] 拒绝「同一外部 arg 被多个 op 消费」的链（如 sigmoid 导数
+    // A*(1-A)：Sub 与 Mul 都读外部 arg A）。在 MIMO 多输出平面缓冲下该模式会触发
+    // 输出/输入缓冲别名，向量化结果与 eager 不符（Test 8 max_diff=0.88）。
+    // 回退 buildFusedMultiNode（图级 getValue 按 node_id 精确解析，任意图均正确）。
+    {
+        std::unordered_map<size_t, int> arg_fanin;
+        for (size_t op_idx = 0; op_idx < op_inputs.size(); ++op_idx) {
+            const auto& inputs = op_inputs[op_idx];
+            for (size_t k = 0; k < inputs.size(); ++k) {
+                if (op_idx > 0 && k == 0) continue;  // 链前序边，非外部 arg
+                if (arg_numels.find(inputs[k]) != arg_numels.end()) {
+                    arg_fanin[inputs[k]]++;
+                }
+            }
+        }
+        for (const auto& [id, cnt] : arg_fanin) {
+            if (cnt > 1) return false;
         }
     }
 
@@ -571,7 +590,20 @@ static void buildFusedMultiNodeVectorized(mlir::OpBuilder& builder, mlir::Locati
         // 仅支持 numel=1（标量）广播；其他部分广播留给 scalar 路径（shape-based 更准）
         auto nit = arg_numels.find(node_id);
         if (nit != arg_numels.end() && nit->second == 1) {
-            offset = builder.create<mlir::arith::ConstantIntOp>(loc, 0, 64);
+            // [Fix 2026-08-31] 标量广播：source offset 归 0（原有），但必须把标量 splat 成
+            // <8 x float> 向量。若直接从 1 元素标量 base 做整向量 load，会越界读 7 个垃圾
+            // 浮点（Test 8 ReLU 反向 Gt 阈值 → mask 错乱）。LLVM 层无 vector 方言 splat，
+            // 用 undef + 8× insertelement 展开。
+            mlir::Value scalar_addr = builder.create<mlir::LLVM::GEPOp>(
+                loc, ptr_type, f32, ptr,
+                mlir::ValueRange{indexToI64(builder, loc, c0_i)});
+            mlir::Value scalar = builder.create<mlir::LLVM::LoadOp>(loc, f32, scalar_addr);
+            mlir::Value vec = builder.create<mlir::LLVM::UndefOp>(loc, vec_ty);
+            for (int64_t lane = 0; lane < VL; ++lane) {
+                mlir::Value lane_idx = builder.create<mlir::arith::ConstantIntOp>(loc, lane, 32);
+                vec = builder.create<mlir::LLVM::InsertElementOp>(loc, vec_ty, vec, scalar, lane_idx);
+            }
+            return vec;
         }
         mlir::Value addr = builder.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, ptr, mlir::ValueRange{offset});
         return builder.create<mlir::LLVM::LoadOp>(loc, vec_ty, addr);
@@ -1354,6 +1386,23 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
             ew_op_node_ids.reserve(len);
             for (size_t k = 0; k < len; ++k) ew_op_node_ids.push_back(compute_nodes[ci + k]->id);
             if (isFusedChainVectorizable(ops, op_inputs, ew_arg_numels, (size_t)last_numel)) {
+                if (std::getenv("C3_CHAIN_TRACE")) {
+                    auto op_name = [](const NodeVariant& op) -> const char* {
+                        return std::visit([](const auto& n)->const char*{ return std::remove_reference_t<decltype(n)>::name; }, op);
+                    };
+                    fprintf(stderr, "[CHAIN-TRACE VEC] len=%zu last_numel=%ld op_inputs:", len, last_numel);
+                    for (size_t ok = 0; ok < ops.size(); ++ok) {
+                        fprintf(stderr, " op%zu[%s]{", ok, op_name(ops[ok]));
+                        for (size_t ii : op_inputs[ok]) {
+                            fprintf(stderr, "%zu:n%ld,", ii,
+                                    (ew_arg_numels.find(ii) != ew_arg_numels.end()) ? ew_arg_numels.at(ii) : -1L);
+                        }
+                        fprintf(stderr, "}");
+                    }
+                    fprintf(stderr, " out_ids:");
+                    for (size_t oid : ew_op_node_ids) fprintf(stderr, "%zu,", oid);
+                    fprintf(stderr, "\n");
+                }
                 buildFusedMultiNodeVectorized(builder, loc, ew_out, fn_n, ops, op_inputs,
                                               arg_ids, ew_arg_ptrs, ew_arg_numels,
                                               ew_op_node_ids);
@@ -1422,15 +1471,32 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
                 }
             }
             // 判断是否可以使用多核向量化
-            if (isFusedChainVectorizable(fnode.ops, fnode.op_inputs, fused_arg_numels, (size_t)node_numel)) {
-                buildFusedMultiNodeVectorized(builder, loc, out_buf, fn_node_n, fnode.ops, fnode.op_inputs,
-                                              fnode.arg_node_ids, fused_arg_ptrs, fused_arg_numels);
-            } else {
-                // [P0.2.1 2026-08-30 苏璃珞] 传 arg_shapes + out_shape
-                buildFusedMultiNode(builder, loc, out_buf, fn_node_n, fnode.ops, fnode.op_inputs,
-                                      fnode.arg_node_ids, fused_arg_ptrs, fused_arg_numels,
-                                      fnode.op_node_ids, /*known_numel=*/0,
-                                      fused_arg_shapes, fused_out_shape_i64);
+            {
+                bool _vec = isFusedChainVectorizable(fnode.ops, fnode.op_inputs, fused_arg_numels, (size_t)node_numel);
+                if (std::getenv("C3_CHAIN_TRACE")) {
+                    auto op_name = [](const NodeVariant& op) -> const char* {
+                        return std::visit([](const auto& n)->const char*{ return std::remove_reference_t<decltype(n)>::name; }, op);
+                    };
+                    fprintf(stderr, "[MN-TRACE %s] fnode.numel=%ld nargs=%zu ops:", _vec ? "VEC" : "SCL", node_numel, fnode.op_inputs.size());
+                    for (size_t oi = 0; oi < fnode.op_inputs.size(); ++oi) {
+                        fprintf(stderr, " op%zu[%s]{", oi, op_name(fnode.ops[oi]));
+                        for (size_t ii : fnode.op_inputs[oi]) fprintf(stderr, "%zu,", ii);
+                        fprintf(stderr, "}");
+                    }
+                    fprintf(stderr, " out_ids:");
+                    for (size_t oid : fnode.op_node_ids) fprintf(stderr, "%zu,", oid);
+                    fprintf(stderr, "\n");
+                }
+                if (_vec) {
+                    buildFusedMultiNodeVectorized(builder, loc, out_buf, fn_node_n, fnode.ops, fnode.op_inputs,
+                                                  fnode.arg_node_ids, fused_arg_ptrs, fused_arg_numels);
+                } else {
+                    // [P0.2.1 2026-08-30 苏璃珞] 传 arg_shapes + out_shape
+                    buildFusedMultiNode(builder, loc, out_buf, fn_node_n, fnode.ops, fnode.op_inputs,
+                                          fnode.arg_node_ids, fused_arg_ptrs, fused_arg_numels,
+                                          fnode.op_node_ids, /*known_numel=*/0,
+                                          fused_arg_shapes, fused_out_shape_i64);
+                }
             }
             continue;
         }
@@ -1900,6 +1966,10 @@ mlir::OwningOpRef<mlir::ModuleOp> buildMLIRModule(
             module->emitError();
             module->dump();
             throw std::runtime_error("MLIRKernelGen: multi-node module verification failed");
+        }
+        if (std::getenv("C3_MN_MLIR_DUMP")) {
+            fprintf(stderr, "===== MULTI-NODE MLIR (pre-lowering) =====\n");
+            module->dump();
         }
         return module;
     }
