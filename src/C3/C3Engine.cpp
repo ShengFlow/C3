@@ -707,8 +707,10 @@ private:
 // ======================= C3Engine 实现 =======================
 
 C3Engine& C3Engine::getInstance() {
-    static C3Engine instance;
-    return instance;
+    // 进程级生命周期：避免 Meyers singleton 在 LLVM/MLIR 全局析构后
+    // 访问已销毁的 mutex。正常资源回收由 shutdownAll() 显式完成。
+    static C3Engine* instance = new C3Engine();
+    return *instance;
 }
 
 C3Engine::C3Engine() : state_(std::make_unique<EngineState>()) {}

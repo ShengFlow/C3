@@ -77,8 +77,10 @@ struct HotPathConfig {
 class C3HotPathManager {
 public:
     static C3HotPathManager& instance() {
-        static C3HotPathManager mgr;
-        return mgr;
+        // 生命周期由 shutdown() 显式管理；故意不注册静态析构，避免
+        // LLVM/MLIR 全局资源销毁后再次触发 mutex/future 清理。
+        static C3HotPathManager* mgr = new C3HotPathManager();
+        return *mgr;
     }
 
     // ======================= 配置 =======================

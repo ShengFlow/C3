@@ -75,6 +75,10 @@ public:
     /** @brief 获取 C3BackwardCapture 单例实例 */
     static C3BackwardCapture& getInstance();
 
+    // 后台 detached 编译任务的生命周期计数，仅供异步提交点和清理护栏使用。
+    bool taskStarted();
+    void taskFinished();
+
     /**
      * @brief 等待所有后台反向编译任务结束。
      * @details 后台任务使用 detached thread 以避免 std::future 析构阻塞；
@@ -281,9 +285,6 @@ private:
     ~C3BackwardCapture() { shutdown(); }
     C3BackwardCapture(const C3BackwardCapture&) = delete;
     C3BackwardCapture& operator=(const C3BackwardCapture&) = delete;
-
-    bool taskStarted();
-    void taskFinished();
 
     // ======================= 反向 Graph 构建助手 =======================
 

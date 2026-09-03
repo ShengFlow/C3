@@ -39,8 +39,10 @@ namespace c3 {
 // ======================= 单例 =======================
 
 C3BackwardCapture& C3BackwardCapture::getInstance() {
-    static C3BackwardCapture instance;
-    return instance;
+    // 由 shutdownAll() 显式停止 detached 任务；保留对象至进程结束，
+    // 避免其 mutex/cv 在其他 TU 的静态析构阶段失效。
+    static C3BackwardCapture* instance = new C3BackwardCapture();
+    return *instance;
 }
 
 // [P0.1 配套实装 2026-08-30 苏璃珞]
@@ -316,7 +318,17 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteBackward(
                 }
                 bemark(4); // miss 段结束（compile+wait 完成）→ 返回前
             }
-            return std::nullopt;
+            // [FIX 2026-09-03 苏璃珞] 编译同步完成后重试 execute，使首次调用即同步用 C3 结果，
+            // 消除 miss→eager 回退与后台编译竞态导致的梯度未完整落盘（见 C3-BUG-20260903-01）。
+            {
+                auto retry = C3KernelRegistry::getInstance().tryExecuteBackward(
+                    base_key + "|in:" + std::to_string(i), grad, forward_inputs);
+                if (retry.has_value() && !retry->empty()) {
+                    out.push_back(std::move(retry->at(0)));
+                    continue; // 该输入已用 C3 内核同步算完，继续处理下一输入
+                }
+            }
+            return std::nullopt; // 重试仍 miss → 整体 eager 回退
         }
         out.push_back(std::move(result->at(0)));
     }
@@ -391,8 +403,10 @@ void C3BackwardCapture::compileBackwardAsync(const ::Node* node, const Tensor& g
 
         // 捕获 type_name 字符串（而非 node 指针），规避反向结束后节点释放导致的 UAF
         std::string type = type_name;
+        if (!taskStarted()) return;
         // 【修复】不能用 std::async → future 析构会阻塞 → 变相同步
         std::thread([this, type, i, grad_desc, input_descs, per_key]() {
+            struct TaskGuard { C3BackwardCapture* self; ~TaskGuard() { self->taskFinished(); } } guard{this};
             // 构建该输入的反向 C3 Graph
             auto graph_opt = buildBackwardGraphForTypeAndIndex(type, i, grad_desc, input_descs);
             if (!graph_opt.has_value()) {
@@ -503,8 +517,10 @@ void C3BackwardCapture::compileBackwardAsyncForInput(
     };
     std::string type = type_name;
 
+    if (!taskStarted()) return;
     // 【修复】不能用 std::async → future 析构会阻塞 → 变相同步
     std::thread([this, type, input_index, grad_desc, input_descs, per_key]() {
+        struct TaskGuard { C3BackwardCapture* self; ~TaskGuard() { self->taskFinished(); } } guard{this};
         // [BW-DIAG 2026-09-02] C3_BW_DIAG=1：定位「支持但装不上」的 per-key 编译失败原因
         static const bool bw_diag = [] {
             const char* e = std::getenv("C3_BW_DIAG");
@@ -1489,7 +1505,9 @@ void C3BackwardCapture::compileFusedBackwardAsync(const BackwardSequence& seq) {
     // 异步编译融合 kernel
     // 【重要】不能用 std::async，因为 std::future 析构会阻塞等待 → 变同步
     //     用 std::thread + detach 才是真正的后台异步
+    if (!taskStarted()) return;
     std::thread([this, seq, fused_key, reg_grad_shape, reg_input_shape]() {
+        struct TaskGuard { C3BackwardCapture* self; ~TaskGuard() { self->taskFinished(); } } guard{this};
         // ======================= 诊断：编译耗时时间戳 =======================
         using clock = std::chrono::high_resolution_clock;
         auto t_start = clock::now();
@@ -2302,7 +2320,9 @@ void C3BackwardCapture::compileUnifiedMIMOBackwardAsync(
     }
     std::string compile_err = "";
 
+    if (!taskStarted()) return;
     std::thread([this, current_type, mimo_key, grad_desc, z_desc, x_desc, w_desc]() {
+        struct TaskGuard { C3BackwardCapture* self; ~TaskGuard() { self->taskFinished(); } } guard{this};
         try {
             // 1. 构建三个底层独立的反向子图 + 一个偏置子图
             BackwardGraph act_bg;

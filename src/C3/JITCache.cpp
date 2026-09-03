@@ -401,8 +401,10 @@ void JITCache::evict() {
 // ======================= Singleton =======================
 
 JITCache& JITCache::getInstance() {
-    static JITCache instance;
-    return instance;
+    // JITCache 由显式清理路径使用；进程退出时保留对象，避免其 mutex
+    // 在 LLVM/MLIR 静态析构期间被访问到已析构状态。
+    static JITCache* instance = new JITCache();
+    return *instance;
 }
 
 } // namespace c3

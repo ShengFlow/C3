@@ -12,10 +12,12 @@ namespace c3 {
 double FusionCostModel::kMinGainRatio = FusionCostModel::kDefaultMinGainRatio;
 
 RegionFusionRegistry& RegionFusionRegistry::getInstance() {
-    static RegionFusionRegistry instance;
+    // 注册表由 shutdownAll() 显式 clear；保留单例至进程结束，避免
+    // LLVM/MLIR 静态析构阶段发生跨 TU mutex 生命周期竞争。
+    static RegionFusionRegistry* instance = new RegionFusionRegistry();
     // 确保 RollingHash 的 pow_base 表已初始化
     RollingHash::precompute(256);
-    return instance;
+    return *instance;
 }
 
 void RegionFusionRegistry::install(uint64_t hash,

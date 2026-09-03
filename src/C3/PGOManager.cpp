@@ -582,8 +582,10 @@ Tensor PGOCompiledKernel::executeFusedNodeInterpreted(
 // ======================= PGOManager =======================
 
 PGOManager& PGOManager::getInstance() {
-    static PGOManager instance;
-    return instance;
+    // 故意不注册静态析构：PGO kernel 可能持有 LLVM/JIT 资源，
+    // 由 C3Cleanup::shutdownAll() 在运行时显式回收，避免跨 TU 析构顺序 UB。
+    static PGOManager* instance = new PGOManager();
+    return *instance;
 }
 
 std::shared_ptr<PGOCompiledKernel> PGOManager::registerKernel(
