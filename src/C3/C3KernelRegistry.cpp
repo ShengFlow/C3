@@ -8,11 +8,9 @@
  *          3. 序列/首 op 模糊匹配 (findFusedKernelFor*)
  *          4. 融合 kernel 包装执行 (executeFusedWithInputs)
  *
- *          **当前状态：stub 阶段**。DEBT-NEW-7 修复集（用户之前设计的 region fusion
- *          全套）需要这些方法作为执行后端，但 region fusion 仍按宏开关
- *          CT_C3_DISABLE_REGION_FUSION 关闭；本文件所有方法在 stub 形态下
- *          返回 nullopt / 空向量 / 抛 not_implemented，保证 build 通过且
- *          c3 单 kernel 路径行为不退化（calls fall back to eager）。
+ *          [Fix 2026-09-05] 已实装：region fusion / backward kernel 的安装、
+ *          查询与执行均有真实实现（executeFusedWithInputs / findFusedKernelFor*）。
+ *          (旧注释"stub 阶段"为 8-09 早期状态,与代码不符,已修正。)
  *
  * @date 2026-08-09
  */
@@ -80,7 +78,7 @@ Tensor C3KernelRegistry::executeFusedWithInputs(
 
 // tryExecuteFused 通过 C3KernelRegistry 自身的 fused_entries_ map 查找
 // (与 tryExecute/tryExecuteUnary 平行,使用 fused_pattern + shape 做 key)。
-// 当前 stub: region fusion 完整启用时由 tryRegionDispatch 通过
+// [Fix 2026-09-05] region fusion 完整启用时由 tryRegionDispatch 通过
 // executeFusedWithInputs(kernel, ...) 直接调用,不走本入口。
 // 保留接口以备 region fusion 启用后通过 op_type + inputs 快速 dispatch。
 std::optional<Tensor> C3KernelRegistry::tryExecuteFused(

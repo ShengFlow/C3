@@ -1187,7 +1187,11 @@ static std::unique_ptr<mlir::ExecutionEngine> createEngine(
             }
 
             engineOpts.llvmModuleBuilder = builder_slot;
-        } catch (...) {}
+        } catch (const std::exception& e) {
+            // [Fix 2026-09-05] 不再静默吞：fast-math 属性设置失败会丢优化且无提示。
+            // 记录警告，保留默认(非 fast-math)编译路径继续。
+            fprintf(stderr, "[LinalgOneShotGen] warning: failed to set fast-math attrs: %s\n", e.what());
+        }
     }
 
     auto maybeEngine = mlir::ExecutionEngine::create(module, engineOpts);
