@@ -10,6 +10,7 @@
 
 #include "MLIRKernelGen.h"
 #include "C3/C3Config.h"
+#include "C3/SIMDTarget.h"
 #include "C3/C3Dialect.h"
 #include "C3/TuningState.h"
 
@@ -85,7 +86,7 @@ static void buildVectorizedLoop(mlir::OpBuilder& builder, mlir::Location loc,
                                 mlir::Value n, int64_t known_numel,
                                 const std::function<void(mlir::OpBuilder&, mlir::Location, mlir::Value)>& vec_body_fn,
                                 const std::function<void(mlir::OpBuilder&, mlir::Location, mlir::Value)>& scalar_body_fn) {
-    constexpr int64_t VL = 8;
+    constexpr int64_t VL = ct::c3::kTargetVecLanes;
     auto f32 = builder.getF32Type();
 
     mlir::Value c0 = builder.create<mlir::arith::ConstantIndexOp>(loc, 0);
@@ -299,7 +300,7 @@ struct BinaryOpLowering : public mlir::OpRewritePattern<SrcOp> {
         auto ptr_type = mlir::LLVM::LLVMPointerType::get(rewriter.getContext());
 
         if (bmod == 0) {
-            constexpr int64_t VL = 8;
+            constexpr int64_t VL = ct::c3::kTargetVecLanes;
             auto vec_ty = mlir::VectorType::get({VL}, f32);
 
             buildVectorizedLoop(rewriter, loc, op.getNumel(), 0,
@@ -368,7 +369,7 @@ struct UnaryOpLowering : public mlir::OpRewritePattern<SrcOp> {
         auto f32 = rewriter.getF32Type();
         auto ptr_type = mlir::LLVM::LLVMPointerType::get(rewriter.getContext());
 
-        constexpr int64_t VL = 8;
+        constexpr int64_t VL = ct::c3::kTargetVecLanes;
         auto vec_ty = mlir::VectorType::get({VL}, f32);
 
         buildVectorizedLoop(rewriter, loc, op.getNumel(), 0,
@@ -410,7 +411,7 @@ struct ReLUOpLowering : public mlir::OpRewritePattern<mlir::c3::ReLUOp> {
         auto f32 = rewriter.getF32Type();
         auto ptr_type = mlir::LLVM::LLVMPointerType::get(rewriter.getContext());
 
-        constexpr int64_t VL = 8;
+        constexpr int64_t VL = ct::c3::kTargetVecLanes;
         auto vec_ty = mlir::VectorType::get({VL}, f32);
 
         buildVectorizedLoop(rewriter, loc, op.getNumel(), 0,
@@ -420,8 +421,7 @@ struct ReLUOpLowering : public mlir::OpRewritePattern<mlir::c3::ReLUOp> {
 
                 mlir::Value val = bld.create<mlir::LLVM::LoadOp>(loc, vec_ty, in_ptr, 16);
                 mlir::Value zero = bld.create<mlir::arith::ConstantOp>(
-                    loc, mlir::DenseElementsAttr::get(
-                        vec_ty, llvm::ArrayRef<float>{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}));
+                    loc, mlir::DenseElementsAttr::get(vec_ty, 0.0f));
                 mlir::Value res = bld.create<mlir::arith::MaxNumFOp>(loc, val, zero);
                 bld.create<mlir::LLVM::StoreOp>(loc, res, o_ptr, 16);
             },
@@ -451,7 +451,7 @@ struct SigmoidOpLowering : public mlir::OpRewritePattern<mlir::c3::SigmoidOp> {
         auto f32 = rewriter.getF32Type();
         auto ptr_type = mlir::LLVM::LLVMPointerType::get(rewriter.getContext());
 
-        constexpr int64_t VL = 8;
+        constexpr int64_t VL = ct::c3::kTargetVecLanes;
         auto vec_ty = mlir::VectorType::get({VL}, f32);
 
         buildVectorizedLoop(rewriter, loc, op.getNumel(), 0,
@@ -463,8 +463,7 @@ struct SigmoidOpLowering : public mlir::OpRewritePattern<mlir::c3::SigmoidOp> {
                 mlir::Value neg_x = bld.create<mlir::arith::NegFOp>(loc, val);
                 mlir::Value exp_val = bld.create<mlir::math::ExpOp>(loc, neg_x);
                 mlir::Value one = bld.create<mlir::arith::ConstantOp>(
-                    loc, mlir::DenseElementsAttr::get(
-                        vec_ty, llvm::ArrayRef<float>{1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f}));
+                    loc, mlir::DenseElementsAttr::get(vec_ty, 1.0f));
                 mlir::Value denom = bld.create<mlir::arith::AddFOp>(loc, one, exp_val);
                 mlir::Value res = bld.create<mlir::arith::DivFOp>(loc, one, denom);
                 bld.create<mlir::LLVM::StoreOp>(loc, res, o_ptr, 16);
@@ -665,12 +664,12 @@ struct MatMulOpLowering : public mlir::OpRewritePattern<mlir::c3::MatMulOp> {
                 val_alpha, lhs, val_lda, rhs, val_ldb, val_beta, out, val_ldc
             });
 
-            // Epilogue for bias and activation — row-wise vectorized (VL=8 float32)
+            // Epilogue for bias and activation — row-wise vectorized (VL = kTargetVecLanes)
             // 外层仍是 M 行的 scf.for；每行 N 个连续元素改走 buildVectorizedLoop：
-            //   vector body: LD out/bias (8-wide), ADD bias (if needed), MAX(ZERO)/exp/tanh, ST 回去 —— 与 BinaryOpLowering / ReLUOpLowering 完全一致的对齐策略
+            //   vector body: LD out/bias (VL-wide), ADD bias (if needed), MAX(ZERO)/exp/tanh, ST 回去 —— 与 BinaryOpLowering / ReLUOpLowering 完全一致的对齐策略
             if (bias || act != 0) {
                 auto& b = rewriter;
-                constexpr int64_t VL = 8;
+                constexpr int64_t VL = ct::c3::kTargetVecLanes;
                 auto vec_ty = mlir::VectorType::get({VL}, f32);
                 mlir::Value M_v = b.create<mlir::arith::ConstantIndexOp>(loc, M);
                 mlir::Value c0 = b.create<mlir::arith::ConstantIndexOp>(loc, 0);
@@ -696,7 +695,7 @@ struct MatMulOpLowering : public mlir::OpRewritePattern<mlir::c3::MatMulOp> {
                     if (bias) {
                         mlir::Value b_vec;
                         if (bias_numel == M) {
-                            // row broadcast: 同一块 bias_val 广播 8 次（VBroadcastOp）
+                            // row broadcast: 同一块 bias_val 广播 VL 次（VBroadcastOp, 自动铺满 vec_ty）
                             mlir::Value bias_ptr = vb.create<mlir::LLVM::GEPOp>(vloc, ptr_type, f32, bias, mlir::ValueRange{bias_row_idx});
                             mlir::Value b_s = vb.create<mlir::LLVM::LoadOp>(vloc, f32, bias_ptr);
                             b_vec = vb.create<mlir::vector::BroadcastOp>(vloc, vec_ty, b_s);
@@ -706,7 +705,7 @@ struct MatMulOpLowering : public mlir::OpRewritePattern<mlir::c3::MatMulOp> {
                             mlir::Value b_s = vb.create<mlir::LLVM::LoadOp>(vloc, f32, bias_ptr);
                             b_vec = vb.create<mlir::vector::BroadcastOp>(vloc, vec_ty, b_s);
                         } else {
-                            // bias_numel == N (按列广播，最常见): bias[j..j+7] 连续 8 个 LD
+                            // bias_numel == N (按列广播，最常见): bias[col..col+VL-1] 连续 VL 个 LD
                             mlir::Value bias_ptr = vb.create<mlir::LLVM::GEPOp>(vloc, ptr_type, f32, bias, mlir::ValueRange{col_base_i64});
                             b_vec = vb.create<mlir::LLVM::LoadOp>(vloc, vec_ty, bias_ptr, /*alignment=*/16);
                         }
@@ -805,7 +804,7 @@ static void runC3Combine(mlir::ModuleOp module) {
 // 关键设计：直接用 mlir::linalg::SoftmaxOp（MLIR upstream 标准 op，**内部已实现** rowmax → exp → rowsum → div 4 步）。
 //   - 数值稳定：linalg.softmax 内部用 max-subtraction 防 exp 溢出
 //   - **向量化**：`convert-linalg-to-loops` + `convert-vector-to-llvm` pipeline 把 linalg.softmax 转
-//     `<8 x float>` SIMD 标量循环 → LLVM 自动向量化
+//     `<VL x float>` SIMD 标量循环 → LLVM 自动向量化
 //   - 不用手写标量循环：避免之前 MatMulOpLowering 标量循环问题
 //
 // 公式：

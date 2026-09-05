@@ -31,6 +31,7 @@
 
 #include "C3/TuningState.h"
 #include "C3/JITCache.h"
+#include "C3/SIMDTarget.h"
 #include <mlir/Target/LLVMIR/Export.h>
 
 // ======================= Profile timestamps (region fusion 探针) =======================
@@ -533,7 +534,7 @@ static void buildFusedMultiNodeVectorized(mlir::OpBuilder& builder, mlir::Locati
                                           const std::unordered_map<size_t, mlir::Value>& arg_ptrs,
                                           const std::unordered_map<size_t, int64_t>& arg_numels = {},
                                           const std::vector<size_t>& op_node_ids = {}) {
-    constexpr int64_t VL = 8;
+    constexpr int64_t VL = ct::c3::kTargetVecLanes;
     auto ptr_type = mlir::LLVM::LLVMPointerType::get(builder.getContext());
     auto f32 = builder.getF32Type();
     auto vec_ty = mlir::VectorType::get({VL}, f32);
@@ -572,12 +573,13 @@ static void buildFusedMultiNodeVectorized(mlir::OpBuilder& builder, mlir::Locati
     mlir::Value rem = builder.create<mlir::arith::RemUIOp>(loc, n_idx, VL_i);
     mlir::Value n_vec = builder.create<mlir::arith::SubIOp>(loc, n_idx, rem);
 
+    // 动态构造 VL 长度的零/一向量（随目标架构位宽变化）
+    const std::vector<float> zeros_v(static_cast<size_t>(VL), 0.0f);
+    const std::vector<float> ones_v(static_cast<size_t>(VL), 1.0f);
     mlir::Value zero_vec = builder.create<mlir::arith::ConstantOp>(
-        loc, mlir::DenseElementsAttr::get(
-            vec_ty, llvm::ArrayRef<float>{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f}));
+        loc, mlir::DenseElementsAttr::get(vec_ty, llvm::ArrayRef<float>(zeros_v)));
     mlir::Value one_vec = builder.create<mlir::arith::ConstantOp>(
-        loc, mlir::DenseElementsAttr::get(
-            vec_ty, llvm::ArrayRef<float>{1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f}));
+        loc, mlir::DenseElementsAttr::get(vec_ty, llvm::ArrayRef<float>(ones_v)));
 
     auto vloop = builder.create<mlir::scf::ForOp>(loc, c0_i, n_vec, VL_i);
     builder.setInsertionPointToStart(vloop.getBody());
@@ -591,7 +593,8 @@ static void buildFusedMultiNodeVectorized(mlir::OpBuilder& builder, mlir::Locati
         auto nit = arg_numels.find(node_id);
         if (nit != arg_numels.end() && nit->second == 1) {
             // [Fix 2026-08-31] 标量广播：source offset 归 0（原有），但必须把标量 splat 成
-            // <8 x float> 向量。若直接从 1 元素标量 base 做整向量 load，会越界读 7 个垃圾
+            // 将标量 splat 成 <VL x float> 向量。若直接从 1 元素标量 base 做整向量
+            // load，会越界读 VL-1 个垃圾
             // 浮点（Test 8 ReLU 反向 Gt 阈值 → mask 错乱）。LLVM 层无 vector 方言 splat，
             // 用 undef + 8× insertelement 展开。
             mlir::Value scalar_addr = builder.create<mlir::LLVM::GEPOp>(

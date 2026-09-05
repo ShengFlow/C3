@@ -24,6 +24,21 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # ---- 编译优化（与宿主工程保持一致：-O3 -ffast-math -march=native + ThinLTO）----
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -ffast-math -march=native")
+
+# ---- SIMD 目标架构开关（可选覆盖 -march=native）----
+# C3_TARGET_SIMD: AUTO(默认,由 -march=native 自动检测) | NEON | AVX2 | AVX512
+# 显式指定时追加对应编译宏/指令集 flag。AVX512 需 F+DQ。
+set(C3_TARGET_SIMD "AUTO" CACHE STRING "Target SIMD arch: AUTO|NEON|AVX2|AVX512")
+string(TOUPPER "${C3_TARGET_SIMD}" C3_TARGET_SIMD_UPPER)
+if(C3_TARGET_SIMD_UPPER STREQUAL "AVX512")
+    add_compile_definitions(__AVX512F__ __AVX512DQ__ __AVX2__ __AVX__)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx512f -mavx512dq -mfma")
+elseif(C3_TARGET_SIMD_UPPER STREQUAL "AVX2")
+    add_compile_definitions(__AVX2__ __AVX__)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx2 -mfma")
+elseif(C3_TARGET_SIMD_UPPER STREQUAL "NEON")
+    add_compile_definitions(__aarch64__)
+endif()
 option(C3_ENABLE_LTO "Enable Link-Time Optimization (Thin LTO)" ON)
 if(C3_ENABLE_LTO)
     set(CMAKE_INTERPROCEDURAL_OPTIMIZATION ON)
