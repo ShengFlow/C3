@@ -355,6 +355,15 @@ public:
         
         // 仅当元素数足够大、单输出，且不是 MatMul（MatMul 自带并行）时才开启多线程并行
         bool do_parallel = (elem_n_ >= kParallelThreshold && M_ == 0 && seg_n == 1);
+        // [Fix 2026-09-05 苏璃珞] 广播防护：并行切片假设每个输入与输出在 [start,end) 内按同一
+        // index 一一对应，故对所有输入统一 in_ptrs[i]+start 前移。若某输入是广播 operand
+        // (numel != elem_n_，如标量/周期偏置)，前移基址会让标量 arg 在 start 处越界、周期取模
+        // 错位 —— 遇此情况必须回退串行（func_ 串行路径按 shape-based 广播正确处理）。
+        if (do_parallel) {
+            for (size_t i = 0; i < num_inputs_; ++i) {
+                if (inputs[i].numel() != elem_n_) { do_parallel = false; break; }
+            }
+        }
 
         // [MIMO 深挖] setup 到此结束（数据读取 + 输出分配 + Tensor 构造），累计后单独计时 cargo
         g_mn_setup_ns.fetch_add(

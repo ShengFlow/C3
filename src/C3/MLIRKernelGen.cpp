@@ -690,7 +690,15 @@ static void buildFusedMultiNodeVectorized(mlir::OpBuilder& builder, mlir::Locati
 
     auto loadExternalScalar = [&](size_t node_id) -> mlir::Value {
         mlir::Value ptr = preloaded_ptrs.at(node_id);
-        mlir::Value addr = builder.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, ptr, mlir::ValueRange{idx});
+        // [Fix 2026-09-05 苏璃珞] 与 loadExternalVector(标量广播用 GEP 0 + splat)对齐：
+        // 尾循环遇到 numel==1 的广播 arg 必须读 ptr[0]，否则 idx∈[n_vec, n-1] 会越界读
+        // 1 元素 buffer。仅当 n%VL!=0 且链内含标量广播 arg 时触发(向量主循环已短路此处曾漏)。
+        auto nit = arg_numels.find(node_id);
+        mlir::Value eff_idx = idx;
+        if (nit != arg_numels.end() && nit->second == 1) {
+            eff_idx = indexToI64(builder, loc, c0_i);
+        }
+        mlir::Value addr = builder.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, ptr, mlir::ValueRange{eff_idx});
         return builder.create<mlir::LLVM::LoadOp>(loc, f32, addr);
     };
 

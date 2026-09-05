@@ -706,29 +706,16 @@ std::optional<C3BackwardCapture::BackwardGraph> C3BackwardCapture::buildBackward
 
 bool C3BackwardCapture::supportsNodeType(const std::string& node_type) {
     // ========== 只支持单输入单输出（unary element-wise）节点的反向编译/融合 ==========
-    // 多输入节点（Add/Sub/Mul/Div/MatMul/CrossEntropy/Softmax 等）的 per-input 单节点 kernel
-    // 目前存在 2 个问题：① 图构造 / 输入映射 bug（unordered_map::at key not found）
-    //                   ② 数值正确性 bug（Mul 返回 [a,a] 而不是正确的 [b,a]）
-    // 先从支持列表移除，一律回退 eager，保证 Test 4-7 数值正确性。
-    // 后续单独修多输入单节点 kernel，验证正确后再加回。
+    // [Fix 2026-09-05 苏璃珞] 仅返回 buildBackwardGraphForTypeAndIndex 确有 case 的类型，
+    //   避免名义支持(返回 true)却编不出 kernel 的脱节。此前 GELU/LReLU/Sin/Cos/Abs/Min/Max
+    //   被列在此却无对应 builder case(一律 nullopt), 只会进融合序列统计、永不产出 kernel。
+    //   多输入单节点 kernel(Add/Sub/Mul/MatMul/Softmax 等)仍按注释回退 eager(正确性优先)。
     return node_type.find("ReLUNode") != std::string::npos ||
-           // Sigmoid backward 暂回退 eager，待 live-range coloring 稳定后重新启用。
-
            node_type.find("TanhNode") != std::string::npos ||
            node_type.find("NegNode") != std::string::npos ||
-           node_type.find("GELUNode") != std::string::npos ||
-           node_type.find("LReLUNode") != std::string::npos ||
-           node_type.find("SinNode") != std::string::npos ||
-           node_type.find("CosNode") != std::string::npos ||
-           node_type.find("AbsNode") != std::string::npos ||
            node_type.find("ExpNode") != std::string::npos ||
            node_type.find("LogNode") != std::string::npos ||
-           node_type.find("MinNode") != std::string::npos ||
-           node_type.find("MaxNode") != std::string::npos ||
-           // Softmax backward 暂回退 eager，避免多归约临时 buffer 生命周期风险。
-
-           // [P0.2 2026-08-30 苏璃珞] CrossEntropy 双输入节点（logits + target）
-           // target 不需 grad（input_index=1 返回 nullopt）；仅 input_index=0 走 buildCrossEntropyBackwardGraph
+           // CrossEntropy: dispatch 有 case(630), 但 tryExecuteBackward 对 CE 短路 → 实际不可达。
            node_type.find("CrossEntropyNode") != std::string::npos;
 }
 
@@ -916,6 +903,11 @@ C3BackwardCapture::BackwardGraph C3BackwardCapture::buildCrossEntropyBackwardGra
     const TensorDesc& input_descs_1)  // target_desc
 {
     (void)grad_desc;  // CE 反向下游 grad 是常数 1/M（mean reduction）或 1，公式不需要它
+    // [Warning 2026-09-05] 本 builder 当前【不可达】：tryExecuteBackward 对 CrossEntropy
+    //   直接短路回 eager(见 179-180 注释, 正确性决策), 故本函数永不被 dispatch。
+    //   其实现本身也仅对最简特例成立(不乘 grad/1/M, 朴素 exp, 注释自曝 M=4,N=8 错位)。
+    //   请不要据此以为 CE 反向已被 C3 覆盖; 若未来要真正支持 CE 反向, 需先解除 CE 短路
+    //   并重写为正确的 (softmax-logits - target)/M * grad 且数值对齐 forward 的 max-subtraction。
     Graph g;
 
     // 输入: [logits, target]

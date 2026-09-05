@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdint>
 #include <future>
+#include <memory>
 #include <stdexcept>
 #include <thread>
 
@@ -214,7 +215,28 @@ bool PGOCompiledKernel::installIntoRegistry(op op_type, const KernelShapeInfo& s
 
 void PGOCompiledKernel::triggerCompilationChain() {
     auto& pgo = PGOManager::getInstance();
-    auto self = shared_from_this();
+    // [Fix 2026-09-05 苏璃珞] shared_from_this() 要求对象由 shared_ptr 管理。生产路径
+    // (PGOManager::compileGraph, PGOManager.cpp:615) 总是 make_shared, 不受影响; 但测试或
+    // 外部以栈上/裸对象构造 PGOCompiledKernel 再触发本链时, shared_from_this() 会抛
+    // bad_weak_ptr —— 此前直接导致 test_c3_pgo_deopt / test_c3_compile_error 的 bad_weak_ptr
+    // 崩溃。修复: 捕获 bad_weak_ptr 并降级为同步编译(非 shared 对象的生命周期由调用方掌控,
+    // 不能安全 async 自持, 故改用不依赖 self 保活的同步路径)。
+    std::shared_ptr<PGOCompiledKernel> self;
+    try {
+        self = shared_from_this();
+    } catch (const std::bad_weak_ptr&) {
+        CtorchError::log(ErrorLevel::WARN, ErrorPlatform::kGENERAL, ErrorType::KERNEL_LAUNCH,
+            "PGO: triggerCompilationChain on non-shared_ptr-managed kernel; using sync compile for " +
+            cache_key_);
+        compileO2();
+        compileOfast();
+        try {
+            PGOManager::getInstance().notifyCompilationCompleted();
+        } catch (...) {
+            // 统计作用, 静默
+        }
+        return;
+    }
     if (!pgo.canAcceptCompilation()) {
         // 编译队列背压触发：将任务推入优先级队列，按热度评分排序
         double heat = computeHeatScore();
