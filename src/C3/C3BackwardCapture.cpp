@@ -1740,7 +1740,17 @@ std::optional<Tensor> C3BackwardCapture::tryExecuteFusedBackward(
     // [PEL25 audit P0-3 2026-09-05] 多输出 backward fusion 主动禁用 — 见
     // reports/2026-09-05/code-review-c3-deep-audit-162100.md §3 P0-3
     //
-    // 根因 (C3-BUG-20260905-01): ReLU→Sigmoid / ReLU→ReLU 等 element-wise 链
+    // [2026-09-05 查证] 本路径降级为 SUPERSEDED (被 MIMO 取代, 非必须复活):
+    //   - MIMO (tryExecuteUnifiedMIMOBackward) 覆盖 FC 层反向 (Activation→Add→MatMul),
+    //     稳态 hit=4678/epoch, 已是 MNIST/FC 主路径。
+    //   - 本函数只服务"无 MatMul 夹层的纯 element-wise 连续链"(ReLU→Sigmoid 直接堆叠),
+    //     MIMO 对这种结构不匹配(miss), 属泛化扩展场景, 与 MNIST/FC 发布基准脱钩。
+    //   - 该旧路径是 P0-3 critical + pending_intercepted_ 裸 Node* 生命周期脆弱,
+    //     复活并 re-enable 风险高且对当前发布无可见收益 → 决定不复活, 保持 stub。
+    //   若未来要支持 element-wise dense 模型(无 FC), 再单独立项, 复用时务必:
+    //     用 MIMO 已验证的 pending 生命周期模式 + 数值回归对照, 而非直接复活旧实现。
+    //
+    // 历史根因 (C3-BUG-20260905-01): ReLU→Sigmoid / ReLU→ReLU 等 element-wise 链
     // 在异步 kernel 安装后,intercepted 机制把错误的 upstream grad 回填到
     // 后续节点 → 训练数值错误。
     //
@@ -1751,18 +1761,18 @@ std::optional<Tensor> C3BackwardCapture::tryExecuteFusedBackward(
     //   - 真根因 (DEBT-2) 在 tryExecuteFusedBackward 的 pending_intercepted_ 节点
     //     生命周期 + shape 校验路径,需重做 intercepted 调度才能恢复融合
     //
-    // 重新启用条件 (PEL26+ TODO):
-    //   1. 修 DEBT-2: chain_forward_inputs 构造 / installBackward shape 校验 /
-    //      pending_intercepted_ 节点生命周期
+    // [2026-09-05 决策] 本路径已 SUPERSEDED, 默认不复活。若未来立项支持 element-wise
+    // dense 模型, 才需满足以下条件后恢复:
+    //   1. 用 MIMO 已验证的 pending 生命周期模式重写 intercepted 调度,
+    //      修复裸 Node* 生命周期 + chain_forward_inputs 构造 / shape 校验
     //   2. 加数值正确性回归测试:ReLU→Sigmoid / ReLU→ReLU 链 forward+backward,
     //      对比 C3 fused vs eager 梯度,差 < 1e-5
     //   3. 灰度启用 (C3_FUSED_BW=1 环境开关),先 1 epoch 验证 loss 与 eager 一致
     //
-    // [PEL25 mitigation 2026-09-05] 加 C3_FUSED_BW 环境变量 kill switch:
-    //   - C3_FUSED_BW=0 (默认): 返回 nullopt,行为完全不变 (本次仍默认 off)
-    //   - C3_FUSED_BW=1: 记录 attempt 日志 + 仍返回 nullopt (因为原实现被删,PEL26+ 重新实装)
+    // [PEL25 mitigation 2026-09-05] C3_FUSED_BW 环境变量 kill switch(仅诊断, 不 re-enable):
+    //   - C3_FUSED_BW=0 (默认): 返回 nullopt,行为完全不变
+    //   - C3_FUSED_BW=1: 记录 attempt 日志 + 仍返回 nullopt
     //   - C3_FUSED_BW=2: 同 1 + 额外打印 intercepted entries (调试用)
-    // 目的: 给 PEL26+ 修 DEBT-2 时一个明确的"我正在尝试"开关,无需重读代码
     static const int kFusedBwLevel = []() {
         const char* e = std::getenv("C3_FUSED_BW");
         if (!e) return 0;
