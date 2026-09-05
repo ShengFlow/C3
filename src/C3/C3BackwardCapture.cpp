@@ -1751,12 +1751,37 @@ std::optional<Tensor> C3BackwardCapture::tryExecuteFusedBackward(
     //   - 真根因 (DEBT-2) 在 tryExecuteFusedBackward 的 pending_intercepted_ 节点
     //     生命周期 + shape 校验路径,需重做 intercepted 调度才能恢复融合
     //
-    // 重新启用条件 (TODO):
+    // 重新启用条件 (PEL26+ TODO):
     //   1. 修 DEBT-2: chain_forward_inputs 构造 / installBackward shape 校验 /
     //      pending_intercepted_ 节点生命周期
     //   2. 加数值正确性回归测试:ReLU→Sigmoid / ReLU→ReLU 链 forward+backward,
     //      对比 C3 fused vs eager 梯度,差 < 1e-5
     //   3. 灰度启用 (C3_FUSED_BW=1 环境开关),先 1 epoch 验证 loss 与 eager 一致
+    //
+    // [PEL25 mitigation 2026-09-05] 加 C3_FUSED_BW 环境变量 kill switch:
+    //   - C3_FUSED_BW=0 (默认): 返回 nullopt,行为完全不变 (本次仍默认 off)
+    //   - C3_FUSED_BW=1: 记录 attempt 日志 + 仍返回 nullopt (因为原实现被删,PEL26+ 重新实装)
+    //   - C3_FUSED_BW=2: 同 1 + 额外打印 intercepted entries (调试用)
+    // 目的: 给 PEL26+ 修 DEBT-2 时一个明确的"我正在尝试"开关,无需重读代码
+    static const int kFusedBwLevel = []() {
+        const char* e = std::getenv("C3_FUSED_BW");
+        if (!e) return 0;
+        if (std::string(e) == "1") return 1;
+        if (std::string(e) == "2") return 2;
+        return 0;  // 任何其他值默认 off
+    }();
+    if (kFusedBwLevel >= 1) {
+        // [DEBT-2 diagnostic] 记 attempt,表明有人在尝试 re-enable 但功能未实装
+        static std::atomic<uint64_t> s_attempts{0};
+        uint64_t n = s_attempts.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (kFusedBwLevel >= 2) {
+            CtorchError::log(ErrorLevel::WARN, ErrorPlatform::kGENERAL,
+                ErrorType::UNKNOWN,
+                "[C3-DEBT-2] C3_FUSED_BW=" + std::to_string(kFusedBwLevel) +
+                " attempt #" + std::to_string(n) +
+                " — fused BW still disabled, set C3_FUSED_BW=0 to suppress");
+        }
+    }
     (void)node;
     (void)grad;
     (void)forward_inputs;
