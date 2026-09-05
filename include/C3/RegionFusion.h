@@ -113,9 +113,10 @@ public:
     /// @param first_op 当前 dispatch 的 op（region 的首个 op）
     /// @param first_input_shapes 首个 op 的输入形状
     /// @return 匹配到的 RegionEntry，或 nullptr
+    /// [perf 2026-09-05] 改为指针数组传参，避免热路径每次构造 vector<vector<size_t>> 的堆分配
     RegionEntry* findRegionByFirstOp(
         op first_op,
-        const std::vector<std::vector<size_t>>& first_input_shapes);
+        const std::vector<const std::vector<size_t>*>& first_input_shapes);
 
     void clear();
     void uninstallAll();

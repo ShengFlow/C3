@@ -34,6 +34,7 @@
 #include <dlfcn.h>
 #include <future>
 #include <mutex>
+#include <thread>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -132,29 +133,68 @@ private:
 // refcount 归零才触发归还，天然安全。C3 多节点 kernel（MIMO 4 输出 / 前向融合 2 输出）均全量
 // 写入每个输出字节（cblas beta=0 + 全量逐元素循环），复用不残留脏数据。
 namespace {
+// [MIMO 输出分配池] 带"引用归零才归还"deleter 的 shared_ptr<char> 复用 flat 输出缓冲。
+// [perf 2026-09-05] thread_local 快速路径：单线程(MNIST 训练主路径)下 acquire/release 均无锁，
+// 消除旧版每调用两次全局 mutex + shared_ptr 定制 deleter 的锁竞争。多线程(do_parallel)时
+// 跨线程归还回退到全局 mutex 池，语义不变。归属线程记录在 deleter 捕获里。
 struct FlatOutPool {
     std::mutex mu;
     std::unordered_map<size_t, std::vector<char*>> free_bufs;
+
+    // 每线程私有无锁缓存：同线程 acquire/release 全程不碰全局锁
+    static std::unordered_map<size_t, std::vector<char*>>& tl_free() {
+        static thread_local std::unordered_map<size_t, std::vector<char*>> m;
+        return m;
+    }
 
     static FlatOutPool& instance() {
         static FlatOutPool p;
         return p;
     }
-    std::shared_ptr<char> acquire(size_t bytes) {
-        char* p = nullptr;
-        {
-            std::lock_guard<std::mutex> lk(mu);
-            auto it = free_bufs.find(bytes);
-            if (it != free_bufs.end() && !it->second.empty()) {
-                p = it->second.back();
-                it->second.pop_back();
-            }
+
+    // 从本线程私有缓存取（无锁）
+    static char* tl_acquire(size_t bytes) {
+        auto& m = tl_free();
+        auto it = m.find(bytes);
+        if (it != m.end() && !it->second.empty()) {
+            char* p = it->second.back();
+            it->second.pop_back();
+            return p;
         }
-        if (!p) p = static_cast<char*>(std::malloc(bytes));
-        return std::shared_ptr<char>(p, [bytes](char* q) {
-            FlatOutPool& pool = FlatOutPool::instance();
-            std::lock_guard<std::mutex> lk(pool.mu);
-            pool.free_bufs[bytes].push_back(q);
+        return nullptr;
+    }
+
+    // 归还到本线程私有缓存（无锁）
+    static void tl_release(size_t bytes, char* q) {
+        tl_free()[bytes].push_back(q);
+    }
+
+    std::shared_ptr<char> acquire(size_t bytes) {
+        // 1. 线程私有无锁路径
+        char* p = tl_acquire(bytes);
+        if (!p) {
+            // 2. 全局池（锁）—— 仅首次或跨线程时走
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                auto it = free_bufs.find(bytes);
+                if (it != free_bufs.end() && !it->second.empty()) {
+                    p = it->second.back();
+                    it->second.pop_back();
+                }
+            }
+            if (!p) p = static_cast<char*>(std::malloc(bytes));
+        }
+
+        // 归属线程 id：析构时若仍在本线程，归还到线程私有缓存(无锁)；否则回全局池(锁)
+        std::thread::id owner = std::this_thread::get_id();
+        return std::shared_ptr<char>(p, [bytes, owner](char* q) {
+            if (std::this_thread::get_id() == owner) {
+                FlatOutPool::tl_release(bytes, q);   // 同线程：无锁归还
+            } else {
+                FlatOutPool& pool = FlatOutPool::instance();
+                std::lock_guard<std::mutex> lk(pool.mu);
+                pool.free_bufs[bytes].push_back(q);  // 跨线程：回全局池
+            }
         });
     }
 };
@@ -243,6 +283,7 @@ public:
         } else {
             out_storage = Storage(total_out_numel, DType::kFloat, device_);
         }
+        auto t_mn0_alloc = std::chrono::steady_clock::now();
         float* out_raw_ptr = out_storage.data<float>();
 
         // 2. 构造输出 Tensors，它们共享 out_storage 并设置偏移量
@@ -251,12 +292,31 @@ public:
         for (size_t k = 0; k < seg_n; ++k) {
             // [MIMO setup 优化] 复用构造期预计算的 shape 引用，避免每次向量拷贝
             const auto& shape = (k < out_shapes_.size()) ? out_shapes_[k] : default_out_shape_;
-            Tensor t(ShapeTag{}, shape, DType::kFloat, device_);
+            // [perf 2026-09-05] 用 PlaceholderTag 构造（只设 shape+strides，不分配/零初始化
+            // 独立 Storage），随后 t.storage()=out_storage 接管池化缓冲。旧 ShapeTag 构造会
+            // 额外 malloc numel 个 float 并 zero() 整个 buffer，随即被覆盖丢弃——每输出一次
+            // 纯浪费，是 mn_setup offset+pool 3.2µs/call 的主因。
+            Tensor t(PlaceholderTag{}, shape, DType::kFloat, device_);
             t.storage() = out_storage;
             t.set_storage_offset(out_offsets[k]);
             outs.push_back(std::move(t));
         }
         auto t_mn0_tns = std::chrono::steady_clock::now();
+
+        // [perf 诊断] 细拆 offset+pool: acquire+Storage构造 vs outs 循环
+        if (mn_setup_trace) {
+            static std::mutex dlock;
+            static uint64_t d_alloc_ns=0, d_outs_ns=0, d_calls=0;
+            { std::lock_guard<std::mutex> lk(dlock);
+              d_alloc_ns += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t_mn0_alloc - t_mn0_read).count();
+              d_outs_ns  += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t_mn0_tns - t_mn0_alloc).count();
+              if ((++d_calls) % 2000 == 0) {
+                fprintf(stderr, "[MN-DIAG] calls=%llu | alloc(acquire+Storage)=%.1fus (%.1f%%) | outs_loop=%.1fus (%.1f%%)\n",
+                        (unsigned long long)d_calls, d_alloc_ns/1e3, 100.0*d_alloc_ns/(d_alloc_ns+d_outs_ns),
+                        d_outs_ns/1e3, 100.0*d_outs_ns/(d_alloc_ns+d_outs_ns));
+              }
+            }
+        }
 
         // [MIMO setup 探针] 聚合 data_read / (offset+pool) / Tensor构造 三段耗时，每 500 次打印。
         // 仅 C3_MN_SETUP_TRACE=1 生效；static 缓存，默认零开销。

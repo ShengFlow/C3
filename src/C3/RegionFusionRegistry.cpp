@@ -193,17 +193,17 @@ bool RegionFusionRegistry::mayMatchAsFirstOp(op first_op) const {
 
 RegionEntry* RegionFusionRegistry::findRegionByFirstOp(
     op first_op,
-    const std::vector<std::vector<size_t>>& first_input_shapes) {
+    const std::vector<const std::vector<size_t>*>& first_input_shapes) {
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto& [_, entry] : entries_) {
         if (!entry.active || entry.op_seq.empty()) continue;
         if (entry.op_seq[0] != first_op) continue;
-        // 形状校验
+        // 形状校验（指针数组，解引用比较，零拷贝）
         if (!entry.first_input_shapes.empty() && !first_input_shapes.empty()) {
             if (entry.first_input_shapes.size() != first_input_shapes.size()) continue;
             bool shape_ok = true;
             for (size_t i = 0; i < first_input_shapes.size(); ++i) {
-                if (entry.first_input_shapes[i] != first_input_shapes[i]) {
+                if (entry.first_input_shapes[i] != *first_input_shapes[i]) {
                     shape_ok = false;
                     break;
                 }
