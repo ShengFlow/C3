@@ -112,6 +112,21 @@ static void buildVectorizedLoop(mlir::OpBuilder& builder, mlir::Location loc,
     builder.setInsertionPointAfter(sloop);
 }
 
+// [Fix 2026-09-05 苏璃珞] 标量广播成 <VL x f32> 向量。
+// 仓库不做 vector 方言（vector.broadcast 在 LLVM translation 上会触发 VectorToLLVM
+// greedy 不收敛 / missing LLVMTranslationDialectInterface）。与 MLIRKernelGen 595-607
+// 的标量→vector 展开保持一致：undef + VL 次 insertelement。
+static mlir::Value buildScalarSplatVec(mlir::OpBuilder& builder, mlir::Location loc,
+                                       mlir::Value scalar, mlir::Type vec_ty) {
+    constexpr int64_t VL = ct::c3::kTargetVecLanes;
+    mlir::Value vec = builder.create<mlir::LLVM::UndefOp>(loc, vec_ty);
+    for (int64_t lane = 0; lane < VL; ++lane) {
+        mlir::Value lane_idx = builder.create<mlir::arith::ConstantIntOp>(loc, lane, 32);
+        vec = builder.create<mlir::LLVM::InsertElementOp>(loc, vec_ty, vec, scalar, lane_idx);
+    }
+    return vec;
+}
+
 static void buildSmallMatMul(mlir::OpBuilder& builder, mlir::Location loc,
                              mlir::Value lhs, mlir::Value rhs, mlir::Value out, mlir::Value bias,
                              mlir::Value preAct,   // [Prewalk A] 可选 pre-activation 输出（可为 nullptr）
@@ -695,15 +710,15 @@ struct MatMulOpLowering : public mlir::OpRewritePattern<mlir::c3::MatMulOp> {
                     if (bias) {
                         mlir::Value b_vec;
                         if (bias_numel == M) {
-                            // row broadcast: 同一块 bias_val 广播 VL 次（VBroadcastOp, 自动铺满 vec_ty）
+                            // row broadcast: 同一块 bias_val 广播 VL 次（undef+insertelement splat, 与 MLIRKernelGen 一致）
                             mlir::Value bias_ptr = vb.create<mlir::LLVM::GEPOp>(vloc, ptr_type, f32, bias, mlir::ValueRange{bias_row_idx});
                             mlir::Value b_s = vb.create<mlir::LLVM::LoadOp>(vloc, f32, bias_ptr);
-                            b_vec = vb.create<mlir::vector::BroadcastOp>(vloc, vec_ty, b_s);
+                            b_vec = buildScalarSplatVec(vb, vloc, b_s, vec_ty);
                         } else if (bias_numel == 1) {
                             mlir::Value bias_0 = vb.create<mlir::arith::ConstantIntOp>(vloc, 0, 64);
                             mlir::Value bias_ptr = vb.create<mlir::LLVM::GEPOp>(vloc, ptr_type, f32, bias, mlir::ValueRange{bias_0});
                             mlir::Value b_s = vb.create<mlir::LLVM::LoadOp>(vloc, f32, bias_ptr);
-                            b_vec = vb.create<mlir::vector::BroadcastOp>(vloc, vec_ty, b_s);
+                            b_vec = buildScalarSplatVec(vb, vloc, b_s, vec_ty);
                         } else {
                             // bias_numel == N (按列广播，最常见): bias[col..col+VL-1] 连续 VL 个 LD
                             mlir::Value bias_ptr = vb.create<mlir::LLVM::GEPOp>(vloc, ptr_type, f32, bias, mlir::ValueRange{col_base_i64});
@@ -719,15 +734,17 @@ struct MatMulOpLowering : public mlir::OpRewritePattern<mlir::c3::MatMulOp> {
                     }
 
                     mlir::Value act_vec = val_vec;
-                    if (act == 1) { // ReLU (vector.max with zero broadcast)
-                        mlir::Value zero_s = vb.create<mlir::arith::ConstantFloatOp>(vloc, f32, llvm::APFloat(0.0f));
-                        mlir::Value zero_v = vb.create<mlir::vector::BroadcastOp>(vloc, vec_ty, zero_s);
+                    if (act == 1) { // ReLU (vector.max with zero splat)
+                        // [Fix 2026-09-05] 用 DenseElementsAttr splat 构造 vector 常数，
+                        // 与 ReLUOpLowering 一致，避免 vector.broadcast 触发 VectorToLLVM 不收敛
+                        mlir::Value zero_v = vb.create<mlir::arith::ConstantOp>(
+                            vloc, mlir::DenseElementsAttr::get(vec_ty, 0.0f));
                         act_vec = vb.create<mlir::arith::MaxNumFOp>(vloc, val_vec, zero_v);
                     } else if (act == 2) { // Sigmoid: 1 / (1 + exp(-x))
                         mlir::Value neg = vb.create<mlir::arith::NegFOp>(vloc, val_vec);
                         mlir::Value e = vb.create<mlir::math::ExpOp>(vloc, neg);
-                        mlir::Value one_s = vb.create<mlir::arith::ConstantFloatOp>(vloc, f32, llvm::APFloat(1.0f));
-                        mlir::Value one_v = vb.create<mlir::vector::BroadcastOp>(vloc, vec_ty, one_s);
+                        mlir::Value one_v = vb.create<mlir::arith::ConstantOp>(
+                            vloc, mlir::DenseElementsAttr::get(vec_ty, 1.0f));
                         mlir::Value d = vb.create<mlir::arith::AddFOp>(vloc, one_v, e);
                         act_vec = vb.create<mlir::arith::DivFOp>(vloc, one_v, d);
                     } else if (act == 3) { // Tanh
@@ -769,12 +786,12 @@ struct MatMulOpLowering : public mlir::OpRewritePattern<mlir::c3::MatMulOp> {
                     sb.create<mlir::LLVM::StoreOp>(sloc, activated, out_cell_ptr);
                 };
 
-                // MatMul epilogue 采用标量循环：这里的 vector.broadcast/vector.math
-                // 在当前 MLIR→LLVM translation 路径上会导致大型 MLP 的
-                // ExecutionEngine 创建失败。只收窄这一处，保留通用逐元素算子的
-                // vectorized lowering，避免全局标量化带来的编译时间爆炸。
+                // [Fix 2026-09-05 苏璃珞] MatMul epilogue 向量化：vec_body 实际执行。
+                // 常数用 DenseElementsAttr splat、row/标量 bias 用 undef+insertelement
+                // splat(buildScalarSplatVec)、列 bias 走 vector load —— 全路径无 vector 方言 op,
+                // 无需 VectorToLLVM,不触发 greedy 不收敛 / missing translation。
                 mlir::Value N_val = N_i64;
-                buildLoop(b, loc, N_val, (int64_t)N, scalar_body);
+                buildVectorizedLoop(b, loc, N_val, (int64_t)N, vec_body, scalar_body);
 
                 b.setInsertionPointAfter(loop_i);
             }
