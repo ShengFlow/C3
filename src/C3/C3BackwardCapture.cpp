@@ -1740,7 +1740,7 @@ std::optional<Tensor> C3BackwardCapture::tryExecuteFusedBackward(
     // [PEL25 audit P0-3 2026-09-05] 多输出 backward fusion 主动禁用 — 见
     // reports/2026-09-05/code-review-c3-deep-audit-162100.md §3 P0-3
     //
-    // 根因 (C3-BUG-20260903-01): ReLU→Sigmoid / ReLU→ReLU 等 element-wise 链
+    // 根因 (C3-BUG-20260905-01): ReLU→Sigmoid / ReLU→ReLU 等 element-wise 链
     // 在异步 kernel 安装后,intercepted 机制把错误的 upstream grad 回填到
     // 后续节点 → 训练数值错误。
     //
