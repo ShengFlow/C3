@@ -28,8 +28,12 @@ DCUCompiledKernel::DCUCompiledKernel(std::string code_object,
     cache_key_ = "dcu_" + graph.toString() + "_" + std::to_string(device);
 #ifdef WITH_DCU
     if (!loadHSAModule()) {
-        CtorchError::log(ErrorLevel::WARN, ErrorPlatform::kGENERAL, ErrorType::UNKNOWN,
-            "DCUCompiledKernel: failed to load HSA module, execute() will fail");
+        // [Fix 2026-09-05 PEL25 audit P0-4] HSA 加载失败 → throw 而非静默 WARN
+        // 旧行为:execute() 返回空 vector,调度器当成"0 输出节点"继续走 → 训练 NaN 无明确报错
+        // 修复:构造期 fail-fast,错误向上传播,用户能立即看到 DCU 环境问题
+        // 见 reports/2026-09-05/code-review-c3-deep-audit-162100.md §3 P0-4
+        throw std::runtime_error("DCUCompiledKernel: failed to load HSA module for kernel '" +
+                                 kernel_name_ + "' (DCU backend unavailable — check DTK install / GPU agent / GCVM path)");
     }
 #endif
 }
@@ -361,18 +365,28 @@ std::vector<Tensor> DCUCompiledKernel::execute(const std::vector<Tensor>& inputs
     return outputs;
 #else
     if (!hsa_queue_ || kernel_handle_ == 0) {
-        CtorchError::log(ErrorLevel::ERROR, ErrorPlatform::kGENERAL, ErrorType::DEVICE_COMPAT,
-            "DCUCompiledKernel::execute: HSA module not loaded");
-        return outputs;
+        // [Fix 2026-09-05 PEL25 audit P0-4] execute() 失败 → throw 而非返回空 vector
+        // 配合构造函数 fail-fast,DCU 路径完全无静默失败点
+        throw std::runtime_error("DCUCompiledKernel::execute: HSA module not loaded for kernel '" +
+                                 kernel_name_ + "'");
     }
 
-    if (!copyInputsToDevice(inputs)) return outputs;
+    if (!copyInputsToDevice(inputs)) {
+        throw std::runtime_error("DCUCompiledKernel::execute: copyInputsToDevice failed for kernel '" +
+                                 kernel_name_ + "'");
+    }
 
     size_t output_numel = inputs[0].numel();
     std::vector<size_t> output_shape = inputs[0].shape();
-    if (!allocateDeviceMemory(output_numel * sizeof(float))) return outputs;
+    if (!allocateDeviceMemory(output_numel * sizeof(float))) {
+        throw std::runtime_error("DCUCompiledKernel::execute: allocateDeviceMemory failed for kernel '" +
+                                 kernel_name_ + "'");
+    }
 
-    if (!launchKernel(inputs)) return outputs;
+    if (!launchKernel(inputs)) {
+        throw std::runtime_error("DCUCompiledKernel::execute: launchKernel failed for kernel '" +
+                                 kernel_name_ + "'");
+    }
 
     // HSA doorbell signal wait already done in launchKernel
     outputs.push_back(copyOutputToHost(output_numel, output_shape));

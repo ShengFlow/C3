@@ -182,7 +182,14 @@ struct FlatOutPool {
                     it->second.pop_back();
                 }
             }
-            if (!p) p = static_cast<char*>(std::malloc(bytes));
+            if (!p) {
+                // [Fix 2026-09-05 PEL25 audit P0-1] malloc 失败 → throw bad_alloc
+                // 旧实现:无 nullptr 检查 → kernel 立即对空指针解引用 → SIGSEGV
+                // 见 reports/2026-09-05/code-review-c3-full-audit-161616.md
+                char* tmp = static_cast<char*>(std::malloc(bytes));
+                if (!tmp) throw std::bad_alloc();
+                p = tmp;
+            }
         }
 
         // 归属线程 id：析构时若仍在本线程，归还到线程私有缓存(无锁)；否则回全局池(锁)

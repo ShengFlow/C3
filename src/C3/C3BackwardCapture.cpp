@@ -1737,304 +1737,32 @@ std::optional<Tensor> C3BackwardCapture::tryExecuteFusedBackward(
     const Tensor& grad,
     const std::vector<Tensor>& forward_inputs)
 {
-    // 多输出 backward fusion 的 intercepted 结果当前仍存在确定性的数值错误：
-    // ReLU→Sigmoid / ReLU→ReLU 在异步 kernel 安装后会把错误的 upstream grad
-    // 回填到后续节点。先隔离执行入口，保留单节点 backward C3；编译/统计代码
-    // 留待修复输出段与节点生命周期后重新启用。正确性优先于融合命中率。
+    // [PEL25 audit P0-3 2026-09-05] 多输出 backward fusion 主动禁用 — 见
+    // reports/2026-09-05/code-review-c3-deep-audit-162100.md §3 P0-3
+    //
+    // 根因 (C3-BUG-20260903-01): ReLU→Sigmoid / ReLU→ReLU 等 element-wise 链
+    // 在异步 kernel 安装后,intercepted 机制把错误的 upstream grad 回填到
+    // 后续节点 → 训练数值错误。
+    //
+    // 当前策略 (correctness > hit rate):
+    //   - 本函数始终返回 std::nullopt,所有反向融合都走单节点 backward C3 路径
+    //   - 编译侧 (compileFusedBackwardAsync / recordBackwardNode / sequence_counts_)
+    //     仍 populate fused_entries_,因为驱动它们的反向链统计是有用的 profiling 信号
+    //   - 真根因 (DEBT-2) 在 tryExecuteFusedBackward 的 pending_intercepted_ 节点
+    //     生命周期 + shape 校验路径,需重做 intercepted 调度才能恢复融合
+    //
+    // 重新启用条件 (TODO):
+    //   1. 修 DEBT-2: chain_forward_inputs 构造 / installBackward shape 校验 /
+    //      pending_intercepted_ 节点生命周期
+    //   2. 加数值正确性回归测试:ReLU→Sigmoid / ReLU→ReLU 链 forward+backward,
+    //      对比 C3 fused vs eager 梯度,差 < 1e-5
+    //   3. 灰度启用 (C3_FUSED_BW=1 环境开关),先 1 epoch 验证 loss 与 eager 一致
     (void)node;
     (void)grad;
     (void)forward_inputs;
     return std::nullopt;
-
-    // ========== 路径 A：当前节点已在 pending 拦截队列中（融合已在下游节点 N0 时提前算出）
-    //            直接取出对应的 upstream grad 作为本节点 backward 的结果返回。
-    //            ComputeCore 流程零修改，grad pack 分发 100% 对齐。
-    // ========== P1 优化：只读查 pending_intercepted_，用 shared_lock 共享锁（大部分 miss 场景 lock 成本骤降）
-    {
-        std::shared_lock<std::shared_mutex> lock(intercepted_mutex_);
-        auto it = pending_intercepted_.find(node);
-        if (it != pending_intercepted_.end()) {
-            const std::string current_type = std::string(typeid(*node).name());
-            // 必须 type 完全匹配（防止不同 backward 轮次间相同地址不同节点误命中）
-            if (it->second.first == current_type) {
-                Tensor intercepted = std::move(it->second.second);
-                // 提前释放共享锁（避免在持锁期间做 stats mutex 二次锁）
-                lock.unlock();
-                pending_intercepted_.erase(node); // 注意：erase 要在 unlock 前？不，因为是 shared_lock 只读的不能 erase → 先 unlock 再拿 unique_lock erase
-                // 正确做法：先 copy 出 value，释放 shared_lock，再拿 unique_lock 删除
-                // 上面已经 move 了 intercepted，但 map 里的 entry 还在。需要重新拿 exclusive lock 清理。
-                {
-                    std::unique_lock<std::shared_mutex> ulock(intercepted_mutex_);
-                    auto it2 = pending_intercepted_.find(node);
-                    if (it2 != pending_intercepted_.end() && it2->second.first == current_type) {
-                        pending_intercepted_.erase(it2);
-                    }
-                }
-                std::lock_guard<std::mutex> slock(stats_mutex_);
-                fusion_hit_count_++;
-                std::cerr << "[DBG-INTERCEPT-HIT] node_type=" << current_type
-                          << " intercepted_numel=" << intercepted.numel()
-                          << " grad_numel=" << grad.numel() << std::endl;
-                return intercepted;
-            } else {
-                // 地址复用但 type 不符 → 清理旧 entry
-                #ifdef CT_DEBUG
-                std::cerr << "[DBG-INTERCEPT-TYPEMISMATCH] node_ptr=" << node
-                          << " stored_type=" << it->second.first
-                          << " current_type=" << typeid(*node).name()
-                          << " → ERASED" << std::endl;
-                #endif
-                // 读锁下不能 erase，先记录后处理
-                lock.unlock();
-                {
-                    std::unique_lock<std::shared_mutex> ulock(intercepted_mutex_);
-                    auto it2 = pending_intercepted_.find(node);
-                    if (it2 != pending_intercepted_.end() && it2->second.first != current_type) {
-                        pending_intercepted_.erase(it2);
-                    }
-                }
-            }
-        }
-    }
-
-    // ========== P1 优化：miss marker 快速跳过 ==========
-    // 如果这个节点已经在当前 backward 轮次中走过一次 B 路径且 lookup 失败，
-    // 后续再次访问直接跳过 upstream traversal 开销。
-    {
-        std::lock_guard<std::mutex> mlock(miss_marker_mutex_);
-        if (miss_marker_nodes_.count(node)) {
-            std::lock_guard<std::mutex> slock(stats_mutex_);
-            fusion_miss_count_++;
-            return std::nullopt;
-        }
-    }
-
-    // ========== 路径 B：当前节点是序列的最下游 N0。从当前节点向上游 traverse w-1 层拼序列，
-    //            查找已编译好的多输出 fusion kernel，一次性算出 w 个节点的 upstream grad。
-    //            outs[0] 返回给 ComputeCore（作为 N0→N1 的 grad pack）；
-    //            outs[1..w-1] 存入 pending_intercepted_，对应 N1…Nw-1 随后的 backward 调用直接取。
-    // 关键：此时 grad = N0.backward 的原生下游端 grad（dL/dy），没有被任何节点处理过！
-    //       完全等价于 eager 流程的 N0.backward(dL/dy) 的输入 → 不会重复计算！
-    const std::string current_type = std::string(typeid(*node).name());
-    if (!isElementWiseBackward(current_type)) {
-        return std::nullopt; // 只有 element-wise 节点才能当融合起点
-    }
-
-    // 从当前节点向上游 traverse：最多 kFusionWindowSize 个节点
-    //   chain_nodes[0] = current node (shared_ptr 保活，避免被 clear 销毁)
-    //   chain_types[0] = current node type
-    //   chain_forward_inputs[0] = current node forward inputs（参数 forward_inputs）
-    std::vector<std::shared_ptr<::Node>> chain_nodes;
-    std::vector<std::string> chain_types;
-    std::vector<std::vector<Tensor>> chain_forward_inputs;
-    chain_nodes.push_back(std::shared_ptr<::Node>()); // nullptr placeholder：caller 侧节点所有权不在这，通过 raw ptr 访问
-    chain_types.push_back(current_type);
-    chain_forward_inputs.push_back(forward_inputs);
-
-    // 当前正在遍历的上游节点指针（N1、N2…）：从 node->getUpStreamNodes()[0] 开始，逐 node 向上。
-    // 注意：element-wise 节点单输入，upstream 只有 1 个（如果有多个 upstream 就不是纯 element-wise 链了）
-    // **跳过中间的 Factor 节点**：ComputeCore 会把真正的单输入节点（Sigmoid/ReLU 等）的上游包一层
-    //   Factor/Input/Identity 节点，类型不在 isElementWiseBackward 中，但 upstream.size() == 1。
-    //   遇到这类节点就跳过，沿着 upstream[0] 继续往前走，最多 kSkipMax 层。
-    const size_t kSkipMax = 4;
-    const ::Node* cur = node;
-    for (size_t step = 1; step < kFusionWindowSize; ++step) {
-        // ---------- 内部：跳过 Factor / wrapper 节点 ----------
-        const ::Node* cur_lookup = cur;
-        size_t skips = 0;
-        while (skips < kSkipMax) {
-            auto ups = cur_lookup->getUpStreamNodes();
-            if (ups.size() != 1) break;          // 多输入（真实多分支或 leaf）→ 不能 skip
-            auto candidate_sp = ups[0];
-            if (!candidate_sp) break;
-            const std::string cname = std::string(typeid(*candidate_sp).name());
-            if (isElementWiseBackward(cname)) {
-                // 找到可融合节点 → 直接把 cur_lookup 置 candidate 并结束 skip loop
-                cur_lookup = candidate_sp.get();
-                break;
-            }
-            // 非 element-wise，但 upstream.size()==1 → 视为 wrapper/Factor，跳过
-            cur_lookup = candidate_sp.get();
-            skips++;
-        }
-        if (skips >= kSkipMax) break; // 太深的 wrapper 链 → 放弃
-
-        // ---------- 取 cur_lookup 的上游 next_sp 作为下一轮的 cur ----------
-        {
-            auto upstreams_of_cur = cur_lookup->getUpStreamNodes();
-            // 注意：现在 cur_lookup 本身必须已经是可融合节点 type（上 while 里保证）
-            // 但我们现在要获取 cur_lookup 的「上游」以便下一轮 step 继续 traverse。
-            // 上面 while 里 candidate_sp 可融合时已经把 cur_lookup = candidate_sp.get()。
-            // 所以 upstreams_of_cur 是 candidate_sp 的 upstreams → 即可融合节点的上游 target。
-            // 这和原逻辑一致！
-            if (upstreams_of_cur.size() != 1) break; // 可融合节点上游 size 必须为 1（否则多输入链断）
-            auto next_sp = upstreams_of_cur[0];
-            if (!next_sp) break;
-
-            const std::string tname = std::string(typeid(*cur_lookup).name());
-            if (!isElementWiseBackward(tname)) break;
-
-            // 保存上游节点的 shared_ptr、type、forward inputs
-            // 这里 cur_lookup 就是可融合节点 raw ptr，但 shared_ptr 在哪？— candidate_sp 就是！
-            // 我们上面 candidate_sp = ups[0] 可融合时还在作用域吗？重取 via cur_lookup 的
-            // 实际 shared_ptr：重新从 cur 的最近 upstream 找？
-            // 最保险方式 — 重新从 skips 遍历一遍获取 shared_ptr：
-            std::shared_ptr<::Node> fused_sp;
-            const ::Node* c2 = cur;
-            size_t s2 = 0;
-            while (s2 < kSkipMax) {
-                auto ups2 = c2->getUpStreamNodes();
-                if (ups2.size() != 1) break;
-                auto cand2 = ups2[0];
-                if (!cand2) break;
-                const std::string nm = std::string(typeid(*cand2).name());
-                if (isElementWiseBackward(nm)) { fused_sp = cand2; break; }
-                c2 = cand2.get(); s2++;
-            }
-            if (!fused_sp) break;
-            // [Fix 2026-08-11 反向融合 SIGBUS] 形状一致性校验：
-            // 融合 kernel 用「统一 elem_n 分段 output 平面 buffer + 链式 grad 传播」，
-            // 隐含假设链内所有 element-wise 节点的 grad/input 形状一致（都 == 最下游
-            // grad 形状）。若 traverse 跳过中间 Add/MatMul 等 wrapper 而撞上形状发生
-            // 变化的节点（如 MNIST 两个 ReLU 隔着 MatMul，z2 grad=[128,128] 而 z1
-            // input=[128,256]），把形状不同的节点拼进同链会越界读 → SIGBUS。
-            // 因此：上游节点 forward input[0] 形状必须 == 最下游 grad 形状，否则 break。
-            auto fused_inputs = fused_sp->getInputs();
-            if (fused_inputs.empty() || fused_inputs[0].sizes() != grad.sizes()) break;
-            chain_nodes.push_back(fused_sp);
-            chain_types.push_back(tname);
-            chain_forward_inputs.push_back(fused_inputs);
-
-            // 下一轮 traverse 从这个可融合节点本身出发（它的上游是更上一层）
-            cur = fused_sp.get();
-        }
-    }
-
-    // 从最长窗口向下尝试查找已编译的 fusion kernel（贪心更长的融合 = 更省）
-    const size_t max_L = chain_types.size(); // >= 1
-    // full_forward_inputs[0..w-1]：按 kernel 需要的顺序（types[0].forward[0], types[1].forward[0], ...）
-    std::vector<Tensor> best_fwd_inputs;
-    std::string best_full_key;
-    size_t best_w = 0;
-    {
-        for (size_t w = kFusionWindowSize; w >= 2; --w) {
-            if (w > max_L) continue;
-            std::vector<std::string> types(chain_types.begin(), chain_types.begin() + w);
-            if (!isFusableSequence(types)) continue;
-
-            // 形状签名对齐 compileFusedBackwardAsync 的 reg_grad_shape / reg_input_shape：
-            //   reg_grad_shape  = seq.grad_shapes.front() = 最下游端（先执行）的 grad shape
-            //                    = grad.sizes()（当前 N0 的 dL/dy shape，正确）
-            //   reg_input_shape = seq.input_shapes.back() = 最上游端（chain[w-1]）forward input[0] shape
-            const size_t last_in_chain = w - 1;
-            const std::vector<size_t>& cur_upstream_input_shape =
-                (!chain_forward_inputs[last_in_chain].empty()) ? chain_forward_inputs[last_in_chain][0].sizes() : grad.sizes();
-            std::string seq_key = makeSequenceKey(types);
-            std::string full_key = makeFusedBackwardKey(seq_key, grad.sizes(), cur_upstream_input_shape);
-            bool has_key = C3KernelRegistry::getInstance().hasBackwardKey(full_key);
-            // ===== DEBUG: 执行端查找的 key，和 [DBG-KEY-INSTALL] 对比定位 100% miss
-            #ifdef CT_DEBUG
-            {
-                std::string shape_g; for (auto s : grad.sizes()) shape_g += std::to_string(s)+",";
-                std::string shape_i; for (auto s : cur_upstream_input_shape) shape_i += std::to_string(s)+",";
-                static std::mutex dbg_mu;
-                static int dbg_counter = 0;
-                std::lock_guard<std::mutex> dlk(dbg_mu);
-                if (dbg_counter++ < 6) { // 只打印前 6 次，避免刷屏
-                    std::cerr << "[DBG-KEY-LOOKUP] key=" << full_key
-                              << " seq_types=" << makeSequenceKey(types)
-                              << " grad=[" << shape_g << "] upstream_input=[" << shape_i << "]"
-                              << " has_key=" << (has_key?"YES":"NO") << std::endl;
-                }
-            }
-            #endif
-            if (has_key) {
-                // 组装完整的 forward inputs：types[k] 的 forward_input[0] 依次 push
-                best_fwd_inputs.clear();
-                best_fwd_inputs.reserve(w);
-                for (size_t k = 0; k < w; ++k) {
-                    if (!chain_forward_inputs[k].empty()) {
-                        best_fwd_inputs.push_back(chain_forward_inputs[k][0]);
-                    }
-                }
-                best_full_key = std::move(full_key);
-                best_w = w;
-                break;
-            }
-        }
-    }
-    if (best_w < 2 || best_fwd_inputs.size() != best_w) {
-        // ========== P1 优化：lookup 失败 → 记录 miss marker，下次直接跳过 traversal ==========
-        {
-            std::lock_guard<std::mutex> mlock(miss_marker_mutex_);
-            miss_marker_nodes_.insert(node);
-            // 防止内存爆炸：超过 1 万条自动清空（下一轮从头开始，开销可忽略）
-            if (miss_marker_nodes_.size() > 10000) {
-                miss_marker_nodes_.clear();
-            }
-        }
-        std::lock_guard<std::mutex> slock(stats_mutex_);
-        fusion_miss_count_++;
-        return std::nullopt; // 没命中任何融合
-    }
-
-    // ============================================================
-    // 命中！执行多输出 fusion kernel → outs.size() == best_w（每个节点 1 个上游 grad 输出）
-    auto outs_opt = C3KernelRegistry::getInstance().tryExecuteBackward(
-        best_full_key, grad, best_fwd_inputs);
-    if (!outs_opt.has_value() || outs_opt->size() != best_w) {
-        #ifdef CT_DEBUG
-        static std::mutex dbg_mu2;
-        static int dbg_counter2 = 0;
-        std::lock_guard<std::mutex> dlk(dbg_mu2);
-        if (dbg_counter2++ < 6) {
-            std::cerr << "[DBG-KER-EXEC-FAIL] key=" << best_full_key
-                      << " has_value=" << outs_opt.has_value()
-                      << " outs_size=" << (outs_opt.has_value() ? outs_opt->size() : -1)
-                      << " best_w=" << best_w << std::endl;
-        }
-        #endif
-        std::lock_guard<std::mutex> slock(stats_mutex_);
-        fusion_miss_count_++;
-        return std::nullopt;
-    }
-    auto& outs = outs_opt.value();
-
-    // ===== 形状修正：kernel 产出的 outs[k] 可能是 flat 1D（{elem_n}），需还原为 grad 的多维形状（如 {512,512}） =====
-    //       反向融合：所有节点的 upstream grad 形状与传入的 grad 完全相同
-    for (size_t k = 0; k < outs.size(); ++k) {
-        if (outs[k].sizes() != grad.sizes() && outs[k].numel() == grad.numel()) {
-            outs[k] = outs[k].reshape(grad.sizes());
-        }
-    }
-
-    // outs[1..w-1] 放进 pending_intercepted_，对应 chain_nodes[1..w-1] 的 raw ptr 作为 key。
-    // 当 ComputeCore 之后处理这些节点（N1、N2…）时，走路径 A 直接取出返回。
-    // ========== P1 优化：写操作拿 unique_lock 独占锁 ==========
-    {
-        std::unique_lock<std::shared_mutex> lock(intercepted_mutex_);
-        for (size_t k = 1; k < best_w; ++k) {
-            const ::Node* raw = nullptr;
-            std::string expected_type;
-            if (k == 0) {
-                // 占位（不会到这里）
-            } else if (chain_nodes[k]) {
-                // 上游节点（k>=1）我们保存了 shared_ptr，直接 get() + typeid
-                raw = chain_nodes[k].get();
-                expected_type = std::string(typeid(*raw).name());
-            }
-            if (raw) {
-                pending_intercepted_[raw] = std::make_pair(expected_type, outs[k]);
-            }
-        }
-    }
-
-    // outs[0] = N0（当前节点）的 upstream grad，直接以 1-element vector<Tensor> 形式返回。
-    // ComputeCore 会把 outs[0] 作为 GradPack(target = N0.upstream[0] = N1) 发出，与 eager 完全一致。
-    std::lock_guard<std::mutex> slock(stats_mutex_);
-    fusion_hit_count_++;
-    return outs[0];
 }
+
 
 // ======================= 工具函数 =======================
 
