@@ -227,20 +227,13 @@ std::optional<Tensor> C3KernelRegistry::tryExecuteUnary(op op_type, const Tensor
 
 // ======================= 反向 kernel 执行 =======================
 
-// TODO(c3-backward): 反向 fusion kernel 的实际执行后端。
-// 当前 stub 返回 nullopt → C3BackwardCapture::tryExecuteBackward 会回退 eager。
-// 完整实现需要：
-//  1. 在 backward_entries_ 中查找 backward_key
-//  2. 验证 grad.shape() 与注册时记录的 grad_shape 一致
-//  3. 验证 forward_inputs 数量与 kernel 签名匹配
-//  4. invoke CompiledKernel 的 function pointer
-//  5. 包装为 vector<Tensor> 返回（多输出支持）
-// DEBT-NEW-7 v0.5.1+: 反向 fusion kernel 的实际执行后端
-// 之前是 stub → C3BackwardCapture 编译完 kernel 装进 backward_entries_ 后
-// 也没人能找到它(此函数返回 nullopt),导致 bw_hit=0,反向全走 eager。
-// 修复:从 backward_entries_ 查 backward_key,invoke CompiledKernel,
-// 包装成 vector<Tensor>(1 element) 返回(C3BackwardCapture 每次
-// 查 per-key,所以返回单元素 vector)。
+// [Fix 2026-09-05 PEL25 audit P1-4] tryExecuteBackward 注释与代码不同步
+//   v0.5.1+ DEBT-NEW-7 修复:从 backward_entries_ 查 backward_key,
+//   invoke CompiledKernel,包装成 vector<Tensor>(1 element)。
+//   现已实装 (line 244+),原 TODO 注释已过时,删之。
+//   验证: 启动器调用 chain_forward_inputs (line 320-326) 喂入 kernel;
+//   shape 校验 (line 295-306) 不匹配返 nullopt;
+//   失败 catch 静默回退 nullopt (line 343-345)。
 std::optional<std::vector<Tensor>> C3KernelRegistry::tryExecuteBackward(
     const std::string& backward_key, const Tensor& grad,
     const std::vector<Tensor>& forward_inputs) {

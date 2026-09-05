@@ -383,7 +383,9 @@ std::unique_ptr<mlir::ExecutionEngine> createEngine(
         : (opt_level == 1) ? llvm::CodeGenOptLevel::Less
         : llvm::CodeGenOptLevel::None;
 
-    // [管线① 2026-08-15] linalg AOT 磁盘持久化缓存（JITCache 2.0 read path）。
+    // [Fix 2026-09-05 PEL25 audit P1-6] "AOT" 命名修正: AOTCache 已于 2026-08-15 删除
+    // (C3Engine.cpp:1924 + user memory 2026-08-12)。本路径实际是 JIT bitcode 磁盘缓存
+    // (JITCache 1.0/2.0 read path),非 AOT (.so 落盘)。命名"linalg JIT 磁盘持久化缓存"。
     // 关键点（已确认的坑）：
     //   a) ExecutionEngine 对 llvmModuleBuilder 是【延迟回调】：create 返回之后、首次
     //      materialize（lookup/execute 触发）时才调用。因此 createEngine 栈上的局部
@@ -408,26 +410,26 @@ std::unique_ptr<mlir::ExecutionEngine> createEngine(
             if (!bc_path.empty()) {
                 builder_slot = [bc_path, aot_trace](mlir::Operation*, llvm::LLVMContext& ctx) {
                     if (aot_trace)
-                        fprintf(stderr, "[AOT-DEBUG] builder: HIT path begin\n");
+                        fprintf(stderr, "[JIT-DBG] builder: HIT path begin\n");
                     auto m = JITCache::getInstance().loadBitcode(bc_path, ctx);
                     if (aot_trace)
-                        fprintf(stderr, "[AOT-DEBUG] builder: HIT path load=%s\n",
+                        fprintf(stderr, "[JIT-DBG] builder: HIT path load=%s\n",
                                 m ? "OK" : "NULL");
                     return m;
                 };
             } else {
                 builder_slot = [module, jit_key, aot_trace](mlir::Operation*, llvm::LLVMContext& ctx) {
                     if (aot_trace)
-                        fprintf(stderr, "[AOT-DEBUG] builder: MISS path begin, key='%s'\n",
+                        fprintf(stderr, "[JIT-DBG] builder: MISS path begin, key='%s'\n",
                                 jit_key.c_str());
                     auto llvm_module = mlir::translateModuleToLLVMIR(module, ctx);
                     if (aot_trace)
-                        fprintf(stderr, "[AOT-DEBUG] builder: translate -> %s\n",
+                        fprintf(stderr, "[JIT-DBG] builder: translate -> %s\n",
                                 llvm_module ? "OK" : "NULLPTR");
                     if (llvm_module) {
                         auto st = JITCache::getInstance().store(jit_key, *llvm_module);
                         if (aot_trace)
-                            fprintf(stderr, "[AOT-DEBUG] builder: store -> '%s'\n", st.c_str());
+                            fprintf(stderr, "[JIT-DBG] builder: store -> '%s'\n", st.c_str());
                     }
                     return llvm_module;
                 };
