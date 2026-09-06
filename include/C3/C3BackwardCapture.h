@@ -138,6 +138,19 @@ public:
         const TensorDesc& x_desc, const TensorDesc& w_desc);
 
     /**
+     * @brief 无 bias SwiGLU FFN 反向 MIMO 异步编译 (2026-09-06)
+     * @details out = h @ W_d, h = g*u, g = silu(gate_pre), gate_pre = x @ W_g, u = x @ W_u。
+     *          一次 kernel 算 9 个梯度输出(grad_h/grad_W_d/grad_g/grad_u/grad_gate_pre/
+     *          grad_x_gate/grad_W_g/grad_x_up/grad_W_u), pending 表回填 Mul/SiLU/两个 MatMul。
+     */
+    void compileFFNMIMOBackwardAsync(
+        const ::Node* mm_out_node, const ::Node* mul_node, const ::Node* silu_node,
+        const ::Node* gate_mm, const ::Node* up_mm,
+        const TensorDesc& grad_desc, const TensorDesc& x_desc, const TensorDesc& wg_desc,
+        const TensorDesc& wu_desc, const TensorDesc& wd_desc, const TensorDesc& g_desc,
+        const TensorDesc& u_desc, const TensorDesc& h_desc, const TensorDesc& gp_desc);
+
+    /**
      * @brief 为指定输入索引异步编译 backward 单输出 kernel
      * @param node 当前 autograd 节点
      * @param grad 下游梯度张量

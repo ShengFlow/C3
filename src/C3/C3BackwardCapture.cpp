@@ -2065,6 +2065,129 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteUnifiedMIMOBackw
 
     // 检查是否为支持的激活节点
     std::string current_type = std::string(typeid(*node).name());
+
+    // ===== [2026-09-06 苏璃珞] 无 bias SwiGLU FFN 反向 MIMO =====
+    // 入口: out = h @ W_d 的 MatMulNode backward。
+    // 匹配: MatMul(out: h@W_d) -> Mul(h = g*u) -> { SiLU(g) <- MatMul(gate: x@W_g),
+    //                                             MatMul(up: x@W_u) }
+    // 一次 kernel 算 9 个梯度输出(见 compileFFNMIMOBackwardAsync), pending 表回填
+    // Mul/SiLU/gate-MatMul/up-MatMul 4 个节点的 backward, 返回 {grad_h, grad_W_d}。
+    if (current_type.find("MatMulNode") != std::string::npos) {
+        auto ups0 = node->getUpStreamNodes();
+        if (ups0.size() < 1 || !ups0[0]) return std::nullopt;
+        const ::Node* mul_node = ups0[0].get();
+        if (std::string(typeid(*mul_node).name()).find("MulNode") == std::string::npos) {
+            return std::nullopt;
+        }
+        auto mul_ups = mul_node->getUpStreamNodes();
+        if (mul_ups.size() < 2 || !mul_ups[0] || !mul_ups[1]) return std::nullopt;
+        const ::Node* silu_node = nullptr;
+        const ::Node* up_mm = nullptr;
+        for (const auto& sp : mul_ups) {
+            const std::string tn = std::string(typeid(*sp.get()).name());
+            if (tn.find("SiLUNode") != std::string::npos) silu_node = sp.get();
+            else if (tn.find("MatMulNode") != std::string::npos) up_mm = sp.get();
+        }
+        if (!silu_node || !up_mm) return std::nullopt;
+        auto silu_ups = silu_node->getUpStreamNodes();
+        if (silu_ups.size() < 1 || !silu_ups[0]) return std::nullopt;
+        const ::Node* gate_mm = silu_ups[0].get();
+        if (std::string(typeid(*gate_mm).name()).find("MatMulNode") == std::string::npos) {
+            return std::nullopt;
+        }
+        if (node->getInputs().size() < 2 || mul_node->getInputs().size() < 2 ||
+            silu_node->getInputs().size() < 1 || gate_mm->getInputs().size() < 2 ||
+            up_mm->getInputs().size() < 2) {
+            return std::nullopt;
+        }
+
+        const Tensor& W_d = node->getInputs()[1];
+        const Tensor& h   = node->getInputs()[0];
+        const Tensor& g_t = mul_node->getInputs()[0];
+        const Tensor& u   = mul_node->getInputs()[1];
+        const Tensor& gate_pre = silu_node->getInputs()[0];
+        const Tensor& W_g = gate_mm->getInputs()[1];
+        const Tensor& x   = gate_mm->getInputs()[0];
+        const Tensor& W_u = up_mm->getInputs()[1];
+
+        // key: grad + 各张量 shape(与编译侧严格一致)
+        std::stringstream fss;
+        fss << "mimo_ffn_backward|g:";
+        for (auto s : grad.sizes()) fss << s << ",";
+        fss << "|x:";
+        for (auto s : x.sizes()) fss << s << ",";
+        fss << "|wg:";
+        for (auto s : W_g.sizes()) fss << s << ",";
+        fss << "|wu:";
+        for (auto s : W_u.sizes()) fss << s << ",";
+        fss << "|wd:";
+        for (auto s : W_d.sizes()) fss << s << ",";
+        fss << "|g:";
+        for (auto s : g_t.sizes()) fss << s << ",";
+        fss << "|u:";
+        for (auto s : u.sizes()) fss << s << ",";
+        fss << "|h:";
+        for (auto s : h.sizes()) fss << s << ",";
+        fss << "|gp:";
+        for (auto s : gate_pre.sizes()) fss << s << ",";
+        std::string ffn_key = fss.str();
+
+        auto& registry = C3KernelRegistry::getInstance();
+        if (registry.hasBackwardKey(ffn_key)) {
+            // 外部输入顺序(与编译侧 merge 一致): grad(0), h, W_d, u, g, gate_pre, x, W_g, x, W_u
+            std::vector<Tensor> inputs = {h, W_d, u, g_t, gate_pre, x, W_g, x, W_u};
+            auto result = registry.tryExecuteBackward(ffn_key, grad, inputs);
+            if (result.has_value() && result->size() == 9) {
+                if (std::getenv("C3_FFN_DUMP")) {
+                    const float* r4 = (*result)[4].data_read<float>();
+                    const float* r6 = (*result)[6].data_read<float>();
+                    fprintf(stderr, "[FFN-DUMP] grad_gp[0:3]=%.6f,%.6f,%.6f  grad_Wg[0:3]=%.6f,%.6f,%.6f\n",
+                            r4[0], r4[1], r4[2], r6[0], r6[1], r6[2]);
+                }
+                Tensor grad_h   = std::move((*result)[0]);
+                Tensor grad_W_d = std::move((*result)[1]);
+                Tensor grad_g   = std::move((*result)[2]);
+                Tensor grad_u   = std::move((*result)[3]);
+                Tensor grad_gate_pre = std::move((*result)[4]);
+                Tensor grad_x_gate = std::move((*result)[5]);
+                Tensor grad_W_g    = std::move((*result)[6]);
+                Tensor grad_x_up   = std::move((*result)[7]);
+                Tensor grad_W_u    = std::move((*result)[8]);
+                {
+                    std::lock_guard<std::mutex> slock(stats_mutex_);
+                    mimo_hit_count_++;
+                }
+                {
+                    std::unique_lock<std::shared_mutex> lock(intercepted_mutex_);
+                    pending_mimo_intercepted_[mul_node]  = {grad_g, grad_u};
+                    pending_mimo_intercepted_[silu_node] = {grad_gate_pre};
+                    pending_mimo_intercepted_[gate_mm]   = {grad_x_gate, grad_W_g};
+                    pending_mimo_intercepted_[up_mm]     = {grad_x_up, grad_W_u};
+                }
+                // MatMulNode(out).backward 返回 {grad_h, grad_W_d}
+                std::vector<Tensor> act_res = {grad_h, grad_W_d};
+                return act_res;
+            }
+        }
+
+        // miss → 触发异步编译
+        compileFFNMIMOBackwardAsync(node, mul_node, silu_node, gate_mm, up_mm,
+                                    TensorDesc::fromShape(grad.sizes()),
+                                    TensorDesc::fromShape(x.sizes()),
+                                    TensorDesc::fromShape(W_g.sizes()),
+                                    TensorDesc::fromShape(W_u.sizes()),
+                                    TensorDesc::fromShape(W_d.sizes()),
+                                    TensorDesc::fromShape(g_t.sizes()),
+                                    TensorDesc::fromShape(u.sizes()),
+                                    TensorDesc::fromShape(h.sizes()),
+                                    TensorDesc::fromShape(gate_pre.sizes()));
+        {
+            std::lock_guard<std::mutex> slock(stats_mutex_);
+            mimo_miss_count_++;
+        }
+        return std::nullopt;
+    }
+
     bool is_act = (current_type.find("ReLUNode") != std::string::npos ||
                    current_type.find("SigmoidNode") != std::string::npos ||
                    current_type.find("TanhNode") != std::string::npos);
@@ -2307,6 +2430,153 @@ void C3BackwardCapture::compileUnifiedMIMOBackwardAsync(
         {
             std::lock_guard<std::mutex> lock(pending_mutex_);
             pending_compiles_.erase(mimo_key);
+        }
+    }).detach();
+}
+
+// ======================= [2026-09-06] 无 bias SwiGLU FFN 反向 MIMO 编译 =======================
+// 反向图: grad_h = grad @ W_d^T; grad_W_d = h^T @ grad;
+//         grad_g = grad_h * u; grad_u = grad_h * g;
+//         grad_gate_pre = grad_g * silu'(gate_pre);
+//         grad_x_gate = grad_gate_pre @ W_g^T; grad_W_g = x^T @ grad_gate_pre;
+//         grad_x_up   = grad_u @ W_u^T;        grad_W_u = x^T @ grad_u;
+// 9 子图 GraphMerger 缝合为一个大一统融合图, 9 输出。
+void C3BackwardCapture::compileFFNMIMOBackwardAsync(
+    const ::Node* /*mm_out_node*/, const ::Node* /*mul_node*/, const ::Node* /*silu_node*/,
+    const ::Node* /*gate_mm*/, const ::Node* /*up_mm*/,
+    const TensorDesc& grad_desc, const TensorDesc& x_desc, const TensorDesc& wg_desc,
+    const TensorDesc& wu_desc, const TensorDesc& wd_desc, const TensorDesc& g_desc,
+    const TensorDesc& u_desc, const TensorDesc& h_desc, const TensorDesc& gp_desc)
+{
+    std::stringstream ss;
+    ss << "mimo_ffn_backward|g:";
+    for (auto s : grad_desc.shape) ss << s << ",";
+    ss << "|x:";
+    for (auto s : x_desc.shape) ss << s << ",";
+    ss << "|wg:";
+    for (auto s : wg_desc.shape) ss << s << ",";
+    ss << "|wu:";
+    for (auto s : wu_desc.shape) ss << s << ",";
+    ss << "|wd:";
+    for (auto s : wd_desc.shape) ss << s << ",";
+    ss << "|g:";
+    for (auto s : g_desc.shape) ss << s << ",";
+    ss << "|u:";
+    for (auto s : u_desc.shape) ss << s << ",";
+    ss << "|h:";
+    for (auto s : h_desc.shape) ss << s << ",";
+    ss << "|gp:";
+    for (auto s : gp_desc.shape) ss << s << ",";
+    std::string ffn_key = ss.str();
+
+    {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        if (pending_compiles_.find(ffn_key) != pending_compiles_.end()) {
+            return;
+        }
+        pending_compiles_[ffn_key] = true;
+    }
+    {
+        std::lock_guard<std::mutex> slock(stats_mutex_);
+        mimo_compile_count_++;
+    }
+
+    if (!taskStarted()) return;
+    std::thread([this, ffn_key, grad_desc, x_desc, wg_desc, wu_desc, wd_desc,
+                 g_desc, u_desc, h_desc, gp_desc]() {
+        struct TaskGuard { C3BackwardCapture* self; ~TaskGuard() { self->taskFinished(); } } guard{this};
+        try {
+            // 双输出子图 helper: 输入 [grad, a, b] → 输出 [grad_a = grad@b^T, grad_b = a^T@grad]
+            auto buildMMDual = [](const TensorDesc& gd, const TensorDesc& a_d, const TensorDesc& b_d) {
+                Graph g;
+                size_t grad_in = g.addInput(gd);
+                size_t a_in = g.addInput(a_d);
+                size_t b_in = g.addInput(b_d);
+                TensorDesc bT_d = TensorDesc::fromShape({b_d.shape[1], b_d.shape[0]});
+                size_t bT = g.addNode(TransposeNode{b_d, 0, 1}, {b_in}, bT_d);
+                TensorDesc ga_d = TensorDesc::fromShape({gd.shape[0], bT_d.shape[1]});
+                size_t ga = g.addNode(MatMulNode{gd, bT_d}, {grad_in, bT}, ga_d);
+                TensorDesc aT_d = TensorDesc::fromShape({a_d.shape[1], a_d.shape[0]});
+                size_t aT = g.addNode(TransposeNode{a_d, 0, 1}, {a_in}, aT_d);
+                TensorDesc gb_d = TensorDesc::fromShape({aT_d.shape[0], gd.shape[1]});
+                size_t gb = g.addNode(MatMulNode{aT_d, gd}, {aT, grad_in}, gb_d);
+                g.markOutput(ga);
+                g.markOutput(gb);
+                return g;
+            };
+
+            // S0: [grad, h, W_d] → [grad_h, grad_W_d]
+            Graph s0 = buildMMDual(grad_desc, h_desc, wd_desc);
+            TensorDesc grad_h_desc = TensorDesc::fromShape({grad_desc.shape[0], wd_desc.shape[0]});
+            // S1: grad_g = grad_h * u
+            Graph s1 = buildMulBackwardGraph(grad_h_desc, g_desc, u_desc, 0).first;
+            // S2: grad_u = grad_h * g
+            Graph s2 = buildMulBackwardGraph(grad_h_desc, g_desc, u_desc, 1).first;
+            TensorDesc grad_g_desc = grad_h_desc;   // mul 输出 shape = g_desc = {M, INT}
+            TensorDesc grad_u_desc = grad_h_desc;
+            // S3: grad_gate_pre = grad_g * silu'(gate_pre)
+            Graph s3 = buildSiLUBackwardGraph(grad_g_desc, gp_desc).first;
+            TensorDesc grad_gp_desc = grad_g_desc;
+            // S4: [grad_gate_pre, x, W_g] → [grad_x_gate, grad_W_g]
+            Graph s4 = buildMMDual(grad_gp_desc, x_desc, wg_desc);
+            // S5: [grad_u, x, W_u] → [grad_x_up, grad_W_u]
+            Graph s5 = buildMMDual(grad_u_desc, x_desc, wu_desc);
+
+            // S1/S2 的 grad 输入由 S0 输出 0 提供; S3 由 S1; S4 由 S3; S5 由 S2
+            std::vector<Graph> sub_graphs = {s0, s1, s2, s3, s4, s5};
+            MergeSpec spec;
+            spec.links.push_back(MergeLink{0, 0, 1, 0});  // grad_h -> grad_g
+            spec.links.push_back(MergeLink{0, 0, 2, 0});  // grad_h -> grad_u
+            spec.links.push_back(MergeLink{1, 0, 3, 0});  // grad_g -> silu backward
+            spec.links.push_back(MergeLink{3, 0, 4, 0});  // grad_gate_pre -> grad_x_gate
+            spec.links.push_back(MergeLink{2, 0, 5, 0});  // grad_u -> grad_x_up
+
+            MergedGraphInfo unified_info = GraphMerger::merge(sub_graphs, spec);
+            Graph fused_graph = std::move(unified_info.graph);
+
+            fused_graph.clearOutputs();
+            fused_graph.markOutput(unified_info.output_remap[0][0]);  // 0: grad_h
+            fused_graph.markOutput(unified_info.output_remap[0][1]);  // 1: grad_W_d
+            fused_graph.markOutput(unified_info.output_remap[1][0]);  // 2: grad_g
+            fused_graph.markOutput(unified_info.output_remap[2][0]);  // 3: grad_u
+            fused_graph.markOutput(unified_info.output_remap[3][0]);  // 4: grad_gate_pre
+            fused_graph.markOutput(unified_info.output_remap[4][0]);  // 5: grad_x_gate
+            fused_graph.markOutput(unified_info.output_remap[4][1]);  // 6: grad_W_g
+            fused_graph.markOutput(unified_info.output_remap[5][0]);  // 7: grad_x_up
+            fused_graph.markOutput(unified_info.output_remap[5][1]);  // 8: grad_W_u
+
+            CompileOptions opts;
+            opts.backend = C3Backend::MLIR;
+            opts.enable_fusion = true;
+
+            auto kernel = C3Engine::getInstance().compile(fused_graph, opts);
+            if (kernel) {
+                // 外部输入顺序(merge 按子图输入遍历):
+                // grad, h, W_d, u, g, gate_pre, x, W_g, x, W_u (10 个, grad 是输入 0)
+                // fwd map {0..8} 对应执行侧 inputs {h,W_d,u,g,gate_pre,x,W_g,x,W_u}
+                C3KernelRegistry::getInstance().installBackward(
+                    ffn_key, kernel, grad_desc.shape, grad_desc.shape,
+                    {0, 1, 2, 3, 4, 5, 6, 7, 8}, 10
+                );
+                #ifdef CT_DEBUG
+                std::cerr << "[FFN-MIMO-COMPILE-SUCCESS] key=" << ffn_key << std::endl;
+                #endif
+            }
+        } catch (const std::exception& e) {
+            static std::mutex err_mu;
+            std::lock_guard<std::mutex> ek(err_mu);
+            static std::hash<std::string> h;
+            static std::unordered_set<size_t> seen;
+            size_t kh = h(std::string(e.what()) + "|" + ffn_key);
+            if (seen.insert(kh).second) {
+                fprintf(stderr, "[FFN-MIMO-COMPILE-ERR] key=%s err=%s\n",
+                        ffn_key.c_str(), e.what());
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(pending_mutex_);
+            pending_compiles_.erase(ffn_key);
         }
     }).detach();
 }
