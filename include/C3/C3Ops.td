@@ -272,6 +272,21 @@ def C3_DivOp : C3_BinaryElementwiseOp<"div"> {
 }
 
 //===----------------------------------------------------------------------===//
+// PEL25 #9: SwiGLU Op (双输入, LLaMA/PaLM FFN 核心组件)
+// swiglu(x, gate) = silu(x) * gate = (x * sigmoid(x)) * gate
+// 复用 C3_BinaryElementwiseOp 模板 (lhs=x, rhs=gate, out=result)
+//===----------------------------------------------------------------------===//
+
+def C3_SwiGLUOp : C3_BinaryElementwiseOp<"swiglu"> {
+  let summary = "SwiGLU activation (LLaMA/PaLM FFN core)";
+  let description = [{
+    swiglu(x, gate) = silu(x) * gate = (x * sigmoid(x)) * gate
+    双输入 elementwise 算子, 复用 C3_BinaryElementwiseOp 模板.
+    PEL25 §6 #9 决策点: 接 C3 JIT 路径.
+  }];
+}
+
+//===----------------------------------------------------------------------===//
 // Unary Elementwise Operations
 //===----------------------------------------------------------------------===//
 
@@ -297,6 +312,21 @@ def C3_ExpOp : C3_UnaryElementwiseOp<"exp"> {
 
 def C3_LogOp : C3_UnaryElementwiseOp<"log"> {
   let summary = "Elementwise natural logarithm operation";
+}
+
+//===----------------------------------------------------------------------===//
+// PEL25 #9: SiLU Op (单输入, SwiGLU 子模块)
+// silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+// 复用 C3_UnaryElementwiseOp 模板
+//===----------------------------------------------------------------------===//
+
+def C3_SiLUOp : C3_UnaryElementwiseOp<"silu"> {
+  let summary = "SiLU activation (LLaMA/PaLM core, SwiGLU submodule)";
+  let description = [{
+    silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+    单输入 elementwise 算子, 复用 C3_UnaryElementwiseOp 模板.
+    PEL25 §6 #9 决策点: 接 C3 JIT 路径.
+  }];
 }
 
 //===----------------------------------------------------------------------===//

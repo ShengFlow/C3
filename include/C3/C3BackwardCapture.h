@@ -307,6 +307,30 @@ private:
                                      const TensorDesc& input_desc);
 
     /**
+     * @brief 构建 SiLU backward 的 C3 Graph (PEL25 #10)
+     * @param grad_desc 下游梯度描述符
+     * @param input_desc forward 输入描述符
+     * @return C3 Graph: Mul(grad, Add(Sigmoid(x), Mul(x, Mul(Sigmoid(x), Sub(1, Sigmoid(x))))))
+     *   即: d/dx silu(x) = sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x))
+     *        grad_input = grad * d_silu_dx
+     */
+    BackwardGraph buildSiLUBackwardGraph(const TensorDesc& grad_desc,
+                                   const TensorDesc& input_desc);
+
+    /**
+     * @brief 构建 SwiGLU backward 的 C3 Graph (PEL25 #10, 双输入)
+     * @param grad_desc 下游梯度描述符
+     * @param input_descs forward 输入描述符 [x, gate]
+     * @param input_index 目标上游输入索引 (0=x → dL/dx, 1=gate → dL/dgate)
+     * @return 单输出 C3 Graph (仅计算目标输入的梯度)
+     *   input_index=0: grad_x = grad * gate * silu_d(x)
+     *   input_index=1: grad_gate = grad * silu(x)
+     */
+    BackwardGraph buildSwiGLUBackwardGraph(const TensorDesc& grad_desc,
+                                    const std::vector<TensorDesc>& input_descs,
+                                    size_t input_index);
+
+    /**
      * @brief 构建 Tanh backward 的 C3 Graph
      * @param grad_desc 下游梯度描述符
      * @param input_desc forward 输入描述符

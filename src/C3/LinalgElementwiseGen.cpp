@@ -81,6 +81,7 @@ bool isUnaryElementwiseOp(ElementwiseOp op) {
     case ElementwiseOp::Tanh:
     case ElementwiseOp::Exp:
     case ElementwiseOp::Log:
+    case ElementwiseOp::SiLU:  // PEL25 #8
         return true;
     case ElementwiseOp::Add:
     case ElementwiseOp::Sub:
@@ -97,6 +98,7 @@ const char* elementwiseOpName(ElementwiseOp op) {
     case ElementwiseOp::Tanh: return "Tanh";
     case ElementwiseOp::Exp: return "Exp";
     case ElementwiseOp::Log: return "Log";
+    case ElementwiseOp::SiLU: return "SiLU";  // PEL25 #8
     case ElementwiseOp::Add: return "Add";
     case ElementwiseOp::Sub: return "Sub";
     case ElementwiseOp::Mul: return "Mul";
@@ -220,6 +222,17 @@ void buildLinalgElementwiseFunc(mlir::OpBuilder& builder, mlir::Location loc,
             case ElementwiseOp::Tanh:
                 result = b.create<mlir::math::TanhOp>(regionLoc, args[0]);
                 break;
+            case ElementwiseOp::SiLU: {  // PEL25 #8: silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+                mlir::Value x = args[0];
+                mlir::Value neg_x = b.create<mlir::arith::NegFOp>(regionLoc, x);
+                mlir::Value exp_neg_x = b.create<mlir::math::ExpOp>(regionLoc, neg_x);
+                mlir::Value one = b.create<mlir::arith::ConstantFloatOp>(
+                    regionLoc, f32Type, llvm::APFloat(1.0f));
+                mlir::Value denom = b.create<mlir::arith::AddFOp>(regionLoc, one, exp_neg_x);
+                mlir::Value sigmoid = b.create<mlir::arith::DivFOp>(regionLoc, one, denom);
+                result = b.create<mlir::arith::MulFOp>(regionLoc, x, sigmoid);
+                break;
+            }
             case ElementwiseOp::Exp:
                 result = b.create<mlir::math::ExpOp>(regionLoc, args[0]);
                 break;
@@ -691,6 +704,17 @@ mlir::ModuleOp buildLinalgBroadcastingModule(mlir::MLIRContext& context, Element
             case ElementwiseOp::Tanh:
                 result = b.create<mlir::math::TanhOp>(regionLoc, args[0]);
                 break;
+            case ElementwiseOp::SiLU: {  // PEL25 #8: silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+                mlir::Value x = args[0];
+                mlir::Value neg_x = b.create<mlir::arith::NegFOp>(regionLoc, x);
+                mlir::Value exp_neg_x = b.create<mlir::math::ExpOp>(regionLoc, neg_x);
+                mlir::Value one = b.create<mlir::arith::ConstantFloatOp>(
+                    regionLoc, f32Type, llvm::APFloat(1.0f));
+                mlir::Value denom = b.create<mlir::arith::AddFOp>(regionLoc, one, exp_neg_x);
+                mlir::Value sigmoid = b.create<mlir::arith::DivFOp>(regionLoc, one, denom);
+                result = b.create<mlir::arith::MulFOp>(regionLoc, x, sigmoid);
+                break;
+            }
             case ElementwiseOp::Exp:
                 result = b.create<mlir::math::ExpOp>(regionLoc, args[0]);
                 break;

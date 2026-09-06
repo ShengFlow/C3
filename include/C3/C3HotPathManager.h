@@ -570,6 +570,20 @@ private:
                 }
             }
 
+            // MatMul + Add + SiLU 模式 (PEL25 Stage 5.2: LLaMA FFN 风格)
+            if (last3_0.op_type == op::MatMul &&
+                last3_1.op_type == op::Add &&
+                last3_2.op_type == op::SiLU) {
+                if (last3_0.shape.size() >= 4 && last3_1.shape.size() >= 2 && last3_2.shape.size() >= 1) {
+                    size_t M = last3_0.shape[0];
+                    size_t N = last3_0.shape[3];
+                    if (last3_1.shape[0] == M && last3_1.shape[1] == N) {
+                        submitFusedCompileAsync({last3_0, last3_1, last3_2}, dev, cfg, "MatMul+Add+SiLU");
+                        return true;
+                    }
+                }
+            }
+
             // MatMul + Sigmoid 模式 (无 bias)
             if (last3_0.op_type == op::MatMul &&
                 last3_1.op_type == op::Sigmoid) {
@@ -636,6 +650,36 @@ private:
                             submitFusedCompileAsync({last3_0, *add_rec, last3_1}, dev, cfg, "MatMul+Add+ReLU");
                         } else {
                             submitFusedCompileAsync({last3_0, last3_1}, dev, cfg, "MatMul+ReLU");
+                        }
+                        return true;
+                    }
+                }
+            }
+
+            // MatMul + SiLU 模式 (无 bias, PEL25 Stage 5.2)
+            if (last3_0.op_type == op::MatMul &&
+                last3_1.op_type == op::SiLU) {
+                if (last3_0.shape.size() >= 4 && last3_1.shape.size() >= 1) {
+                    size_t M = last3_0.shape[0];
+                    size_t N = last3_0.shape[3];
+                    bool shape_ok = false;
+                    if (last3_1.shape.size() >= 2) {
+                        shape_ok = (last3_1.shape[0] == M && last3_1.shape[1] == N);
+                    } else if (last3_1.shape.size() == 1) {
+                        shape_ok = (last3_1.shape[0] == M * N);
+                    }
+                    if (shape_ok) {
+                        // [forward 稳健化] 同 ReLU 模式: 优先在缓冲内寻找与该 MatMul
+                        // 输出 (M,N) 形状兼容的 Add (bias), 升级 MatMul+Add+SiLU
+                        const DispatchRecord* add_rec = nullptr;
+                        for (const auto& r : seq) {
+                            if (r.op_type != op::Add || r.shape.size() < 2) continue;
+                            if (r.shape[0] == M && r.shape[1] == N) { add_rec = &r; break; }
+                        }
+                        if (add_rec) {
+                            submitFusedCompileAsync({last3_0, *add_rec, last3_1}, dev, cfg, "MatMul+Add+SiLU");
+                        } else {
+                            submitFusedCompileAsync({last3_0, last3_1}, dev, cfg, "MatMul+SiLU");
                         }
                         return true;
                     }

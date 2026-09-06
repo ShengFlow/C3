@@ -141,67 +141,51 @@ struct FlatOutPool {
     std::mutex mu;
     std::unordered_map<size_t, std::vector<char*>> free_bufs;
 
-    // 每线程私有无锁缓存：同线程 acquire/release 全程不碰全局锁
-    static std::unordered_map<size_t, std::vector<char*>>& tl_free() {
-        static thread_local std::unordered_map<size_t, std::vector<char*>> m;
-        return m;
-    }
+    // [PEL25 2026-09-06 Stage 5 segfault fix] 删 tl_free() thread_local 路径
+    // (f4823fe 引入的 perf 优化, 跟 lifetime 析构顺序冲突 — 见 acquire 注释)
 
+    // [PEL25 2026-09-06 segfault fix #2] 用 heap + never delete 避免 static 析构顺序问题
+    // 之前 static FlatOutPool p 跟 GradBucket 都在 __cxa_finalize 阶段析构,
+    // 但顺序无定义 → Tensor 析构时 lock pool.mu 触发 "Invalid argument".
+    // heap + never delete 保证 lifetime 跟程序同 (进程退出 OS 回收), leak 接受.
+    // TODO 后续: 实现显式 atexit 回调 free 所有 char* + delete pool, 兼得 perf + 零 leak.
     static FlatOutPool& instance() {
-        static FlatOutPool p;
-        return p;
-    }
-
-    // 从本线程私有缓存取（无锁）
-    static char* tl_acquire(size_t bytes) {
-        auto& m = tl_free();
-        auto it = m.find(bytes);
-        if (it != m.end() && !it->second.empty()) {
-            char* p = it->second.back();
-            it->second.pop_back();
-            return p;
-        }
-        return nullptr;
-    }
-
-    // 归还到本线程私有缓存（无锁）
-    static void tl_release(size_t bytes, char* q) {
-        tl_free()[bytes].push_back(q);
+        static FlatOutPool* p = new FlatOutPool();
+        return *p;
     }
 
     std::shared_ptr<char> acquire(size_t bytes) {
-        // 1. 线程私有无锁路径
-        char* p = tl_acquire(bytes);
-        if (!p) {
-            // 2. 全局池（锁）—— 仅首次或跨线程时走
-            {
-                std::lock_guard<std::mutex> lk(mu);
-                auto it = free_bufs.find(bytes);
-                if (it != free_bufs.end() && !it->second.empty()) {
-                    p = it->second.back();
-                    it->second.pop_back();
-                }
-            }
-            if (!p) {
-                // [Fix 2026-09-05 PEL25 audit P0-1] malloc 失败 → throw bad_alloc
-                // 旧实现:无 nullptr 检查 → kernel 立即对空指针解引用 → SIGSEGV
-                // 见 reports/2026-09-05/code-review-c3-full-audit-161616.md
-                char* tmp = static_cast<char*>(std::malloc(bytes));
-                if (!tmp) throw std::bad_alloc();
-                p = tmp;
+        // [PEL25 2026-09-06 Stage 5 segfault fix] 删 tl_acquire thread_local 路径,
+        // 直接走全局池 (mutex 保护). 跟 deleter 改法一致, lifetime 全局正确.
+        char* p = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            auto it = free_bufs.find(bytes);
+            if (it != free_bufs.end() && !it->second.empty()) {
+                p = it->second.back();
+                it->second.pop_back();
             }
         }
+        if (!p) {
+            // [Fix 2026-09-05 PEL25 audit P0-1] malloc 失败 → throw bad_alloc
+            // 旧实现:无 nullptr 检查 → kernel 立即对空指针解引用 → SIGSEGV
+            // 见 reports/2026-09-05/code-review-c3-full-audit-161616.md
+            char* tmp = static_cast<char*>(std::malloc(bytes));
+            if (!tmp) throw std::bad_alloc();
+            p = tmp;
+        }
 
-        // 归属线程 id：析构时若仍在本线程，归还到线程私有缓存(无锁)；否则回全局池(锁)
-        std::thread::id owner = std::this_thread::get_id();
-        return std::shared_ptr<char>(p, [bytes, owner](char* q) {
-            if (std::this_thread::get_id() == owner) {
-                FlatOutPool::tl_release(bytes, q);   // 同线程：无锁归还
-            } else {
-                FlatOutPool& pool = FlatOutPool::instance();
-                std::lock_guard<std::mutex> lk(pool.mu);
-                pool.free_bufs[bytes].push_back(q);  // 跨线程：回全局池
-            }
+        // [PEL25 2026-09-06 Stage 5 segfault fix] 删 tl_free() thread_local 路径,
+        // 全部走全局 mutex 池. 原因: tl_free() 是 thread_local static,
+        // main thread 退出时**先于** global static (GradBucket) 析构,
+        // Tensor::~Tensor() 调 custom deleter 调 tl_release 访问已死 unordered_map
+        // → EXC_BAD_ACCESS address=0x38 (vector buffer 越界).
+        // f4823fe 引入的 perf 优化 (<1ms/epoch 收益) 换成 lifetime 正确性.
+        // 后续可考虑: tl_free() 用 shared_ptr 包装 + atexit 提前清空, 兼得 perf + 正确性.
+        return std::shared_ptr<char>(p, [bytes](char* q) {
+            FlatOutPool& pool = FlatOutPool::instance();
+            std::lock_guard<std::mutex> lk(pool.mu);
+            pool.free_bufs[bytes].push_back(q);
         });
     }
 };

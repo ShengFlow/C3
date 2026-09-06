@@ -32,6 +32,7 @@ enum class ElementwiseOp {
     Tanh,    ///< out = tanh(in)
     Exp,     ///< out = exp(in)
     Log,     ///< out = log(in)
+    SiLU,    ///< out = x * sigmoid(x) = x / (1 + exp(-x)) — PEL25 #8
     Add,     ///< out = a + b
     Sub,     ///< out = a - b
     Mul,     ///< out = a * b

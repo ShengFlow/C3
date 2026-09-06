@@ -25,6 +25,8 @@
 #include "AutoGrad/Nodes/MatMulNode.h"
 #include "AutoGrad/Nodes/ExpNode.h"
 #include "AutoGrad/Nodes/LogNode.h"
+#include "AutoGrad/Nodes/SiLUNode.h"      // PEL25 #10
+#include "AutoGrad/Nodes/SwiGLUNode.h"   // PEL25 #10
 
 #include <algorithm>
 #include <cstddef>
@@ -631,6 +633,17 @@ std::optional<C3BackwardCapture::BackwardGraph> C3BackwardCapture::buildBackward
         if (input_index != 0 || input_descs.size() < 1) return std::nullopt;
         return buildSigmoidBackwardGraph(grad_desc, input_descs[0]);
 
+    } else if (node_type.find("SwiGLUNode") != std::string::npos) {
+        // PEL25 #10: SwiGLU 双输入, 复用 buildBackwardGraphForTypeAndIndex 模式
+        // input_index 0 → dL/dx, input_index 1 → dL/dgate
+        if (input_index >= input_descs.size()) return std::nullopt;
+        return buildSwiGLUBackwardGraph(grad_desc, input_descs, input_index);
+
+    } else if (node_type.find("SiLUNode") != std::string::npos) {
+        // PEL25 #10: SiLU 单输入
+        if (input_index != 0 || input_descs.size() < 1) return std::nullopt;
+        return buildSiLUBackwardGraph(grad_desc, input_descs[0]);
+
     } else if (node_type.find("TanhNode") != std::string::npos) {
         if (input_index != 0 || input_descs.size() < 1) return std::nullopt;
         return buildTanhBackwardGraph(grad_desc, input_descs[0]);
@@ -806,6 +819,142 @@ C3BackwardCapture::BackwardGraph C3BackwardCapture::buildSigmoidBackwardGraph(
     g.markOutput(result);
     // [Fix 2026-08-11 最小集 build] 图输入 [grad, x]，x 对应 forward_inputs[0]
     return {std::move(g), {0}};
+}
+
+// [PEL25 #10 2026-09-05 苏璃珞] SiLU backward graph construction
+//
+// 公式: d/dx silu(x) = sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x))
+//   grad_input = grad * d_silu_dx
+//
+// 算子序列（11 op）：
+//   1. neg_x = Neg(x)                              (Neg)
+//   2. exp_neg_x = Exp(neg_x)                       (Exp)
+//   3. sigmoid_x = 1.0 / (1.0 + exp_neg_x)          (Div, one_constant=1.0)
+//   4. one_minus_sig = 1.0 - sigmoid_x              (Sub, one_constant=1.0)
+//   5. sig_times_one_minus = sigmoid_x * one_minus  (Mul)
+//   6. x_times_sig = x * sigmoid_x                  (Mul)
+//   7. term1_x = x_times_sig * one_minus_sig         (Mul)
+//   8. term2_x = sigmoid_x + term1_x                (Add)   ← d_silu_dx
+//   9. grad_in_mul = grad * term2_x                 (Mul)   ← grad_input
+//   output = grad_in_mul
+C3BackwardCapture::BackwardGraph C3BackwardCapture::buildSiLUBackwardGraph(
+    const TensorDesc& grad_desc,
+    const TensorDesc& input_desc)
+{
+    Graph g;
+
+    // 输入: [grad, x]
+    size_t grad_in = g.addInput(grad_desc);
+    size_t x_in = g.addInput(input_desc);
+
+    TensorDesc sig_desc = TensorDesc::fromShape(input_desc.shape);
+    TensorDesc one_desc = TensorDesc::fromShape({1});
+
+    // sigmoid(x) = 1 / (1 + exp(-x))
+    size_t neg_x = g.addNode(NegNode{sig_desc}, {x_in}, sig_desc);
+    size_t exp_neg = g.addNode(ExpNode{sig_desc}, {neg_x}, sig_desc);
+    size_t one_node = g.addConstant(1.0, one_desc);
+    size_t denom = g.addNode(AddNode{sig_desc, sig_desc}, {one_node, exp_neg}, sig_desc);
+    size_t sigmoid = g.addNode(DivNode{sig_desc, sig_desc}, {one_node, denom}, sig_desc);
+
+    // sigmoid * (1 - sigmoid)
+    size_t one_minus_sig = g.addNode(SubNode{sig_desc, sig_desc}, {one_node, sigmoid}, sig_desc);
+    size_t sig_times_one_minus = g.addNode(MulNode{sig_desc, sig_desc}, {sigmoid, one_minus_sig}, sig_desc);
+
+    // sigmoid + x * sigmoid * (1 - sigmoid) = d_silu_dx
+    size_t x_times_sig = g.addNode(MulNode{sig_desc, sig_desc}, {x_in, sigmoid}, sig_desc);
+    size_t term1_x = g.addNode(MulNode{sig_desc, sig_desc}, {x_times_sig, one_minus_sig}, sig_desc);
+    size_t d_silu_dx = g.addNode(AddNode{sig_desc, sig_desc}, {sigmoid, term1_x}, sig_desc);
+
+    // grad * d_silu_dx
+    size_t result = g.addNode(MulNode{grad_desc, sig_desc}, {grad_in, d_silu_dx}, sig_desc);
+
+    g.markOutput(result);
+    // [PEL25 #10] 图输入 [grad, x], x 对应 forward_inputs[0]
+    return {std::move(g), {0}};
+}
+
+// [PEL25 #10 2026-09-05 苏璃珞] SwiGLU backward graph construction (双输入)
+//
+// 公式:
+//   silu(x) = x * sigmoid(x)
+//   d/dx silu(x) = sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x))
+//   dSwiGLU/dx     = gate * d_silu_dx(x)
+//   dSwiGLU/dgate  = silu(x)
+//
+//   grad_x    = grad * gate * d_silu_dx(x)
+//   grad_gate = grad * silu(x)
+//
+// input_index = 0 (dL/dx):   复用 buildSiLUBackwardGraph 思路 + gate 乘 + grad 乘
+// input_index = 1 (dL/dgate): grad * x * sigmoid(x)
+C3BackwardCapture::BackwardGraph C3BackwardCapture::buildSwiGLUBackwardGraph(
+    const TensorDesc& grad_desc,
+    const std::vector<TensorDesc>& input_descs,
+    size_t input_index)
+{
+    if (input_descs.size() < 2) {
+        return BackwardGraph{};  // 安全 fallback
+    }
+    const TensorDesc& x_desc = input_descs[0];
+    const TensorDesc& gate_desc = input_descs[1];
+    TensorDesc out_desc = TensorDesc::fromShape(x_desc.shape);
+
+    if (input_index == 0) {
+        // dL/dx = grad * gate * d_silu_dx(x)
+        Graph g;
+        size_t grad_in = g.addInput(grad_desc);
+        size_t x_in = g.addInput(x_desc);
+        size_t gate_in = g.addInput(gate_desc);
+
+        TensorDesc sig_desc = TensorDesc::fromShape(x_desc.shape);
+        TensorDesc one_desc = TensorDesc::fromShape({1});
+
+        // sigmoid(x) (复用 buildSiLU 思路)
+        size_t neg_x = g.addNode(NegNode{sig_desc}, {x_in}, sig_desc);
+        size_t exp_neg = g.addNode(ExpNode{sig_desc}, {neg_x}, sig_desc);
+        size_t one_node = g.addConstant(1.0, one_desc);
+        size_t denom = g.addNode(AddNode{sig_desc, sig_desc}, {one_node, exp_neg}, sig_desc);
+        size_t sigmoid = g.addNode(DivNode{sig_desc, sig_desc}, {one_node, denom}, sig_desc);
+
+        // d_silu_dx = sigmoid + x * sigmoid * (1 - sigmoid)
+        size_t one_minus_sig = g.addNode(SubNode{sig_desc, sig_desc}, {one_node, sigmoid}, sig_desc);
+        size_t x_times_sig = g.addNode(MulNode{sig_desc, sig_desc}, {x_in, sigmoid}, sig_desc);
+        size_t x_sig_1ms = g.addNode(MulNode{sig_desc, sig_desc}, {x_times_sig, one_minus_sig}, sig_desc);
+        size_t d_silu_dx = g.addNode(AddNode{sig_desc, sig_desc}, {sigmoid, x_sig_1ms}, sig_desc);
+
+        // grad * gate * d_silu_dx
+        size_t grad_x_1 = g.addNode(MulNode{grad_desc, out_desc}, {grad_in, gate_in}, out_desc);
+        size_t grad_x = g.addNode(MulNode{out_desc, sig_desc}, {grad_x_1, d_silu_dx}, sig_desc);
+
+        g.markOutput(grad_x);
+        // 图输入 [grad, x, gate], 0=grad, 1=x, 2=gate (forward_inputs[0]=x, forward_inputs[1]=gate)
+        return {std::move(g), {1}};
+    } else {
+        // dL/dgate = grad * silu(x) = grad * x * sigmoid(x)
+        Graph g;
+        size_t grad_in = g.addInput(grad_desc);
+        size_t x_in = g.addInput(x_desc);
+
+        TensorDesc sig_desc = TensorDesc::fromShape(x_desc.shape);
+        TensorDesc one_desc = TensorDesc::fromShape({1});
+
+        // sigmoid(x)
+        size_t neg_x = g.addNode(NegNode{sig_desc}, {x_in}, sig_desc);
+        size_t exp_neg = g.addNode(ExpNode{sig_desc}, {neg_x}, sig_desc);
+        size_t one_node = g.addConstant(1.0, one_desc);
+        size_t denom = g.addNode(AddNode{sig_desc, sig_desc}, {one_node, exp_neg}, sig_desc);
+        size_t sigmoid = g.addNode(DivNode{sig_desc, sig_desc}, {one_node, denom}, sig_desc);
+
+        // silu(x) = x * sigmoid(x)
+        size_t silu_x = g.addNode(MulNode{sig_desc, sig_desc}, {x_in, sigmoid}, sig_desc);
+
+        // grad * silu(x)
+        size_t grad_gate = g.addNode(MulNode{grad_desc, sig_desc}, {grad_in, silu_x}, sig_desc);
+
+        g.markOutput(grad_gate);
+        // 图输入 [grad, x], x 对应 forward_inputs[0]
+        return {std::move(g), {0}};
+    }
 }
 
 // [P0.2 2026-08-30 苏璃珞] Softmax backward graph construction
