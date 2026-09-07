@@ -331,7 +331,21 @@ std::optional<std::vector<Tensor>> C3KernelRegistry::tryExecuteBackward(
             (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - t_bw_exec0).count(), std::memory_order_relaxed);
         return outputs;
+    } catch (const std::exception& e) {
+        static std::mutex emu;
+        static int ecnt = 0;
+        std::lock_guard<std::mutex> el(emu);
+        if (ecnt++ < 5) {
+            fprintf(stderr, "[BW-EXEC-EXC] key=%s err=%s\n", backward_key.c_str(), e.what());
+        }
+        return std::nullopt;
     } catch (...) {
+        static std::mutex emu2;
+        static int ecnt2 = 0;
+        std::lock_guard<std::mutex> el(emu2);
+        if (ecnt2++ < 5) {
+            fprintf(stderr, "[BW-EXEC-EXC] key=%s err=unknown\n", backward_key.c_str());
+        }
         return std::nullopt;
     }
 }
