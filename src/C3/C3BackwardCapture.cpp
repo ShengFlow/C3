@@ -13,6 +13,7 @@
 #include "C3/C3KernelRegistry.h"
 #include "C3/Graph.h"
 #include "C3/GraphMerger.h"
+#include "C3/FusionPlanner.h"
 
 #include "AutoGrad/Nodes/ReLUNode.h"
 #include "AutoGrad/Nodes/SigmoidNode.h"
@@ -2551,6 +2552,29 @@ void C3BackwardCapture::compileFFNMIMOBackwardAsync(
             fused_graph.markOutput(unified_info.output_remap[4][1]);  // 6: grad_W_g
             fused_graph.markOutput(unified_info.output_remap[5][0]);  // 7: grad_x_up
             fused_graph.markOutput(unified_info.output_remap[5][1]);  // 8: grad_W_u
+
+            // [L2 诊断 2026-09-07] C3_PLANNER_DIAG=1: 在真实 FFN MIMO fused_graph 上跑
+            // FusionPlanner, 量化 planner(默认单 GEMM/逐元素单元模型) 与 MIMO(单内核多输出
+            // region) 的结构差。纯只读, 不改变任何编译/执行路径。
+            if (std::getenv("C3_PLANNER_DIAG")) {
+                FusionPlan plan = FusionPlanner::planUnits(fused_graph);
+                fprintf(stderr, "[PLANNER-DIAG] FFN-MIMO graph nodes=%zu compute_units=%zu:",
+                        fused_graph.nodeCount(), plan.compute_unit_count);
+                for (const auto& u : plan.units) {
+                    if (!u.isCompute()) continue;
+                    fprintf(stderr, " [%s n=%zu",
+                            u.kind == FusionUnitKind::GEMM_EPILOGUE ? "GEMM_EPI"
+                            : (u.kind == FusionUnitKind::GEMM ? "GEMM"
+                            : (u.kind == FusionUnitKind::ELEMENTWISE ? "ELEM" : "LEAF")),
+                            u.node_ids.size());
+                    for (size_t id : u.node_ids) {
+                        fprintf(stderr, " %s",
+                                std::visit([](auto&& o) { return std::string(o.name); }, fused_graph.node(id).op).c_str());
+                    }
+                    fprintf(stderr, "]");
+                }
+                fprintf(stderr, "\n");
+            }
 
             CompileOptions opts;
             opts.backend = C3Backend::MLIR;
