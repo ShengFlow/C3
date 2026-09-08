@@ -22,6 +22,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -573,13 +574,19 @@ static void buildFusedMultiNodeVectorized(mlir::OpBuilder& builder, mlir::Locati
     mlir::Value rem = builder.create<mlir::arith::RemUIOp>(loc, n_idx, VL_i);
     mlir::Value n_vec = builder.create<mlir::arith::SubIOp>(loc, n_idx, rem);
 
-    // 动态构造 VL 长度的零/一向量（随目标架构位宽变化）
+    // 动态构造 VL 长度的零/一/NaN 向量（随目标架构位宽变化）
     const std::vector<float> zeros_v(static_cast<size_t>(VL), 0.0f);
     const std::vector<float> ones_v(static_cast<size_t>(VL), 1.0f);
     mlir::Value zero_vec = builder.create<mlir::arith::ConstantOp>(
         loc, mlir::DenseElementsAttr::get(vec_ty, llvm::ArrayRef<float>(zeros_v)));
     mlir::Value one_vec = builder.create<mlir::arith::ConstantOp>(
         loc, mlir::DenseElementsAttr::get(vec_ty, llvm::ArrayRef<float>(ones_v)));
+    // [2026-09-07] NaN 向量, 供 Div 除零守卫统一(见 DivNode 分支): rhs==0 → NaN,
+    // 对齐标量 buildFused 路径的显式 NaN 语义, 避免同图不同编译路径 inf vs NaN 分裂。
+    const float kNaN = std::numeric_limits<float>::quiet_NaN();
+    const std::vector<float> nans_v(static_cast<size_t>(VL), kNaN);
+    mlir::Value nan_vec = builder.create<mlir::arith::ConstantOp>(
+        loc, mlir::DenseElementsAttr::get(vec_ty, llvm::ArrayRef<float>(nans_v)));
 
     auto vloop = builder.create<mlir::scf::ForOp>(loc, c0_i, n_vec, VL_i);
     builder.setInsertionPointToStart(vloop.getBody());
@@ -671,7 +678,12 @@ static void buildFusedMultiNodeVectorized(mlir::OpBuilder& builder, mlir::Locati
             } else if constexpr (std::is_same_v<T, DivNode>) {
                 if (op_idx > 0) { lhs = prev_val_v; rhs = loadExternalVector(ext_inputs[0]); }
                 else { lhs = loadExternalVector(ext_inputs[0]); rhs = loadExternalVector(ext_inputs[1]); }
-                result_v = builder.create<mlir::arith::DivFOp>(loc, lhs, rhs);
+                mlir::Value div_v = builder.create<mlir::arith::DivFOp>(loc, lhs, rhs);
+                // [2026-09-07] 除零守卫: rhs==0 → NaN, 统一与标量 buildFused 路径语义
+                // (IEEE x/0=inf, 但此处统一 NaN 避免同图不同编译路径 inf/NaN 分裂)
+                mlir::Value dz_v = builder.create<mlir::arith::CmpFOp>(
+                    loc, mlir::arith::CmpFPredicate::OEQ, rhs, zero_vec);
+                result_v = builder.create<mlir::arith::SelectOp>(loc, dz_v, nan_vec, div_v);
             }
         }, op);
 
@@ -766,7 +778,15 @@ static void buildFusedMultiNodeVectorized(mlir::OpBuilder& builder, mlir::Locati
             } else if constexpr (std::is_same_v<T, DivNode>) {
                 if (op_idx > 0) { lhs = prev_val_s; rhs = loadExternalScalar(ext_inputs[0]); }
                 else { lhs = loadExternalScalar(ext_inputs[0]); rhs = loadExternalScalar(ext_inputs[1]); }
-                result_s = builder.create<mlir::arith::DivFOp>(loc, lhs, rhs);
+                mlir::Value div_s = builder.create<mlir::arith::DivFOp>(loc, lhs, rhs);
+                // [2026-09-07] 除零守卫: rhs==0 → NaN, 统一与向量/标量 buildFused 路径语义
+                mlir::Value zero_f = builder.create<mlir::arith::ConstantFloatOp>(
+                    loc, builder.getF32Type(), llvm::APFloat(0.0f));
+                mlir::Value nan_f = builder.create<mlir::arith::ConstantFloatOp>(
+                    loc, builder.getF32Type(), llvm::APFloat::getNaN(llvm::APFloat::IEEEsingle()));
+                mlir::Value dz_s = builder.create<mlir::arith::CmpFOp>(
+                    loc, mlir::arith::CmpFPredicate::OEQ, rhs, zero_f);
+                result_s = builder.create<mlir::arith::SelectOp>(loc, dz_s, nan_f, div_s);
             }
         }, op);
 

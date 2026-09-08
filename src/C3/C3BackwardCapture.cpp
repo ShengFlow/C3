@@ -2100,6 +2100,13 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteUnifiedMIMOBackw
             up_mm->getInputs().size() < 2) {
             return std::nullopt;
         }
+        // [2026-09-07 苏璃珞] 单消费者守卫: 本 MIMO 在 mm_out 时刻按"mul 是 h 的唯一下游"预算一份
+        // grad_h 回填 pending。若 h(或 mul 输出)被多个下游消费, ComputeCore 会累积多份 grad 才弹
+        // mul, 而 pending 只含一份 → 丢其它消费者贡献(与历史 C3-BUG-20260905-01 同根因)。
+        // 用稳定 fanout(getDownstreamCount, 构建期)确保 mul 仅被当前 mm_out 消费, 否则回退 eager。
+        if (mul_node->getDownstreamCount() != 1) {
+            return std::nullopt;
+        }
 
         const Tensor& W_d = node->getInputs()[1];
         const Tensor& h   = node->getInputs()[0];
@@ -2551,16 +2558,25 @@ void C3BackwardCapture::compileFFNMIMOBackwardAsync(
 
             auto kernel = C3Engine::getInstance().compile(fused_graph, opts);
             if (kernel) {
-                // 外部输入顺序(merge 按子图输入遍历):
-                // grad, h, W_d, u, g, gate_pre, x, W_g, x, W_u (10 个, grad 是输入 0)
-                // fwd map {0..8} 对应执行侧 inputs {h,W_d,u,g,gate_pre,x,W_g,x,W_u}
-                C3KernelRegistry::getInstance().installBackward(
-                    ffn_key, kernel, grad_desc.shape, grad_desc.shape,
-                    {0, 1, 2, 3, 4, 5, 6, 7, 8}, 10
-                );
-                #ifdef CT_DEBUG
-                std::cerr << "[FFN-MIMO-COMPILE-SUCCESS] key=" << ffn_key << std::endl;
-                #endif
+                // [2026-09-07 苏璃珞] 从 GraphMerger 的实际 external_input_ids 推导 num_inputs,
+                // 不再硬编码 10 —— 消除"子图结构一变就静默错喂"的脆弱。期望外部输入:
+                // grad, h, W_d, u, g, gate_pre, x, W_g, x, W_u (grad 是第 0 个, 后 9 个 fwd)。
+                // 执行侧 forward_inputs 按 {h,W_d,u,g,gate_pre,x,W_g,x,W_u} 喂入, 故 fwd map 恒等。
+                const auto& ext_ids = unified_info.external_input_ids;
+                const size_t kExpect = 10;  // grad + 9 fwd
+                if (ext_ids.size() != kExpect) {
+                    fprintf(stderr,
+                            "[FFN-MIMO-COMPILE-ERR] key=%s external input count=%zu (expect %zu) — 结构变化, 不注册\n",
+                            ffn_key.c_str(), ext_ids.size(), kExpect);
+                } else {
+                    C3KernelRegistry::getInstance().installBackward(
+                        ffn_key, kernel, grad_desc.shape, grad_desc.shape,
+                        {0, 1, 2, 3, 4, 5, 6, 7, 8}, ext_ids.size()
+                    );
+                    #ifdef CT_DEBUG
+                    std::cerr << "[FFN-MIMO-COMPILE-SUCCESS] key=" << ffn_key << std::endl;
+                    #endif
+                }
             }
         } catch (const std::exception& e) {
             static std::mutex err_mu;
