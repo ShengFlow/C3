@@ -175,8 +175,11 @@ static mlir::LLVM::LLVMFuncOp getOrDeclareExpf(mlir::OpBuilder& builder, mlir::L
 }
 
 static void buildGt(mlir::OpBuilder& builder, mlir::Location loc,
-                    mlir::Value lhs, mlir::Value rhs, mlir::Value out, mlir::Value n) {
+                    mlir::Value lhs, mlir::Value rhs, mlir::Value out, mlir::Value n,
+                    bool rhs_scalar) {
     // out = (lhs > rhs) ? 1.0f : 0.0f
+    // rhs_scalar=true 时 rhs 是单元素(如 ReLU 阈值 0), 循环外读一次;
+    // rhs_scalar=false 时 rhs 与 lhs 等长(逐元素向量比较), 循环内读 rhs[i]。
     auto ptr_type = mlir::LLVM::LLVMPointerType::get(builder.getContext());
     auto f32 = builder.getF32Type();
     
@@ -187,10 +190,13 @@ static void buildGt(mlir::OpBuilder& builder, mlir::Location loc,
     auto zero_f = builder.create<mlir::arith::ConstantFloatOp>(loc, f32, llvm::APFloat(0.0f));
     auto one_f = builder.create<mlir::arith::ConstantFloatOp>(loc, f32, llvm::APFloat(1.0f));
 
-    // [HPC 优化] rhs 是大小为 1 的标量常量（如 0.0f），在循环外仅加载一次，避免循环内重复加载和越界访问
-    auto c0_i64 = indexToI64(builder, loc, c0);
-    auto rhs_ptr_base = builder.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, rhs, mlir::ValueRange{c0_i64});
-    auto rhs_val = builder.create<mlir::LLVM::LoadOp>(loc, f32, rhs_ptr_base);
+    // [HPC 优化] rhs 标量时循环外仅加载一次, 避免循环内重复加载和越界访问
+    mlir::Value rhs_val;
+    if (rhs_scalar) {
+        auto c0_i64 = indexToI64(builder, loc, c0);
+        auto rhs_ptr_base = builder.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, rhs, mlir::ValueRange{c0_i64});
+        rhs_val = builder.create<mlir::LLVM::LoadOp>(loc, f32, rhs_ptr_base);
+    }
     
     // 循环: for i in 0..n-1: out[i] = (lhs[i] > rhs) ? 1.0f : 0.0f
     auto loop = builder.create<mlir::scf::ForOp>(loc, c0, n_idx, c1);
@@ -202,6 +208,11 @@ static void buildGt(mlir::OpBuilder& builder, mlir::Location loc,
     auto out_ptr = builder.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, out, mlir::ValueRange{idx_i64});
     
     auto lhs_val = builder.create<mlir::LLVM::LoadOp>(loc, f32, lhs_ptr);
+    if (!rhs_scalar) {
+        // 逐元素: rhs[i] 与 lhs[i] 同 index(等长), 泛化非标量比较
+        auto rhs_ptr = builder.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, rhs, mlir::ValueRange{idx_i64});
+        rhs_val = builder.create<mlir::LLVM::LoadOp>(loc, f32, rhs_ptr);
+    }
     
     // 比较: lhs > rhs
     auto cmp = builder.create<mlir::arith::CmpFOp>(loc, mlir::arith::CmpFPredicate::OGT, lhs_val, rhs_val);
@@ -1757,7 +1768,12 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
             int64_t N = tr.in_desc.shape.size() > 1 ? tr.in_desc.shape[1] : 1;
             builder.create<mlir::c3::TransposeOp>(loc, in_ptrs[0], out_buf, M, N, tr.dim0, tr.dim1);
         } else if (std::holds_alternative<GtNode>(op)) {
-            buildGt(builder, loc, in_ptrs[0], in_ptrs[1], out_buf, node_n);
+            const auto& gtn = std::get<GtNode>(op);
+            // [2026-09-07 苏璃珞] 泛化: rhs 可能标量(numel==1, 如 ReLU 阈值)或等长向量(逐元素比较)。
+            // 由 rhs_desc 判定, 不再假设恒标量。
+            size_t rhs_n = 1;
+            for (size_t s : gtn.rhs_desc.shape) rhs_n *= s;
+            buildGt(builder, loc, in_ptrs[0], in_ptrs[1], out_buf, node_n, rhs_n == 1);
         } else {
             // 支持的 op 列表 (M1 路线图 9/15 + M2 完成):
             //   MatMul/Add/Sub/Mul/Div/Neg/ReLU/Sigmoid/Tanh/SumReduce/Transpose/Gt/Exp/Log

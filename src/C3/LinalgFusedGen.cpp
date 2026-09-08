@@ -67,6 +67,12 @@ static bool isBroadcastableTo(const std::vector<size_t>& src, const std::vector<
     return true;
 }
 
+static size_t numelOf(const std::vector<size_t>& shape) {
+    size_t n = 1;
+    for (size_t d : shape) n *= d;
+    return n;
+}
+
 bool isPureElementwiseGraph(const Graph& graph) {
     static const bool disabled = [] {
         const char* v = std::getenv("C3_LINALG_FUSED");
@@ -108,9 +114,21 @@ bool isPureElementwiseGraph(const Graph& graph) {
     const auto& graph_outputs = graph.outputs();
     if (graph_outputs.empty()) return false;
     const auto& out_shape = graph.node(graph_outputs[0]).out_desc.shape;
+    const size_t out_numel = numelOf(out_shape);
 
     for (const auto& node : nodes) {
+        // 形状需可广播到输出 …
         if (!isBroadcastableTo(node.out_desc.shape, out_shape)) {
+            return false;
+        }
+        // … 且 numel 必须与输出完全一致。
+        //
+        // [2026-09-07 苏璃珞] OneShot 后端把每个入参当 1D 全长 n 的 identity memref,
+        // 逐迭代索引读取。若仅允许「广播到输出」而放行标量/短输入(如 {1}→{n}),
+        // 会在 1 元素缓冲区上越界读取 n 次。故广播张量(含 size-1 维缩并的短缓冲)
+        // 一律不进 OneShot —— 其语义需真广播仿射映射, 而非当前 identity 1D ABI。
+        // 纯逐元素(等 numel 扁平)图不受影响。
+        if (numelOf(node.out_desc.shape) != out_numel) {
             return false;
         }
     }
