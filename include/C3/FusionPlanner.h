@@ -41,6 +41,24 @@ enum class FusionStrategy : uint8_t {
                      ///<   Transpose 并入 GEMM；SumReduce/Softmax/CrossEntropy/Fused 仍为边界
 };
 
+/**
+ * @brief RegionKernel 策略的跨分量合并度量（纯数据驱动）
+ * @details 连通分量之外, 仅当"共享外部输入的重用节省"足够大才把多分量并成
+ *          一个多输出内核: merged = saved_reload_bytes > min_benefit_ratio * working_set_bytes。
+ *          launch 省税不在此原型中计入(硬件相关, 交给 autotune 指纹)。
+ */
+struct RegionMergeMetric {
+    size_t component_count = 0;        ///< 连通分量数
+    uint64_t saved_reload_bytes = 0;   ///< Σ (usage(e)-1) * numel(e), 共享外部输入因并入单内核省的重读
+    uint64_t working_set_bytes = 0;    ///< Σ regionable 节点输出 numel(寄存器/局部压力代理)
+    bool merged = false;               ///< 是否把多分量并成单 region
+};
+
+/// RegionKernel 跨分量合并的代价门参数（原型默认保守; 系数终态由 autotune 指纹给出）
+struct RegionFusionPolicy {
+    double min_benefit_ratio = 0.25;   ///< 收益须至少覆盖工作集 25% 才跨分量合并
+};
+
 /// 单个融合单元
 struct FusionUnit {
     FusionUnitKind kind = FusionUnitKind::LEAF;
@@ -58,6 +76,7 @@ struct FusionPlan {
     std::vector<FusionUnit> units;    ///< 所有单元（含 LEAF 单节点）
     std::vector<size_t> node_unit;    ///< node_id -> units 下标（size = nodeCount）
     size_t compute_unit_count = 0;    ///< 非 LEAF 单元数
+    RegionMergeMetric region_metric;  ///< RegionKernel 策略的跨分量合并度量（Default 策略为零值）
 
     /// 取包含指定 node_id 的单元（node_id 非法则返回 nullptr）
     const FusionUnit* unitOf(size_t node_id) const {
@@ -88,8 +107,11 @@ public:
 
     /// 按指定策略规划融合单元
     /// @param strategy FusionStrategy::RegionKernel 时：多输出 region 判据
-    ///                 （连通区段 + 共享中间量内联 + Transpose 并入 GEMM）。
-    static FusionPlan planUnits(const Graph& graph, FusionStrategy strategy);
+    ///                 （连通区段 + 共享中间量内联 + Transpose 并入 GEMM
+    ///                 + 代价门跨分量合并, 度量见 plan.region_metric）。
+    /// @param policy   RegionKernel 跨分量合并代价门参数（Default 策略忽略）
+    static FusionPlan planUnits(const Graph& graph, FusionStrategy strategy,
+                                const RegionFusionPolicy& policy = {});
 
     /// 供测试/诊断：节点 → 可共内核类别（不触发任何编译）
     static FusionUnitKind nodeKind(const Node& node);

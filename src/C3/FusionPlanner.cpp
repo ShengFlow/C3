@@ -184,7 +184,7 @@ FusionPlan planDefault(const Graph& graph) {
 
 // ======================= RegionKernel 策略（单内核多输出 region） =======================
 
-FusionPlan planRegionKernel(const Graph& graph) {
+FusionPlan planRegionKernel(const Graph& graph, const RegionFusionPolicy& policy) {
     const size_t n = graph.nodeCount();
     const auto& nodes = graph.nodes();
     const auto& graph_inputs = graph.inputs();
@@ -235,14 +235,59 @@ FusionPlan planRegionKernel(const Graph& graph) {
     for (auto& [r, m] : root_min) ordered.emplace_back(m, r);
     std::sort(ordered.begin(), ordered.end());
 
+    // ---- 跨分量合并代价门（数据驱动, 非按结构名） ----
+    // 每个连通分量一组; 统计"外部输入被多少个分量消费"→ 并入单内核省的重读字节。
+    std::vector<std::vector<size_t>> comp_members(ordered.size());
+    for (size_t ci = 0; ci < ordered.size(); ++ci) {
+        size_t r = ordered[ci].second;
+        for (size_t i = 0; i < n; ++i)
+            if (regionable[i] && find(i) == r) comp_members[ci].push_back(i);
+    }
+    std::unordered_map<size_t, size_t> ext_usage; // 外部输入节点 id -> 消费它的分量数
+    std::vector<std::vector<size_t>> comp_ext(ordered.size());
+    for (size_t ci = 0; ci < comp_members.size(); ++ci) {
+        std::vector<bool> member(n, false);
+        for (size_t id : comp_members[ci]) member[id] = true;
+        for (size_t id : comp_members[ci]) {
+            for (size_t in_id : nodes[id].inputs) {
+                if (in_id >= n || member[in_id]) continue;
+                // 每个分量对同一外部输入只计一次
+                if (std::find(comp_ext[ci].begin(), comp_ext[ci].end(), in_id) == comp_ext[ci].end()) {
+                    comp_ext[ci].push_back(in_id);
+                    ext_usage[in_id] += 1;
+                }
+            }
+        }
+    }
+    RegionMergeMetric metric;
+    metric.component_count = comp_members.size();
+    for (auto& [e, cnt] : ext_usage) {
+        if (cnt <= 1) continue;
+        metric.saved_reload_bytes += (uint64_t)(cnt - 1) * (uint64_t)nodeNumel(nodes[e]);
+    }
+    for (size_t i = 0; i < n; ++i)
+        if (regionable[i]) metric.working_set_bytes += (uint64_t)nodeNumel(nodes[i]);
+    metric.merged = (metric.component_count > 1) &&
+                    (metric.saved_reload_bytes >
+                     (uint64_t)((double)metric.working_set_bytes * policy.min_benefit_ratio));
+
+    // ---- 组装单元 ----
     std::vector<FusionUnit> units;
-    for (auto& [min_id, r] : ordered) {
+    if (metric.merged) {
         FusionUnit u;
         u.kind = FusionUnitKind::REGION_KERNEL;
-        u.numel = 0; // region 内多形状，无单一 numel
+        u.numel = 0;
         for (size_t i = 0; i < n; ++i)
-            if (regionable[i] && find(i) == r) u.node_ids.push_back(i);
+            if (regionable[i]) u.node_ids.push_back(i);
         units.push_back(std::move(u));
+    } else {
+        for (size_t ci = 0; ci < comp_members.size(); ++ci) {
+            FusionUnit u;
+            u.kind = FusionUnitKind::REGION_KERNEL;
+            u.numel = 0;
+            u.node_ids = comp_members[ci]; // 已按 id 升序(遍历升序收集)
+            units.push_back(std::move(u));
+        }
     }
     for (size_t i = 0; i < n; ++i) {
         if (regionable[i]) continue;
@@ -252,7 +297,9 @@ FusionPlan planRegionKernel(const Graph& graph) {
         u.node_ids.push_back(i);
         units.push_back(std::move(u));
     }
-    return assemble(graph, std::move(units));
+    FusionPlan plan = assemble(graph, std::move(units));
+    plan.region_metric = metric;
+    return plan;
 }
 
 } // namespace
@@ -280,9 +327,10 @@ FusionPlan FusionPlanner::planUnits(const Graph& graph) {
     return planUnits(graph, FusionStrategy::Default);
 }
 
-FusionPlan FusionPlanner::planUnits(const Graph& graph, FusionStrategy strategy) {
+FusionPlan FusionPlanner::planUnits(const Graph& graph, FusionStrategy strategy,
+                                    const RegionFusionPolicy& policy) {
     if (strategy == FusionStrategy::RegionKernel) {
-        return planRegionKernel(graph);
+        return planRegionKernel(graph, policy);
     }
     return planDefault(graph);
 }
