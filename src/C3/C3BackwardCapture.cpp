@@ -2558,8 +2558,9 @@ void C3BackwardCapture::compileFFNMIMOBackwardAsync(
             // region) 的结构差。纯只读, 不改变任何编译/执行路径。
             if (std::getenv("C3_PLANNER_DIAG")) {
                 FusionPlan plan = FusionPlanner::planUnits(fused_graph);
-                fprintf(stderr, "[PLANNER-DIAG] FFN-MIMO graph nodes=%zu compute_units=%zu:",
-                        fused_graph.nodeCount(), plan.compute_unit_count);
+                FusionPlan region = FusionPlanner::planUnits(fused_graph, FusionStrategy::RegionKernel);
+                fprintf(stderr, "[PLANNER-DIAG] FFN-MIMO graph nodes=%zu default_units=%zu region_units=%zu:",
+                        fused_graph.nodeCount(), plan.compute_unit_count, region.compute_unit_count);
                 for (const auto& u : plan.units) {
                     if (!u.isCompute()) continue;
                     fprintf(stderr, " [%s n=%zu",
@@ -2572,6 +2573,10 @@ void C3BackwardCapture::compileFFNMIMOBackwardAsync(
                                 std::visit([](auto&& o) { return std::string(o.name); }, fused_graph.node(id).op).c_str());
                     }
                     fprintf(stderr, "]");
+                }
+                for (const auto& u : region.units) {
+                    if (!u.isCompute()) continue;
+                    fprintf(stderr, " region[n=%zu]", u.node_ids.size());
                 }
                 fprintf(stderr, "\n");
             }

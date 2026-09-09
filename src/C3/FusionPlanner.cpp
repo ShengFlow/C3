@@ -23,29 +23,247 @@ size_t nodeNumel(const Node& n) {
     return v;
 }
 
-/// 该节点是否为「结构性 / 物化边界」类别（不进逐元素 / GEMM 尾链融合）
-bool isStructural(const Node& n) {
+/// 结构性 / 物化边界（默认策略）：不并入逐元素 / GEMM 尾链融合
+bool isStructuralDefault(const Node& n) {
     return std::visit([](auto&& op) -> bool {
         using T = std::decay_t<decltype(op)>;
         return std::is_same_v<T, ConstNode> ||      // 常量 / 图输入占位
-               std::is_same_v<T, SumReduceNode> ||  // 降维，独立 kernel
-               std::is_same_v<T, TransposeNode> ||  // 转置，独立 kernel
-               std::is_same_v<T, SoftmaxNode> ||    // softmax，独立 kernel
-               std::is_same_v<T, CrossEntropyNode> || // 交叉熵，独立 kernel
-               std::is_same_v<T, FusedNode>;        // 已是融合单元（不透明）
+               std::is_same_v<T, SumReduceNode> ||  // 降维
+               std::is_same_v<T, TransposeNode> ||  // 默认：转置独立 kernel
+               std::is_same_v<T, SoftmaxNode> ||
+               std::is_same_v<T, CrossEntropyNode> ||
+               std::is_same_v<T, FusedNode>;        // 已融合单元（不透明）
     }, n.op);
+}
+
+/// region 策略硬边界：连 region 也切开的 op（保留各自独立 kernel）
+bool isRegionSeparator(const Node& n) {
+    return std::visit([](auto&& op) -> bool {
+        using T = std::decay_t<decltype(op)>;
+        return std::is_same_v<T, ConstNode> ||
+               std::is_same_v<T, SumReduceNode> ||
+               std::is_same_v<T, SoftmaxNode> ||
+               std::is_same_v<T, CrossEntropyNode> ||
+               std::is_same_v<T, FusedNode>;
+    }, n.op);
+}
+
+/// 由已构造好的单元集生成最终 FusionPlan（node_unit + 边界信息 + compute 计数）
+FusionPlan assemble(const Graph& graph, std::vector<FusionUnit> units) {
+    const size_t n = graph.nodeCount();
+    FusionPlan plan;
+    plan.units = std::move(units);
+    plan.node_unit.assign(n, SIZE_MAX);
+    plan.compute_unit_count = 0;
+    for (size_t u = 0; u < plan.units.size(); ++u) {
+        FusionUnit& unit = plan.units[u];
+        unit.unit_index = u;
+        if (unit.isCompute()) plan.compute_unit_count++;
+        for (size_t id : unit.node_ids)
+            if (id < n) plan.node_unit[id] = u;
+    }
+    const auto& nodes = graph.nodes();
+    const auto& graph_outputs = graph.outputs();
+    auto isOutputNode = [&](size_t id) {
+        return std::find(graph_outputs.begin(), graph_outputs.end(), id) != graph_outputs.end();
+    };
+    for (auto& u : plan.units) {
+        std::unordered_set<size_t> ext_in;
+        std::unordered_set<size_t> outs;
+        std::vector<bool> member(n, false);
+        for (size_t id : u.node_ids) if (id < n) member[id] = true;
+        for (size_t id : u.node_ids) {
+            const auto& nd = nodes[id];
+            for (size_t in_id : nd.inputs) {
+                if (in_id >= n || member[in_id]) continue;
+                ext_in.insert(in_id);
+            }
+            if (isOutputNode(id)) { outs.insert(id); continue; }
+            for (size_t out_id : nd.outputs) {
+                if (out_id < n && !member[out_id]) { outs.insert(id); break; }
+            }
+        }
+        u.external_input_ids.assign(ext_in.begin(), ext_in.end());
+        std::sort(u.external_input_ids.begin(), u.external_input_ids.end());
+        u.output_ids.assign(outs.begin(), outs.end());
+        std::sort(u.output_ids.begin(), u.output_ids.end());
+    }
+    return plan;
+}
+
+// ======================= Default 策略（前向单 GEMM / 逐元素单元） =======================
+
+FusionPlan planDefault(const Graph& graph) {
+    const size_t n = graph.nodeCount();
+    const auto& nodes = graph.nodes();
+    const auto& graph_inputs = graph.inputs();
+
+    std::vector<bool> is_input(n, false);
+    for (size_t id : graph_inputs) if (id < n) is_input[id] = true;
+
+    std::vector<FusionUnitKind> cat(n, FusionUnitKind::LEAF);
+    std::vector<bool> compute(n, false);
+    for (size_t i = 0; i < n; ++i) {
+        FusionUnitKind k = is_input[i] ? FusionUnitKind::LEAF
+                                       : FusionPlanner::nodeKind(nodes[i]);
+        cat[i] = k;
+        compute[i] = (k != FusionUnitKind::LEAF);
+    }
+
+    std::vector<size_t> parent(n), rank(n, 0);
+    std::vector<bool> hasGemm(n, false);
+    std::vector<size_t> aggNumel(n, 0);
+    for (size_t i = 0; i < n; ++i) {
+        parent[i] = i;
+        aggNumel[i] = nodeNumel(nodes[i]);
+        hasGemm[i] = (cat[i] == FusionUnitKind::GEMM);
+    }
+    std::function<size_t(size_t)> find = [&](size_t x) -> size_t {
+        while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; }
+        return x;
+    };
+
+    auto tryMerge = [&](size_t p, size_t c) -> void {
+        if (p == c || !compute[p] || !compute[c]) return;
+        if (cat[c] != FusionUnitKind::ELEMENTWISE) return;
+        if (cat[p] != FusionUnitKind::ELEMENTWISE && cat[p] != FusionUnitKind::GEMM) return;
+        if (nodes[p].outputs.size() != 1) return;                 // 多消费者物化
+        if (cat[p] == FusionUnitKind::GEMM && cat[c] == FusionUnitKind::GEMM) return;
+        size_t rp = find(p), rc = find(c);
+        if (rp == rc) return;
+        if (hasGemm[rp] && hasGemm[rc]) return;                   // 不合成双 GEMM
+        if (aggNumel[rp] != aggNumel[rc]) return;                 // numel 一致性
+        if (rank[rp] < rank[rc]) std::swap(rp, rc);
+        parent[rc] = rp;
+        if (rank[rp] == rank[rc]) rank[rp]++;
+        hasGemm[rp] = hasGemm[rp] || hasGemm[rc];
+    };
+
+    for (size_t p = 0; p < n; ++p) {
+        if (!compute[p]) continue;
+        for (size_t c : nodes[p].outputs) if (c < n) tryMerge(p, c);
+    }
+
+    struct SetAgg { bool has_elem = false; bool has_gemm = false; size_t min_id = SIZE_MAX; };
+    std::unordered_map<size_t, SetAgg> root_map;
+    for (size_t i = 0; i < n; ++i) {
+        if (!compute[i]) continue;
+        size_t r = find(i);
+        SetAgg& agg = root_map[r];
+        agg.has_elem = agg.has_elem || (cat[i] == FusionUnitKind::ELEMENTWISE);
+        agg.has_gemm = agg.has_gemm || (cat[i] == FusionUnitKind::GEMM);
+        if (i < agg.min_id) agg.min_id = i;
+    }
+    std::vector<std::pair<size_t, size_t>> ordered;
+    for (auto& [r, agg] : root_map) ordered.emplace_back(agg.min_id, r);
+    std::sort(ordered.begin(), ordered.end());
+
+    std::vector<FusionUnit> units;
+    for (auto& [min_id, r] : ordered) {
+        const SetAgg& agg = root_map[r];
+        FusionUnitKind kind = agg.has_gemm
+            ? (agg.has_elem ? FusionUnitKind::GEMM_EPILOGUE : FusionUnitKind::GEMM)
+            : FusionUnitKind::ELEMENTWISE;
+        FusionUnit u;
+        u.kind = kind;
+        u.numel = aggNumel[r];
+        for (size_t i = 0; i < n; ++i)
+            if (compute[i] && find(i) == r) u.node_ids.push_back(i);
+        units.push_back(std::move(u));
+    }
+    for (size_t i = 0; i < n; ++i) {
+        if (compute[i]) continue;
+        FusionUnit u;
+        u.kind = FusionUnitKind::LEAF;
+        u.numel = nodeNumel(nodes[i]);
+        u.node_ids.push_back(i);
+        units.push_back(std::move(u));
+    }
+    return assemble(graph, std::move(units));
+}
+
+// ======================= RegionKernel 策略（单内核多输出 region） =======================
+
+FusionPlan planRegionKernel(const Graph& graph) {
+    const size_t n = graph.nodeCount();
+    const auto& nodes = graph.nodes();
+    const auto& graph_inputs = graph.inputs();
+
+    std::vector<bool> is_input(n, false);
+    for (size_t id : graph_inputs) if (id < n) is_input[id] = true;
+
+    // 可 region 化：非输入 且 非硬边界 op。含 Transpose(region 内可折叠进 GEMM)、
+    // 逐元素族、MatMul。SumReduce/Softmax/CrossEntropy/Fused/Const 为独立边界。
+    std::vector<bool> regionable(n, false);
+    for (size_t i = 0; i < n; ++i) {
+        if (is_input[i]) continue;
+        if (isRegionSeparator(nodes[i])) continue;
+        regionable[i] = true;
+    }
+
+    // union-find：连通 regionable 分量并成同一 region
+    //（共享中间量不物化、允许多 GEMM——单内核顺序执行 + 多输出）
+    std::vector<size_t> parent(n), rank(n, 0);
+    for (size_t i = 0; i < n; ++i) parent[i] = i;
+    std::function<size_t(size_t)> find = [&](size_t x) -> size_t {
+        while (parent[x] != x) { parent[x] = parent[parent[x]]; x = parent[x]; }
+        return x;
+    };
+    auto unite = [&](size_t a, size_t b) {
+        size_t ra = find(a), rb = find(b);
+        if (ra == rb) return;
+        if (rank[ra] < rank[rb]) std::swap(ra, rb);
+        parent[rb] = ra;
+        if (rank[ra] == rank[rb]) rank[ra]++;
+    };
+    for (size_t p = 0; p < n; ++p) {
+        if (!regionable[p]) continue;
+        for (size_t c : nodes[p].outputs) {
+            if (c >= n || !regionable[c]) continue;
+            unite(p, c);
+        }
+    }
+
+    std::unordered_map<size_t, size_t> root_min; // root -> min node id
+    for (size_t i = 0; i < n; ++i) {
+        if (!regionable[i]) continue;
+        size_t r = find(i);
+        auto it = root_min.find(r);
+        if (it == root_min.end() || i < it->second) root_min[r] = i;
+    }
+    std::vector<std::pair<size_t, size_t>> ordered; // (min_id, root)
+    for (auto& [r, m] : root_min) ordered.emplace_back(m, r);
+    std::sort(ordered.begin(), ordered.end());
+
+    std::vector<FusionUnit> units;
+    for (auto& [min_id, r] : ordered) {
+        FusionUnit u;
+        u.kind = FusionUnitKind::REGION_KERNEL;
+        u.numel = 0; // region 内多形状，无单一 numel
+        for (size_t i = 0; i < n; ++i)
+            if (regionable[i] && find(i) == r) u.node_ids.push_back(i);
+        units.push_back(std::move(u));
+    }
+    for (size_t i = 0; i < n; ++i) {
+        if (regionable[i]) continue;
+        FusionUnit u;
+        u.kind = FusionUnitKind::LEAF;
+        u.numel = nodeNumel(nodes[i]);
+        u.node_ids.push_back(i);
+        units.push_back(std::move(u));
+    }
+    return assemble(graph, std::move(units));
 }
 
 } // namespace
 
 FusionUnitKind FusionPlanner::nodeKind(const Node& node) {
-    if (isStructural(node)) return FusionUnitKind::LEAF;
+    if (isStructuralDefault(node)) return FusionUnitKind::LEAF;
     return std::visit([](auto&& op) -> FusionUnitKind {
         using T = std::decay_t<decltype(op)>;
         if constexpr (std::is_same_v<T, MatMulNode>) {
             return FusionUnitKind::GEMM;
         }
-        // 逐元素族：可彼此共内核（等 numel、identity-1D ABI）
         if constexpr (std::is_same_v<T, AddNode> || std::is_same_v<T, SubNode> ||
                       std::is_same_v<T, MulNode> || std::is_same_v<T, DivNode> ||
                       std::is_same_v<T, NegNode> || std::is_same_v<T, ReLUNode> ||
@@ -59,167 +277,14 @@ FusionUnitKind FusionPlanner::nodeKind(const Node& node) {
 }
 
 FusionPlan FusionPlanner::planUnits(const Graph& graph) {
-    const size_t n = graph.nodeCount();
-    FusionPlan plan;
-    plan.units.clear();
-    plan.node_unit.assign(n, SIZE_MAX);
+    return planUnits(graph, FusionStrategy::Default);
+}
 
-    const auto& nodes = graph.nodes();
-    const auto& graph_inputs = graph.inputs();
-    const auto& graph_outputs = graph.outputs();
-
-    // 每个节点是否图输入（图输入 = 外部参数/占位，恒为边界）
-    std::vector<bool> is_input(n, false);
-    for (size_t id : graph_inputs) if (id < n) is_input[id] = true;
-
-    std::vector<FusionUnitKind> cat(n, FusionUnitKind::LEAF);
-    std::vector<bool> compute(n, false);
-    for (size_t i = 0; i < n; ++i) {
-        FusionUnitKind k = is_input[i] ? FusionUnitKind::LEAF
-                                       : FusionPlanner::nodeKind(nodes[i]);
-        cat[i] = k;
-        compute[i] = (k != FusionUnitKind::LEAF);
+FusionPlan FusionPlanner::planUnits(const Graph& graph, FusionStrategy strategy) {
+    if (strategy == FusionStrategy::RegionKernel) {
+        return planRegionKernel(graph);
     }
-
-    // ---- union-find（仅合并 compute 节点） ----
-    std::vector<size_t> parent(n);
-    std::vector<size_t> rank(n, 0);
-    std::vector<bool> hasGemm(n, false);       // 仅对根有意义
-    std::vector<size_t> aggNumel(n, 0);        // 仅对根有意义（governing numel）
-    for (size_t i = 0; i < n; ++i) {
-        parent[i] = i;
-        aggNumel[i] = nodeNumel(nodes[i]);
-        hasGemm[i] = (cat[i] == FusionUnitKind::GEMM);
-    }
-    std::function<size_t(size_t)> find = [&](size_t x) -> size_t {
-        while (parent[x] != x) {
-            parent[x] = parent[parent[x]]; // 路径压缩
-            x = parent[x];
-        }
-        return x;
-    };
-
-    // 尝试融合有向边 p -> c。规则见头文件；保守：任何不确定即割。
-    auto tryMerge = [&](size_t p, size_t c) -> void {
-        if (p == c) return;
-        if (!compute[p] || !compute[c]) return;
-        // 逐元素消费者才能并入上游；MatMul 可被逐元素尾链吸收
-        if (cat[c] != FusionUnitKind::ELEMENTWISE) return;
-        if (cat[p] != FusionUnitKind::ELEMENTWISE &&
-            cat[p] != FusionUnitKind::GEMM) return;
-        // 多消费者：必须物化，不并入任一消费者
-        if (nodes[p].outputs.size() != 1) return;
-        // 显式避免 GEMM 并入 GEMM / 双 GEMM 同单元（共享 GEMM 合并负收益，已证）
-        if (cat[p] == FusionUnitKind::GEMM && cat[c] == FusionUnitKind::GEMM) return;
-
-        size_t rp = find(p), rc = find(c);
-        if (rp == rc) return;
-        // 两个集合都已含 GEMM → 会变成双 GEMM 单元，禁止
-        if (hasGemm[rp] && hasGemm[rc]) return;
-        // numel 一致：纯逐元素要求成员同 numel；GEMM 单元要求尾链 == GEMM 输出 numel
-        if (aggNumel[rp] != aggNumel[rc]) return;
-
-        // 合并（按秩）
-        if (rank[rp] < rank[rc]) std::swap(rp, rc);
-        parent[rc] = rp;
-        if (rank[rp] == rank[rc]) rank[rp]++;
-        hasGemm[rp] = hasGemm[rp] || hasGemm[rc];
-        // aggNumel 在允许分支时已保证相等
-    };
-
-    // 处理边：按生产者升序，保证前置子图先定型
-    for (size_t p = 0; p < n; ++p) {
-        if (!compute[p]) continue;
-        for (size_t c : nodes[p].outputs) {
-            if (c >= n) continue;
-            tryMerge(p, c);
-        }
-    }
-
-    // ---- 汇总集合 → 单元 ----
-    // 先收集 compute 根 → 单元 kind（SetAgg 值初始化，避免未初始化字段）
-    struct SetAgg { bool has_elem = false; bool has_gemm = false; size_t min_id = SIZE_MAX; };
-    std::unordered_map<size_t, SetAgg> root_map;
-    for (size_t i = 0; i < n; ++i) {
-        if (!compute[i]) continue;
-        size_t r = find(i);
-        SetAgg& agg = root_map[r];
-        agg.has_elem = agg.has_elem || (cat[i] == FusionUnitKind::ELEMENTWISE);
-        agg.has_gemm = agg.has_gemm || (cat[i] == FusionUnitKind::GEMM);
-        if (i < agg.min_id) agg.min_id = i;
-    }
-    // 决定 kind（按 min_id 排序保证确定性）
-    std::vector<std::pair<size_t, size_t>> ordered; // (min_id, root)
-    for (auto& [r, agg] : root_map) ordered.emplace_back(agg.min_id, r);
-    std::sort(ordered.begin(), ordered.end());
-
-    std::unordered_map<size_t, size_t> root_to_unit;
-    plan.compute_unit_count = 0;
-    for (auto& [min_id, r] : ordered) {
-        const auto& agg = root_map[r];
-        FusionUnitKind kind =
-            agg.has_gemm ? (agg.has_elem ? FusionUnitKind::GEMM_EPILOGUE
-                                         : FusionUnitKind::GEMM)
-                         : FusionUnitKind::ELEMENTWISE;
-        root_to_unit[r] = plan.units.size();
-        FusionUnit u;
-        u.kind = kind;
-        u.unit_index = plan.units.size();
-        u.numel = aggNumel[r]; // 判据已保证单元内 numel 一致
-        // 收集成员
-        for (size_t i = 0; i < n; ++i) {
-            if (compute[i] && find(i) == r) u.node_ids.push_back(i);
-        }
-        plan.units.push_back(std::move(u));
-        plan.compute_unit_count++;
-    }
-
-    // LEAF（结构性/图输入）各占一个单节点单元，附加在 compute 单元之后
-    for (size_t i = 0; i < n; ++i) {
-        if (compute[i]) continue;
-        FusionUnit u;
-        u.kind = FusionUnitKind::LEAF;
-        u.unit_index = plan.units.size();
-        u.node_ids.push_back(i);
-        u.numel = nodeNumel(nodes[i]);
-        root_to_unit[i] = plan.units.size();
-        plan.units.push_back(std::move(u));
-    }
-
-    // 填充 node_unit + 边界信息
-    for (size_t i = 0; i < n; ++i) {
-        size_t r = compute[i] ? find(i) : i;
-        size_t uidx = root_to_unit[r];
-        plan.node_unit[i] = uidx;
-    }
-
-    auto isOutputNode = [&](size_t id) {
-        return std::find(graph_outputs.begin(), graph_outputs.end(), id) != graph_outputs.end();
-    };
-
-    for (auto& u : plan.units) {
-        std::unordered_set<size_t> ext_in;
-        std::unordered_set<size_t> outs;
-        std::vector<bool> member(n, false);
-        for (size_t id : u.node_ids) member[id] = true;
-        for (size_t id : u.node_ids) {
-            const auto& nd = nodes[id];
-            for (size_t in_id : nd.inputs) {
-                if (in_id >= n || member[in_id]) continue; // 单元内 / 无效
-                ext_in.insert(in_id);
-            }
-            if (isOutputNode(id)) { outs.insert(id); continue; }
-            for (size_t out_id : nd.outputs) {
-                if (out_id < n && !member[out_id]) { outs.insert(id); break; }
-            }
-        }
-        u.external_input_ids.assign(ext_in.begin(), ext_in.end());
-        std::sort(u.external_input_ids.begin(), u.external_input_ids.end());
-        u.output_ids.assign(outs.begin(), outs.end());
-        std::sort(u.output_ids.begin(), u.output_ids.end());
-    }
-
-    return plan;
+    return planDefault(graph);
 }
 
 } // namespace c3

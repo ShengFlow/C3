@@ -27,10 +27,18 @@ namespace c3 {
 
 /// 融合单元的 kernel 类别（lowering 能力，与「哪个算子能并」解耦）
 enum class FusionUnitKind : uint8_t {
-    ELEMENTWISE = 0,   ///< 纯逐元素单元：所有成员等 numel、identity-1D ABI 安全
-    GEMM = 1,          ///< 仅一个 MatMul，无被吸收的 epilogue
-    GEMM_EPILOGUE = 2, ///< 一个 MatMul + 其单消费者逐元素尾链
-    LEAF = 3           ///< 结构性节点 / 图输入占位：自身一个 kernel，作物化边界
+    ELEMENTWISE = 0,     ///< 纯逐元素单元：所有成员等 numel、identity-1D ABI 安全
+    GEMM = 1,            ///< 仅一个 MatMul，无被吸收的 epilogue
+    GEMM_EPILOGUE = 2,   ///< 一个 MatMul + 其单消费者逐元素尾链
+    REGION_KERNEL = 3,   ///< 单内核多输出 region：连通区段内共享中间量只算一次
+    LEAF = 4             ///< 结构性节点 / 图输入占位：自身一个 kernel，作物化边界
+};
+
+/// 融合策略（判据粒度，均数据驱动、非按结构名特判）
+enum class FusionStrategy : uint8_t {
+    Default = 0,   ///< 前向单 GEMM / 逐元素单元：多消费者中间量物化，双 GEMM 不并
+    RegionKernel = 1 ///< 多输出 region：连通区段(共享中间量仅区段内复用)可并单内核；
+                     ///<   Transpose 并入 GEMM；SumReduce/Softmax/CrossEntropy/Fused 仍为边界
 };
 
 /// 单个融合单元
@@ -75,7 +83,13 @@ struct FusionPlan {
  */
 class FusionPlanner {
 public:
+    /// 默认前向策略（单 GEMM / 逐元素单元）
     static FusionPlan planUnits(const Graph& graph);
+
+    /// 按指定策略规划融合单元
+    /// @param strategy FusionStrategy::RegionKernel 时：多输出 region 判据
+    ///                 （连通区段 + 共享中间量内联 + Transpose 并入 GEMM）。
+    static FusionPlan planUnits(const Graph& graph, FusionStrategy strategy);
 
     /// 供测试/诊断：节点 → 可共内核类别（不触发任何编译）
     static FusionUnitKind nodeKind(const Node& node);
