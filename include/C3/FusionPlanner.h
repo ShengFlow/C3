@@ -43,20 +43,24 @@ enum class FusionStrategy : uint8_t {
 
 /**
  * @brief RegionKernel 策略的跨分量合并度量（纯数据驱动）
- * @details 连通分量之外, 仅当"共享外部输入的重用节省"足够大才把多分量并成
- *          一个多输出内核: merged = saved_reload_bytes > min_benefit_ratio * working_set_bytes。
- *          launch 省税不在此原型中计入(硬件相关, 交给 autotune 指纹)。
+ * @details 连通分量之外, 仅当分量间存在共享外部输入(同一 backward 调用派生的分支)才考虑合并:
+ *          merged = has_shared_ext && (saved_reload_bytes + saved_launch_bytes)
+ *                    > min_benefit_ratio * working_set_bytes。
+ *          working_set 为 live 中间量(graph 输出除外, 因它们无论如何都要写回)。
+ *          launch 项与系数终态由 autotune 机器指纹校准。
  */
 struct RegionMergeMetric {
     size_t component_count = 0;        ///< 连通分量数
     uint64_t saved_reload_bytes = 0;   ///< Σ (usage(e)-1) * numel(e), 共享外部输入因并入单内核省的重读
-    uint64_t working_set_bytes = 0;    ///< Σ regionable 节点输出 numel(寄存器/局部压力代理)
+    uint64_t saved_launch_bytes = 0;   ///< (k-1) * launch_unit_bytes, 仅在 has_shared_ext 时计入
+    uint64_t working_set_bytes = 0;    ///< Σ 非 graph-output 的 regionable 节点 numel(live 中间量代理)
     bool merged = false;               ///< 是否把多分量并成单 region
 };
 
 /// RegionKernel 跨分量合并的代价门参数（原型默认保守; 系数终态由 autotune 指纹给出）
 struct RegionFusionPolicy {
-    double min_benefit_ratio = 0.25;   ///< 收益须至少覆盖工作集 25% 才跨分量合并
+    double min_benefit_ratio = 0.25;       ///< 收益须至少覆盖工作集 25% 才跨分量合并
+    uint64_t launch_unit_bytes = 400 * 1024; ///< 单次 launch 等价字节税(约 2µs @ 200GB/s), 终态由 autotune 校准
 };
 
 /// 单个融合单元

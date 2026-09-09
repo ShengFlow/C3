@@ -2578,9 +2578,10 @@ void C3BackwardCapture::compileFFNMIMOBackwardAsync(
                     if (!u.isCompute()) continue;
                     fprintf(stderr, " region[n=%zu]", u.node_ids.size());
                 }
-                fprintf(stderr, " region_metric[comp=%zu reload=%llu ws=%llu merged=%d]\n",
+                fprintf(stderr, " region_metric[comp=%zu reload=%llu launch=%llu ws=%llu merged=%d]\n",
                         region.region_metric.component_count,
                         (unsigned long long)region.region_metric.saved_reload_bytes,
+                        (unsigned long long)region.region_metric.saved_launch_bytes,
                         (unsigned long long)region.region_metric.working_set_bytes,
                         region.region_metric.merged ? 1 : 0);
             }

@@ -261,14 +261,26 @@ FusionPlan planRegionKernel(const Graph& graph, const RegionFusionPolicy& policy
     }
     RegionMergeMetric metric;
     metric.component_count = comp_members.size();
+    bool has_shared_ext = false;
     for (auto& [e, cnt] : ext_usage) {
         if (cnt <= 1) continue;
+        has_shared_ext = true;
         metric.saved_reload_bytes += (uint64_t)(cnt - 1) * (uint64_t)nodeNumel(nodes[e]);
     }
+    // live 中间量: graph 输出除外(无论如何写回), 只算真正的中间 live 张量
+    const auto& graph_outputs = graph.outputs();
+    std::vector<bool> is_output(n, false);
+    for (size_t o : graph_outputs) if (o < n) is_output[o] = true;
     for (size_t i = 0; i < n; ++i)
-        if (regionable[i]) metric.working_set_bytes += (uint64_t)nodeNumel(nodes[i]);
-    metric.merged = (metric.component_count > 1) &&
-                    (metric.saved_reload_bytes >
+        if (regionable[i] && !is_output[i])
+            metric.working_set_bytes += (uint64_t)nodeNumel(nodes[i]);
+    // launch 省税仅在同一次 backward 调用的分支间(共享外部输入)才计入
+    if (has_shared_ext && metric.component_count > 1) {
+        metric.saved_launch_bytes =
+            (uint64_t)(metric.component_count - 1) * policy.launch_unit_bytes;
+    }
+    metric.merged = (metric.component_count > 1) && has_shared_ext &&
+                    ((metric.saved_reload_bytes + metric.saved_launch_bytes) >
                      (uint64_t)((double)metric.working_set_bytes * policy.min_benefit_ratio));
 
     // ---- 组装单元 ----
