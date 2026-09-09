@@ -2584,6 +2584,12 @@ void C3BackwardCapture::compileFFNMIMOBackwardAsync(
                         (unsigned long long)region.region_metric.saved_launch_bytes,
                         (unsigned long long)region.region_metric.working_set_bytes,
                         region.region_metric.merged ? 1 : 0);
+                // [迁移决策门 G1] 一致性校验: planner 打算发几个 region kernel vs MIMO 现发 1 个
+                size_t planner_wants = region.region_metric.merged ? 1u : region.compute_unit_count;
+                bool reconciled = (planner_wants == 1u); // MIMO 现为单内核
+                fprintf(stderr, "[BW-RECONCILE] mimo_kernels=1 planner_wants=%zu reconciled=%d%s\n",
+                        planner_wants, reconciled ? 1 : 0,
+                        reconciled ? "" : " (mismatch: launch 税低估或 ws 高估, 见 C3_BACKWARD_FUSION_MIGRATION_DESIGN.md)");
             }
 
             CompileOptions opts;
