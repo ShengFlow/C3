@@ -14,6 +14,7 @@
 #include "C3/PGOManager.h"
 #include "C3/AutoTuner.h"
 #include "C3/TuningState.h"
+#include "C3/MachineFingerprint.h"
 #include "ThreadPool.h"
 
 #ifdef CT_ENABLE_MLIR
@@ -932,6 +933,10 @@ static std::shared_ptr<CompiledKernel> doCompile(
     const std::string& /*cache_key*/)
 {
     try {
+        // 运行时默认加载机器指纹(deploy 校准产物, 进程内一次, O(1) 就绪)。
+        // 供 planner 代价门(RegionFusionPolicy::fromMachineDefaults)在真实编译路径读取。
+        MachineFingerprint::instance().loadDefault();
+
         // 自动调优：若启用且尚未调优，先运行一次 QEA 搜索
         if (options.enable_autotune && !TuningState::instance().isTuned()) {
             AutoTunerConfig at_cfg;

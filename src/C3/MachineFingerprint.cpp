@@ -30,11 +30,12 @@ MachineFingerprint& MachineFingerprint::instance() {
 bool MachineFingerprint::loadDefault() {
     {
         std::lock_guard<std::mutex> lk(mutex_);
-        if (loaded_) return true;
+        if (default_attempted_) return loaded_;
+        default_attempted_ = true; // 进程内只尝试一次(成败都缓存), 避免运行时反复 open 缺失文件
     }
     const char* env = std::getenv("C3_FINGERPRINT");
     std::string path = env ? std::string(env) : std::string(kDefaultPath);
-    return load(path); // 已确认未加载; 成功后内部置 loaded_ = true
+    return load(path); // load 内部置 loaded_ = true(成功时)
 }
 
 bool MachineFingerprint::load(const std::string& path) {

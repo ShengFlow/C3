@@ -38,7 +38,7 @@ public:
     static MachineFingerprint& instance();
 
     /// 若尚未加载, 尝试从默认路径加载(env C3_FINGERPRINT 优先, 否则 ./c3.fingerprint)。
-    /// 不强制: 无文件则保持默认常量, 返回 false。
+    /// 进程内仅尝试一次(成败都缓存), 不强制: 无文件则保持默认常量, 返回 false。
     bool loadDefault();
 
     /// 从显式路径加载; 成功返回 true 并填入 data_。
@@ -67,6 +67,7 @@ private:
     mutable std::mutex mutex_;
     FingerprintData data_;
     bool loaded_ = false;
+    bool default_attempted_ = false;
 };
 
 } // namespace c3
