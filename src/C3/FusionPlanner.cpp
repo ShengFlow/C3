@@ -267,13 +267,34 @@ FusionPlan planRegionKernel(const Graph& graph, const RegionFusionPolicy& policy
         has_shared_ext = true;
         metric.saved_reload_bytes += (uint64_t)(cnt - 1) * (uint64_t)nodeNumel(nodes[e]);
     }
-    // live 中间量: graph 输出除外(无论如何写回), 只算真正的中间 live 张量
+    // live 峰值工作集: 任意时刻同时存活(已产未死)中间量的最大 numel。
+    // graph 输出除外(无论如何写回), 只算真中间量; 比"求和"更准(求和会高估)。
+    // 拓扑序用节点 id(递增, Graph 保证输入 id < 自身); 中间量 m live 于 [m, last_use(m)]。
     const auto& graph_outputs = graph.outputs();
     std::vector<bool> is_output(n, false);
     for (size_t o : graph_outputs) if (o < n) is_output[o] = true;
-    for (size_t i = 0; i < n; ++i)
-        if (regionable[i] && !is_output[i])
-            metric.working_set_bytes += (uint64_t)nodeNumel(nodes[i]);
+
+    struct Ev { size_t pos; int64_t delta; bool add; }; // add 先于 remove(同 pos)
+    std::vector<Ev> events;
+    for (size_t i = 0; i < n; ++i) {
+        if (!regionable[i] || is_output[i]) continue;
+        if (nodes[i].outputs.empty()) continue;      // 死中间量(不产生 live)
+        size_t last_use = nodes[i].outputs[0];
+        for (size_t c : nodes[i].outputs) if (c > last_use) last_use = c;
+        events.push_back({i, (int64_t)nodeNumel(nodes[i]), true});
+        events.push_back({last_use, -(int64_t)nodeNumel(nodes[i]), false});
+    }
+    std::sort(events.begin(), events.end(),
+              [](const Ev& a, const Ev& b) {
+                  return a.pos != b.pos ? a.pos < b.pos : (a.add && !b.add);
+              });
+    uint64_t peak = 0, running = 0;
+    for (const Ev& e : events) {
+        if (e.add) running += (uint64_t)e.delta;
+        else       running -= (uint64_t)(-e.delta);
+        if (running > peak) peak = running;
+    }
+    metric.working_set_bytes = peak;
     // launch 省税仅在同一次 backward 调用的分支间(共享外部输入)才计入
     if (has_shared_ext && metric.component_count > 1) {
         metric.saved_launch_bytes =
