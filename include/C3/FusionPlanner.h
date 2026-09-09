@@ -61,6 +61,10 @@ struct RegionMergeMetric {
 struct RegionFusionPolicy {
     double min_benefit_ratio = 0.25;       ///< 收益须至少覆盖工作集 25% 才跨分量合并
     uint64_t launch_unit_bytes = 400 * 1024; ///< 单次 launch 等价字节税(约 2µs @ 200GB/s), 终态由 autotune 校准
+
+    /// 从 MachineFingerprint(deploy 校准)构造策略: launch_unit_bytes 用指纹实测值
+    /// (未校准回退保守默认)。运行时 Engine 启动后调用一次即可让代价门用机器实测。
+    static RegionFusionPolicy fromMachineDefaults();
 };
 
 /// 单个融合单元

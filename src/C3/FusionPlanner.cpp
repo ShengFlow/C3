@@ -11,6 +11,8 @@
 #include <unordered_map>
 #include <unordered_set>
 
+#include "C3/MachineFingerprint.h"
+
 namespace ct {
 namespace c3 {
 
@@ -366,6 +368,12 @@ FusionPlan FusionPlanner::planUnits(const Graph& graph, FusionStrategy strategy,
         return planRegionKernel(graph, policy);
     }
     return planDefault(graph);
+}
+
+RegionFusionPolicy RegionFusionPolicy::fromMachineDefaults() {
+    RegionFusionPolicy p;
+    p.launch_unit_bytes = MachineFingerprint::instance().launchUnitBytes();
+    return p;
 }
 
 } // namespace c3

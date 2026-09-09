@@ -14,6 +14,7 @@
 #include "C3/Graph.h"
 #include "C3/GraphMerger.h"
 #include "C3/FusionPlanner.h"
+#include "C3/MachineFingerprint.h"
 
 #include "AutoGrad/Nodes/ReLUNode.h"
 #include "AutoGrad/Nodes/SigmoidNode.h"
@@ -2558,9 +2559,13 @@ void C3BackwardCapture::compileFFNMIMOBackwardAsync(
             // region) 的结构差。纯只读, 不改变任何编译/执行路径。
             if (std::getenv("C3_PLANNER_DIAG")) {
                 FusionPlan plan = FusionPlanner::planUnits(fused_graph);
-                FusionPlan region = FusionPlanner::planUnits(fused_graph, FusionStrategy::RegionKernel);
-                fprintf(stderr, "[PLANNER-DIAG] FFN-MIMO graph nodes=%zu default_units=%zu region_units=%zu:",
-                        fused_graph.nodeCount(), plan.compute_unit_count, region.compute_unit_count);
+                // 代价门用机器指纹实测 launch 税(部署时 c3ctl 校准, 运行时 O(1) 读)
+                MachineFingerprint::instance().loadDefault();
+                RegionFusionPolicy rpol = RegionFusionPolicy::fromMachineDefaults();
+                FusionPlan region = FusionPlanner::planUnits(fused_graph, FusionStrategy::RegionKernel, rpol);
+                fprintf(stderr, "[PLANNER-DIAG] FFN-MIMO graph nodes=%zu default_units=%zu region_units=%zu launch_b=%llu:",
+                        fused_graph.nodeCount(), plan.compute_unit_count, region.compute_unit_count,
+                        (unsigned long long)rpol.launch_unit_bytes);
                 for (const auto& u : plan.units) {
                     if (!u.isCompute()) continue;
                     fprintf(stderr, " [%s n=%zu",
