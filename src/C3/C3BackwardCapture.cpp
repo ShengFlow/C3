@@ -31,11 +31,13 @@
 #include "AutoGrad/Nodes/SwiGLUNode.h"   // PEL25 #10
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <future>
 #include <iomanip>
 #include <sstream>
 #include <thread>
+#include <unordered_set>
 
 namespace ct {
 namespace c3 {
@@ -2420,15 +2422,58 @@ void C3BackwardCapture::runPartitionABTest(const Graph& fused_graph,
                                            const char* label) {
     if (!std::getenv("C3_PARTITION_AB")) return;
 
-    // 假输入(填非零常数): 内核执行时间只依赖 shape; 非零可避免全 0 触发的特殊路径
-    auto fakeInputs = [](const Graph& g) {
+    // 假输入填充规则。
+    // 关键点 1(统一性): 填充值只由 (原图节点 id, 元素下标) 决定, 与"在子图中的位置"无关。
+    //   这样整图 A 与各子图 B 对同一条逻辑输入喂到完全相同的字节, 比较才有意义。
+    // 关键点 2(非均匀): 采用确定性伪随机分布而非常数填充。均匀常数输入会让大量节点退化为
+    //   常数张量, 逐元素/广播类错误在其上不可观测; 非均匀数据才能暴露它们。
+    // 关键点 3(常量): 原图 Const 节点是图内真实常量, 在子图中被暴露为外部输入, 必须喂其真实值,
+    //   否则子图语义与整图不一致。
+    // 关键点 4(不可复现): 既非图输入、又非 Const 的叶子(如 SumReduce 等分隔符)无法由输入复现,
+    //   计入 *unsynth, 数值对比随之跳过(不给假结论)。
+    const std::unordered_set<size_t> origInputSet(fused_graph.inputs().begin(),
+                                                  fused_graph.inputs().end());
+
+    auto pseudoRandom = [](size_t orig_id, size_t elem) {
+        uint64_t h = static_cast<uint64_t>(orig_id) * 1000003ULL + static_cast<uint64_t>(elem);
+        h ^= h >> 33;
+        h *= 0xff51afd7ed558ccdULL;
+        h ^= h >> 33;
+        h *= 0xc4ceb9fe1a85ec53ULL;
+        h ^= h >> 33;
+        return static_cast<float>(static_cast<double>(h % 2000001ULL) / 1000000.0 - 1.0);  // [-1, 1]
+    };
+
+    auto fakeInputs = [&fused_graph, &origInputSet, &pseudoRandom](
+                          const Graph& g, const std::vector<size_t>* orig_ids,
+                          size_t* unsynth) {
         std::vector<Tensor> ins;
-        ins.reserve(g.inputs().size());
-        for (size_t iid : g.inputs()) {
-            const auto& d = g.node(iid).out_desc;
+        const auto& gin = g.inputs();
+        ins.reserve(gin.size());
+        for (size_t i = 0; i < gin.size(); ++i) {
+            const auto& d = g.node(gin[i]).out_desc;
             Tensor t(ShapeTag{}, d.shape, DType::kFloat, DeviceType::kCPU);
             float* p = t.data_write<float>();
-            for (size_t i = 0; i < t.numel(); ++i) p[i] = 0.5f;
+            size_t bid = static_cast<size_t>(-1);   // 用于伪随机的"逻辑源 id"
+            bool is_const = false;
+            float const_val = 0.0f;
+            if (orig_ids != nullptr && i < orig_ids->size()) {
+                const size_t oid = (*orig_ids)[i];
+                bid = oid;
+                if (fused_graph.validNodeId(oid) && origInputSet.count(oid) == 0) {
+                    const NodeVariant& nv = fused_graph.node(oid).op;
+                    if (std::holds_alternative<ConstNode>(nv)) {
+                        is_const = true;
+                        const_val = static_cast<float>(std::get<ConstNode>(nv).value);
+                    } else if (unsynth != nullptr) {
+                        (*unsynth)++;
+                    }
+                }
+            } else {
+                bid = gin[i];   // 整图路径: 输入节点 id 即逻辑源 id
+            }
+            for (size_t k = 0; k < t.numel(); ++k)
+                p[k] = is_const ? const_val : pseudoRandom(bid, k);
             ins.push_back(std::move(t));
         }
         return ins;
@@ -2452,7 +2497,7 @@ void C3BackwardCapture::runPartitionABTest(const Graph& fused_graph,
         fprintf(stderr, "[PARTITION-AB] %s: A(整图)编译失败, 跳过\n", label);
         return;
     }
-    std::vector<Tensor> insA = fakeInputs(fused_graph);
+    std::vector<Tensor> insA = fakeInputs(fused_graph, nullptr, nullptr);
     kA->execute(insA);                       // 预热
 
     // ---- B: 按 planner 判定切分, 逐子图编译/执行 ----
@@ -2461,6 +2506,7 @@ void C3BackwardCapture::runPartitionABTest(const Graph& fused_graph,
 
     std::vector<std::shared_ptr<CompiledKernel>> kBs;
     std::vector<std::vector<Tensor>> insBs;
+    size_t unsynthInputs = 0;   // 无法从输入复现的子图外部输入数(>0 则数值对比不可信)
     double compileB = 0.0;
     for (auto& s : subs) {
         auto tb0 = now();
@@ -2471,7 +2517,7 @@ void C3BackwardCapture::runPartitionABTest(const Graph& fused_graph,
             return;
         }
         kBs.push_back(kb);
-        insBs.push_back(fakeInputs(s.graph));
+        insBs.push_back(fakeInputs(s.graph, &s.input_orig_ids, &unsynthInputs));
     }
     if (kBs.empty()) {
         fprintf(stderr, "[PARTITION-AB] %s: 无子图, 跳过\n", label);
@@ -2509,6 +2555,7 @@ void C3BackwardCapture::runPartitionABTest(const Graph& fused_graph,
     for (size_t i = 0; i < sA.size(); ++i)
         if (sB[i] < sA[i]) winB++;
 
+    // 性能对比输出
     fprintf(stderr,
             "[PARTITION-AB] %s: nodes=%zu rounds=%d | A(1内核) compile=%.1fms med=%.3fms "
             "range=[%.3f,%.3f] | B(%zu内核) compile=%.1fms med=%.3fms range=[%.3f,%.3f] | "
@@ -2516,6 +2563,94 @@ void C3BackwardCapture::runPartitionABTest(const Graph& fused_graph,
             label, fused_graph.nodeCount(), kRounds, compileA, medA, minA, maxA,
             subs.size(), compileB, medB, minB, maxB,
             dMed, winB, sA.size());
+
+    // ---- 数值正确性对比: A 的输出 vs B 各子图输出(按原图输出 id 对齐) ----
+    // 仅当子图间无 upstream 依赖时可直接比较(有依赖需编排执行, 本设施暂不覆盖)
+    bool any_dep = false;
+    for (const auto& s : subs)
+        if (!s.upstream_units.empty()) any_dep = true;
+
+    if (any_dep) {
+        fprintf(stderr, "[PARTITION-AB] %s: 子图间存在依赖, 跳过数值对比(需编排执行)\n", label);
+    } else if (unsynthInputs > 0) {
+        fprintf(stderr,
+                "[PARTITION-AB] %s: 跳过数值对比——有 %zu 个子图外部输入既非图输入也非 Const "
+                "(无法仅由输入复现子图语义)\n",
+                label, unsynthInputs);
+    } else {
+        // [诊断] 各子图覆盖与边界摘要
+        for (size_t k = 0; k < subs.size(); ++k)
+            fprintf(stderr,
+                    "[PARTITION-AB]   sub%zu: unit=%zu nodes=%zu inputs=%zu outputs=%zu upstream=%zu\n",
+                    k, subs[k].unit_index, subs[k].unit_node_ids.size(),
+                    subs[k].input_orig_ids.size(), subs[k].output_orig_ids.size(),
+                    subs[k].upstream_units.size());
+        std::vector<Tensor> outsA = kA->execute(insA);   // A 输出, 顺序 == graph.outputs()
+        std::unordered_map<size_t, Tensor> outByOrig;    // 原图输出节点 id -> 张量
+        for (size_t k = 0; k < kBs.size(); ++k) {
+            std::vector<Tensor> outs = kBs[k]->execute(insBs[k]);
+            const auto& oids = subs[k].output_orig_ids;
+            for (size_t i = 0; i < oids.size() && i < outs.size(); ++i)
+                outByOrig.emplace(oids[i], outs[i]);
+        }
+        const auto& gouts = fused_graph.outputs();
+        size_t compared = 0, mismatched = 0, missing = 0, nonfloat = 0, nonfinite = 0;
+        std::string missingList;
+        double maxDiff = 0.0;
+        for (size_t i = 0; i < gouts.size() && i < outsA.size(); ++i) {
+            auto it = outByOrig.find(gouts[i]);
+            if (it == outByOrig.end()) {
+                missing++;
+                missingList += std::to_string(gouts[i]) + ",";
+                continue;
+            }
+            const Tensor& ta = outsA[i];
+            const Tensor& tb = it->second;
+            if (ta.dtype() != DType::kFloat || tb.dtype() != DType::kFloat) { nonfloat++; continue; }
+            if (ta.numel() != tb.numel()) { mismatched++; continue; }
+            compared++;
+            const float* pa = ta.data_read<float>();
+            const float* pb = tb.data_read<float>();
+            double md = 0.0;
+            size_t badIdx = 0;
+            size_t nf = 0;
+            for (size_t j = 0; j < ta.numel(); ++j) {
+                const double av = (double)pa[j];
+                const double bv = (double)pb[j];
+                if (!std::isfinite(av) || !std::isfinite(bv)) { nf++; continue; }
+                const double dd = std::fabs(av - bv);
+                if (dd > md) { md = dd; badIdx = j; }
+            }
+            if (nf > 0) {
+                // 非有限值无法用差值判定, 单独计数并视为不一致(避免 NaN 比较静默通过)
+                nonfinite += nf;
+                mismatched++;
+                fprintf(stderr,
+                        "[PARTITION-AB]   nonfinite out#%zu orig=%zu count=%zu (非有限值, 该输出判为不一致)\n",
+                        i, gouts[i], nf);
+                continue;
+            }
+            maxDiff = std::max(maxDiff, md);
+            if (md > 1e-4) {
+                mismatched++;
+                fprintf(stderr,
+                        "[PARTITION-AB]   mismatch out#%zu orig=%zu numel=%zu max=%.3e at j=%zu\n",
+                        i, gouts[i], ta.numel(), md, badIdx);
+                const size_t probe = ta.numel() < 4 ? ta.numel() : 4;
+                for (size_t j = 0; j < probe; ++j)
+                    fprintf(stderr, "[PARTITION-AB]     j=%zu A=%.6g B=%.6g ratio=%.6g\n",
+                            j, (double)pa[j], (double)pb[j],
+                            pb[j] != 0.0f ? (double)pa[j] / (double)pb[j] : 0.0);
+            }
+        }
+        fprintf(stderr,
+                "[PARTITION-AB] %s: 数值对比 outputs=%zu compared=%zu mismatched=%zu "
+                "missing=%zu nonfloat=%zu nonfinite=%zu max_abs_diff=%.3e -> %s%s%s\n",
+                label, gouts.size(), compared, mismatched, missing, nonfloat, nonfinite, maxDiff,
+                (mismatched == 0 && missing == 0 && compared > 0) ? "PASS" : "CHECK",
+                missing == 0 ? "" : " | 未覆盖输出(orig id)=",
+                missing == 0 ? "" : missingList.c_str());
+    }
 }
 
 void C3BackwardCapture::compileUnifiedMIMOBackwardAsync(
