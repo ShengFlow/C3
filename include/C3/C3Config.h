@@ -118,8 +118,15 @@ inline bool forceRegionMergeEnabled() {
 ///          - **绝不改行为**：真实执行仍走 MIMO 手写目录, planner 判定不参与任何决策
 ///          用途：G2 阶段常态化运行, 累积"planner 会错/不会错"的证据, 为 G3(真接管) 提供依据。
 ///          默认关闭（保守）；与 C3_PLANNER_DIAG 可共存（后者额外输出详细分区与度量）。
+/// @note **2026-09-10 §4.86 起默认开启**：影子纯观测、绝不改行为, 仅在 MIMO 异步编译
+///       线程内跑一次 planner 判定(O(节点数), 非热路径)开销可忽略; 常态开启才能持续
+///       累积证据。显式设 `C3_PLANNER_SHADOW=0` 可关闭。
 inline bool plannerShadowEnabled() {
-    static const bool enabled = detail::envFlag("C3_PLANNER_SHADOW");
+    static const bool enabled = [] {
+        const char* v = std::getenv("C3_PLANNER_SHADOW");
+        if (v == nullptr) return true;   // 默认开(§4.86)
+        return v[0] == '1';
+    }();
     return enabled;
 }
 
