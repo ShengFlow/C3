@@ -18,6 +18,7 @@
  *  - 热路径检测/编译触发       : CT_C3_DISABLE_HOTPATH        / C3_DISABLE_HOTPATH         / hotPathTrackingEnabled()
  *  - MatMul CBLAS 加速         : 运行时 C3_MATMUL_NO_CBLAS=1 / matmulNoCblasEnabled()
  *  - Region 强制合并(跳过代价门) : 运行时 C3_FORCE_REGION_MERGE=1 / forceRegionMergeEnabled()
+ *  - planner 影子观测(G2 决策门) : 运行时 C3_PLANNER_SHADOW=1 / plannerShadowEnabled()
  *
  * @date 2026/8/7
  */
@@ -104,6 +105,19 @@ inline bool matmulNoCblasEnabled() {
 ///          仅影响 FusionPlanner 的分区判定，不改任何 kernel 正确性路径。
 inline bool forceRegionMergeEnabled() {
     static const bool enabled = detail::envFlag("C3_FORCE_REGION_MERGE");
+    return enabled;
+}
+
+// ======================= 影子观测 (G2 迁移决策门) =======================
+/// 查询是否启用 planner 影子观测（G2 阶段）
+/// @details 运行时 C3_PLANNER_SHADOW=1 开启。语义（区别于 C3_PLANNER_DIAG 的详细诊断）：
+///          - **静默观测**：planner 判定与现状 MIMO 一致时不输出（避免日志噪声）
+///          - **仅不一致告警**：判错时输出 `[G2-SHADOW-MISMATCH]` 并计入统计, 供事后分析
+///          - **绝不改行为**：真实执行仍走 MIMO 手写目录, planner 判定不参与任何决策
+///          用途：G2 阶段常态化运行, 累积"planner 会错/不会错"的证据, 为 G3(真接管) 提供依据。
+///          默认关闭（保守）；与 C3_PLANNER_DIAG 可共存（后者额外输出详细分区与度量）。
+inline bool plannerShadowEnabled() {
+    static const bool enabled = detail::envFlag("C3_PLANNER_SHADOW");
     return enabled;
 }
 

@@ -2327,46 +2327,53 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteUnifiedMIMOBackw
     return std::nullopt;
 }
 
-/// [迁移决策门 G1] 在真实 MIMO fused_graph 上跑 planner 并输出对拍结果(只读, off-path)
-/// @details env C3_PLANNER_DIAG=1 门控。量化 planner(default 单 GEMM/逐元素单元模型 /
-///          region 单内核多输出模型) 与实际 MIMO 内核数的结构差, 用于 G1 一致率校验。
+/// [迁移决策门 G1/G2] 在真实 MIMO fused_graph 上跑 planner 并对拍(只读, 不参与执行)
+/// @details 两种模式, 均 env 门控, **默认均关闭(零开销)**:
+///          - `C3_PLANNER_DIAG=1`   : 详细诊断 —— 输出分区明细/代价门度量/一致率
+///          - `C3_PLANNER_SHADOW=1` : G2 影子观测 —— 静默一致, 仅不一致时告警(常态化累积证据)
+///          两种模式都**不改变任何执行行为**(真实执行仍走 MIMO 手写目录)。
 void C3BackwardCapture::diagnosePlannerReconcile(const Graph& fused_graph, const char* label,
                                                   size_t mimo_kernels) {
-    if (!std::getenv("C3_PLANNER_DIAG")) return;
+    const bool diag = std::getenv("C3_PLANNER_DIAG") != nullptr;
+    const bool shadow = plannerShadowEnabled();
+    if (!diag && !shadow) return;  // 默认: 不进入诊断, 零开销
 
-    FusionPlan plan = FusionPlanner::planUnits(fused_graph);
     // 代价门用机器指纹实测 launch 税(部署时 c3ctl 校准, 运行时 O(1) 读)
     MachineFingerprint::instance().loadDefault();
     RegionFusionPolicy rpol = RegionFusionPolicy::fromMachineDefaults();
     FusionPlan region = FusionPlanner::planUnits(fused_graph, FusionStrategy::RegionKernel, rpol);
 
-    fprintf(stderr, "[PLANNER-DIAG] %s graph nodes=%zu default_units=%zu region_units=%zu launch_b=%llu:",
-            label, fused_graph.nodeCount(), plan.compute_unit_count, region.compute_unit_count,
-            (unsigned long long)rpol.launch_unit_bytes);
-    for (const auto& u : plan.units) {
-        if (!u.isCompute()) continue;
-        fprintf(stderr, " [%s n=%zu",
-                u.kind == FusionUnitKind::GEMM_EPILOGUE ? "GEMM_EPI"
-                : (u.kind == FusionUnitKind::GEMM ? "GEMM"
-                : (u.kind == FusionUnitKind::ELEMENTWISE ? "ELEM" : "LEAF")),
-                u.node_ids.size());
-        for (size_t id : u.node_ids) {
-            fprintf(stderr, " %s",
-                    std::visit([](auto&& o) { return std::string(o.name); }, fused_graph.node(id).op).c_str());
+    if (diag) {
+        // [详细诊断] 额外跑 default 策略分区, 逐单元打印结构明细
+        FusionPlan plan = FusionPlanner::planUnits(fused_graph);
+        fprintf(stderr, "[PLANNER-DIAG] %s graph nodes=%zu default_units=%zu region_units=%zu launch_b=%llu:",
+                label, fused_graph.nodeCount(), plan.compute_unit_count, region.compute_unit_count,
+                (unsigned long long)rpol.launch_unit_bytes);
+        for (const auto& u : plan.units) {
+            if (!u.isCompute()) continue;
+            fprintf(stderr, " [%s n=%zu",
+                    u.kind == FusionUnitKind::GEMM_EPILOGUE ? "GEMM_EPI"
+                    : (u.kind == FusionUnitKind::GEMM ? "GEMM"
+                    : (u.kind == FusionUnitKind::ELEMENTWISE ? "ELEM" : "LEAF")),
+                    u.node_ids.size());
+            for (size_t id : u.node_ids) {
+                fprintf(stderr, " %s",
+                        std::visit([](auto&& o) { return std::string(o.name); }, fused_graph.node(id).op).c_str());
+            }
+            fprintf(stderr, "]");
         }
-        fprintf(stderr, "]");
+        for (const auto& u : region.units) {
+            if (!u.isCompute()) continue;
+            fprintf(stderr, " region[n=%zu]", u.node_ids.size());
+        }
+        fprintf(stderr, " region_metric[comp=%zu reload=%llu launch=%llu ws=%llu merged=%d force=%d]\n",
+                region.region_metric.component_count,
+                (unsigned long long)region.region_metric.saved_reload_bytes,
+                (unsigned long long)region.region_metric.saved_launch_bytes,
+                (unsigned long long)region.region_metric.working_set_bytes,
+                region.region_metric.merged ? 1 : 0,
+                rpol.force_merge ? 1 : 0);
     }
-    for (const auto& u : region.units) {
-        if (!u.isCompute()) continue;
-        fprintf(stderr, " region[n=%zu]", u.node_ids.size());
-    }
-    fprintf(stderr, " region_metric[comp=%zu reload=%llu launch=%llu ws=%llu merged=%d force=%d]\n",
-            region.region_metric.component_count,
-            (unsigned long long)region.region_metric.saved_reload_bytes,
-            (unsigned long long)region.region_metric.saved_launch_bytes,
-            (unsigned long long)region.region_metric.working_set_bytes,
-            region.region_metric.merged ? 1 : 0,
-            rpol.force_merge ? 1 : 0);
 
     // 一致性校验: planner 打算发几个 region kernel vs MIMO 实际发几个
     size_t planner_wants = region.region_metric.merged ? 1u : region.compute_unit_count;
@@ -2382,15 +2389,26 @@ void C3BackwardCapture::diagnosePlannerReconcile(const Graph& fused_graph, const
         g1_matched = reconcile_matched_;
     }
 
-    fprintf(stderr, "[BW-RECONCILE] label=%s mimo_kernels=%zu planner_wants=%zu reconciled=%d%s\n",
-            label, mimo_kernels, planner_wants, reconciled ? 1 : 0,
-            reconciled ? "" :
-            (rpol.force_merge
-                 ? " (mismatch: 结构不可并——非代价门问题, 见 bw-reconcile-root-cause-diagnosis)"
-                 : " (mismatch: 代价门未过——用 C3_FORCE_REGION_MERGE=1 可分离'结构是否正确'与'是否划算', 见 2026-09-10 根因诊断)"));
-    fprintf(stderr, "[G1-RATIO] reconciled=%zu/%zu (%.1f%%)\n",
-            g1_matched, g1_total,
-            g1_total ? 100.0 * (double)g1_matched / (double)g1_total : 0.0);
+    if (diag) {
+        fprintf(stderr, "[BW-RECONCILE] label=%s mimo_kernels=%zu planner_wants=%zu reconciled=%d%s\n",
+                label, mimo_kernels, planner_wants, reconciled ? 1 : 0,
+                reconciled ? "" :
+                (rpol.force_merge
+                     ? " (mismatch: 结构不可并——非代价门问题, 见 bw-reconcile-root-cause-diagnosis)"
+                     : " (mismatch: 代价门未过——用 C3_FORCE_REGION_MERGE=1 可分离'结构是否正确'与'是否划算', 见 2026-09-10 根因诊断)"));
+        fprintf(stderr, "[G1-RATIO] reconciled=%zu/%zu (%.1f%%)\n",
+                g1_matched, g1_total,
+                g1_total ? 100.0 * (double)g1_matched / (double)g1_total : 0.0);
+    }
+
+    // [G2 影子观测] 静默一致, 仅不一致时告警; 绝不改行为(真实执行仍走 MIMO 手写目录)
+    if (shadow && !reconciled) {
+        fprintf(stderr,
+                "[G2-SHADOW-MISMATCH] label=%s graph_nodes=%zu mimo_kernels=%zu planner_wants=%zu "
+                "force=%d cum=%zu/%zu (planner 判定与现状不符; 仍走 MIMO, 不改行为)\n",
+                label, fused_graph.nodeCount(), mimo_kernels, planner_wants,
+                rpol.force_merge ? 1 : 0, g1_matched, g1_total);
+    }
 }
 
 void C3BackwardCapture::compileUnifiedMIMOBackwardAsync(
