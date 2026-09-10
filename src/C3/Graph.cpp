@@ -653,10 +653,30 @@ Graph Graph::fuse() const {
         }
 
         if (chain.size() >= 2) {
-            // 反转链条为输入→输出方向
-            std::reverse(chain.begin(), chain.end());
-            fusion_chains.push_back(chain);
-            for (size_t id : chain) fused[id] = true;
+            // [Fix 2026-09-10] 拒绝融合含「rhs 标量广播」的链。
+            // 二元 op(Add/Sub/Mul/Div) 的 rhs 若为 numel=1 标量、lhs numel>1，融合成
+            // FusedNode 后 buildFusedMultiNode* 对标量 arg 的加载会越界读(标量被当
+            // 长度 n 的数组读，idx>=1 读到邻接内存，输出错位)。保留该链独立，走多节点
+            // getBroadcastMod 路径(已正确处理 rhs 标量广播)。lhs 标量广播不受影响
+            // (如 FFN 的 Add(Const[1], Exp)，走标量 buildFusedMultiNode 的 node_id
+            // 精确解析，正确)。
+            bool has_rhs_scalar_broadcast = false;
+            for (size_t cid : chain) {
+                const Node& nd = nodes_[cid];
+                if (nd.inputs.size() < 2) continue;
+                size_t lhs_n = 1, rhs_n = 1;
+                for (size_t d : nodes_[nd.inputs[0]].out_desc.shape) lhs_n *= d;
+                for (size_t d : nodes_[nd.inputs[1]].out_desc.shape) rhs_n *= d;
+                if (rhs_n == 1 && lhs_n > 1) { has_rhs_scalar_broadcast = true; break; }
+            }
+            if (has_rhs_scalar_broadcast) {
+                // 不融合该链：节点保持独立，走普通节点路径
+            } else {
+                // 反转链条为输入→输出方向
+                std::reverse(chain.begin(), chain.end());
+                fusion_chains.push_back(chain);
+                for (size_t id : chain) fused[id] = true;
+            }
         }
     }
 
