@@ -259,6 +259,13 @@ public:
         std::unordered_map<std::string, size_t> backward_fallback_reasons;
         /// backward fallback 覆盖率 = 1 - eager_fallback / attempt
         /// 计算：getStats() 调用方算，Stats 不缓存派生指标
+
+        // ========== [G1 迁移决策门 2026-09-10] planner 对拍一致率稳态统计 ==========
+        // 目的：把 G1 一致率从"单次采样"升级为"整轮运行聚合"，为 G2(影子接管)决策提供
+        // 统计意义的数据基础。仅在 C3_PLANNER_DIAG=1 时累加；默认路径不进入诊断，无开销。
+        size_t reconcile_total = 0;    ///< planner vs MIMO 对拍总次数(跨结构/维度累积)
+        size_t reconcile_matched = 0;  ///< 判定一致(planner 内核数 == MIMO 实际内核数)次数
+        /// 不一致次数 = total - matched；不一致率由调用方派生，此处不缓存派生指标
     };
 
     Stats getStats() const;
@@ -649,6 +656,11 @@ private:
     size_t backward_c3_attempt_count_ = 0;         ///< 走 C3 路径（compile + execute kernel）
     size_t backward_eager_fallback_count_ = 0;     ///< fallback 到 eager 的次数
     std::unordered_map<std::string, size_t> backward_fallback_reasons_;  ///< fallback 原因分类
+
+    // ========== [G1 迁移决策门 2026-09-10] planner 对拍稳态统计 ==========
+    // stats_mutex_ 保护；仅在 C3_PLANNER_DIAG=1 的诊断路径内累加
+    size_t reconcile_total_ = 0;    ///< planner vs MIMO 对拍总次数
+    size_t reconcile_matched_ = 0;  ///< 判定一致次数
 };
 
 } // namespace c3

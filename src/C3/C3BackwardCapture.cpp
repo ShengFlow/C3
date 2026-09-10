@@ -750,6 +750,8 @@ C3BackwardCapture::Stats C3BackwardCapture::getStats() const {
     s.mimo_miss_count = mimo_miss_count_;
     s.mimo_exec_us = mimo_exec_ns_ / 1000;
     s.mimo_keybuild_us = mimo_keybuild_ns_ / 1000;
+    s.reconcile_total = reconcile_total_;
+    s.reconcile_matched = reconcile_matched_;
     return s;
 }
 
@@ -2369,12 +2371,26 @@ void C3BackwardCapture::diagnosePlannerReconcile(const Graph& fused_graph, const
     // 一致性校验: planner 打算发几个 region kernel vs MIMO 实际发几个
     size_t planner_wants = region.region_metric.merged ? 1u : region.compute_unit_count;
     bool reconciled = (planner_wants == mimo_kernels);
+
+    // [G1 稳态统计] 累加跨结构/维度的对拍结果, 输出聚合一致率(供 G2 决策使用)
+    size_t g1_total = 0, g1_matched = 0;
+    {
+        std::lock_guard<std::mutex> lock(stats_mutex_);
+        reconcile_total_++;
+        if (reconciled) reconcile_matched_++;
+        g1_total = reconcile_total_;
+        g1_matched = reconcile_matched_;
+    }
+
     fprintf(stderr, "[BW-RECONCILE] label=%s mimo_kernels=%zu planner_wants=%zu reconciled=%d%s\n",
             label, mimo_kernels, planner_wants, reconciled ? 1 : 0,
             reconciled ? "" :
             (rpol.force_merge
                  ? " (mismatch: 结构不可并——非代价门问题, 见 bw-reconcile-root-cause-diagnosis)"
                  : " (mismatch: 代价门未过——用 C3_FORCE_REGION_MERGE=1 可分离'结构是否正确'与'是否划算', 见 2026-09-10 根因诊断)"));
+    fprintf(stderr, "[G1-RATIO] reconciled=%zu/%zu (%.1f%%)\n",
+            g1_matched, g1_total,
+            g1_total ? 100.0 * (double)g1_matched / (double)g1_total : 0.0);
 }
 
 void C3BackwardCapture::compileUnifiedMIMOBackwardAsync(
