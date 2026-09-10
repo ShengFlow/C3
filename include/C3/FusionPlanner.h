@@ -61,6 +61,15 @@ struct RegionMergeMetric {
 struct RegionFusionPolicy {
     double min_benefit_ratio = 0.25;       ///< 收益须至少覆盖工作集 25% 才跨分量合并
     uint64_t launch_unit_bytes = 400 * 1024; ///< 单次 launch 等价字节税(约 2µs @ 200GB/s), 终态由 autotune 校准
+    /// 强制合并：跳过代价门收益判定，只要结构上可并（多分量 + 共享外部输入）就并。
+    /// @details 用途: 把"region 划分是否正确"与"是否划算"解耦。强制模式用于验证
+    ///          planner 划分与 MIMO 实际范围的**结构等价性**(G1 一致率)；代价判定
+    ///          (min_benefit_ratio/launch_unit_bytes 的收益模型)作为独立优化层后补。
+    ///          env: C3_FORCE_REGION_MERGE=1。
+    /// @warning **仅用于 off-path 结构验证**。开启后 planner 可能产出超大单 region
+    ///          (如 FFN 下 23 节点)，若将来被运行时接管(G3)路径消费会增加缓冲/寄存器
+    ///          压力；不应在真实执行场景启用，除非代价判定已重设计完成。
+    bool force_merge = false;
 
     /// 从 MachineFingerprint(deploy 校准)构造策略: launch_unit_bytes 用指纹实测值
     /// (未校准回退保守默认)。运行时 Engine 启动后调用一次即可让代价门用机器实测。
@@ -99,7 +108,7 @@ struct FusionPlan {
  * @class FusionPlanner
  * @brief 融合决策：输入统一 Graph，输出一组可独立 kernel 化的融合单元。
  * @details 判据（全部由数据驱动，非结构特判）：
- *   1. lowering 能力：逐元素族(Add/Sub/Mul/Div/Neg/ReLU/Sigmoid/Tanh/Gt/Exp/Log)
+ *   1. lowering 能力：逐元素族(Add/Sub/Mul/Div/Neg/ReLU/Sigmoid/Tanh/SiLU/Gt/Exp/Log)
  *      可彼此共内核；MatMul 可吸收其单消费者逐元素尾链成 GEMM_EPILOGUE；
  *      SumReduce/Transpose/Softmax/CrossEntropy/Fused/Const 为结构性边界。
  *   2. shape/numel：纯逐元素单元要求成员 out numel 全等（identity-1D ABI 门，

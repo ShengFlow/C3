@@ -1674,9 +1674,11 @@ namespace {
 /// 将 C3 NodeVariant 映射到调度器 op 枚举
 /// @return op 值；若无法映射（ConstNode/FusedNode/多节点图）则返回 std::nullopt
 static std::optional<op> nodeVariantToOp(const NodeVariant& nv) {
-    // NodeVariant 的 variant 索引顺序：
+    // NodeVariant 的 variant 索引顺序（新增类型只能追加到末尾，见 Graph.h 警告）：
     // AddNode=0, SubNode=1, MulNode=2, DivNode=3, MatMulNode=4,
-    // NegNode=5, ReLUNode=6, SigmoidNode=7, TanhNode=8, ConstNode=9, FusedNode=10
+    // NegNode=5, ReLUNode=6, SigmoidNode=7, TanhNode=8, GtNode=9,
+    // SumReduceNode=10, TransposeNode=11, ExpNode=12, LogNode=13,
+    // ConstNode=14, FusedNode=15, SoftmaxNode=16, CrossEntropyNode=17, SiLUNode=18
     switch (nv.index()) {
         case 0:  return op::Add;
         case 1:  return op::Sub;
@@ -1687,6 +1689,7 @@ static std::optional<op> nodeVariantToOp(const NodeVariant& nv) {
         case 6:  return op::ReLU;
         case 7:  return op::Sigmoid;
         case 8:  return op::Tanh;
+        case 18: return op::SiLU;
         default: return std::nullopt; // ConstNode, FusedNode, unknown
     }
 }

@@ -375,6 +375,14 @@ private:
             g.markOutput(out);
             break;
         }
+        case op::SiLU: {
+            // SiLU 单算子前向：silu(x) = x / (1 + exp(-x))
+            auto desc = TensorDesc::fromShape(lhs_shape);
+            size_t in = g.addInput(desc);
+            size_t out = g.addNode(SiLUNode{desc}, {in}, desc);
+            g.markOutput(out);
+            break;
+        }
         case op::Tanh: {
             auto desc = TensorDesc::fromShape(lhs_shape);
             size_t in = g.addInput(desc);
@@ -499,6 +507,9 @@ private:
             return TanhNode{desc};
         case op::Sigmoid:
             return SigmoidNode{desc};
+        case op::SiLU:
+            // [修复] 此前无此 case，落 default 会静默返回 SigmoidNode（把 silu 当 sigmoid 编译）。
+            return SiLUNode{desc};
         default:
             return SigmoidNode{desc}; // fallback
         }
@@ -519,7 +530,8 @@ private:
             | (1ull << static_cast<size_t>(op::Neg))
             | (1ull << static_cast<size_t>(op::ReLU))
             | (1ull << static_cast<size_t>(op::Tanh))
-            | (1ull << static_cast<size_t>(op::Sigmoid));
+            | (1ull << static_cast<size_t>(op::Sigmoid))
+            | (1ull << static_cast<size_t>(op::SiLU));
         return (kSupportedMask >> static_cast<size_t>(op_type)) & 1ull;
     }
 
@@ -730,6 +742,7 @@ private:
             | (1ull << static_cast<size_t>(op::ReLU))
             | (1ull << static_cast<size_t>(op::Tanh))
             | (1ull << static_cast<size_t>(op::Sigmoid))
+            | (1ull << static_cast<size_t>(op::SiLU))
             | (1ull << static_cast<size_t>(op::GELU))
             | (1ull << static_cast<size_t>(op::LReLU))
             | (1ull << static_cast<size_t>(op::Log))

@@ -225,6 +225,12 @@ static void buildSmallMatMul(mlir::OpBuilder& builder, mlir::Location loc,
         activated = builder.create<mlir::arith::DivFOp>(loc, one, denom);
     } else if (act == 3) { // Tanh
         activated = builder.create<mlir::math::TanhOp>(loc, final_sum);
+    } else if (act == 4) { // SiLU: x / (1 + exp(-x))
+        mlir::Value neg_sum = builder.create<mlir::arith::NegFOp>(loc, final_sum);
+        mlir::Value exp_val = builder.create<mlir::math::ExpOp>(loc, neg_sum);
+        mlir::Value one = builder.create<mlir::arith::ConstantFloatOp>(loc, f32, llvm::APFloat(1.0f));
+        mlir::Value denom = builder.create<mlir::arith::AddFOp>(loc, one, exp_val);
+        activated = builder.create<mlir::arith::DivFOp>(loc, final_sum, denom);
     }
 
     builder.create<mlir::LLVM::StoreOp>(loc, activated, out_cell_ptr);
@@ -501,6 +507,54 @@ struct SigmoidOpLowering : public mlir::OpRewritePattern<mlir::c3::SigmoidOp> {
     }
 };
 
+/// SiLU 激活 lowering: silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+/// 数值形式与主仓 eager 参考实现 (CPU-BASIC/SiLU_BASIC_kernel.cpp) 保持一致。
+struct SiLUOpLowering : public mlir::OpRewritePattern<mlir::c3::SiLUOp> {
+    using OpRewritePattern<mlir::c3::SiLUOp>::OpRewritePattern;
+
+    mlir::LogicalResult matchAndRewrite(mlir::c3::SiLUOp op, mlir::PatternRewriter& rewriter) const override {
+        auto loc = op.getLoc();
+        mlir::Value input = op.getInput();
+        mlir::Value out = op.getOut();
+
+        auto f32 = rewriter.getF32Type();
+        auto ptr_type = mlir::LLVM::LLVMPointerType::get(rewriter.getContext());
+
+        constexpr int64_t VL = ct::c3::kTargetVecLanes;
+        auto vec_ty = mlir::VectorType::get({VL}, f32);
+
+        buildVectorizedLoop(rewriter, loc, op.getNumel(), 0,
+            [&](mlir::OpBuilder& bld, mlir::Location loc, mlir::Value base) {
+                mlir::Value in_ptr = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, input, mlir::ValueRange{base});
+                mlir::Value o_ptr = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, out, mlir::ValueRange{base});
+
+                mlir::Value val = bld.create<mlir::LLVM::LoadOp>(loc, vec_ty, in_ptr, 16);
+                mlir::Value neg_x = bld.create<mlir::arith::NegFOp>(loc, val);
+                mlir::Value exp_val = bld.create<mlir::math::ExpOp>(loc, neg_x);
+                mlir::Value one = bld.create<mlir::arith::ConstantOp>(
+                    loc, mlir::DenseElementsAttr::get(vec_ty, 1.0f));
+                mlir::Value denom = bld.create<mlir::arith::AddFOp>(loc, one, exp_val);
+                mlir::Value res = bld.create<mlir::arith::DivFOp>(loc, val, denom);
+                bld.create<mlir::LLVM::StoreOp>(loc, res, o_ptr, 16);
+            },
+            [&](mlir::OpBuilder& bld, mlir::Location loc, mlir::Value idx) {
+                mlir::Value in_ptr = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, input, mlir::ValueRange{idx});
+                mlir::Value o_ptr = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, out, mlir::ValueRange{idx});
+
+                mlir::Value val = bld.create<mlir::LLVM::LoadOp>(loc, f32, in_ptr);
+                mlir::Value neg_x = bld.create<mlir::arith::NegFOp>(loc, val);
+                mlir::Value exp_val = bld.create<mlir::math::ExpOp>(loc, neg_x);
+                mlir::Value one = bld.create<mlir::arith::ConstantFloatOp>(loc, f32, llvm::APFloat(1.0f));
+                mlir::Value denom = bld.create<mlir::arith::AddFOp>(loc, one, exp_val);
+                mlir::Value res = bld.create<mlir::arith::DivFOp>(loc, val, denom);
+                bld.create<mlir::LLVM::StoreOp>(loc, res, o_ptr, 16);
+            });
+
+        rewriter.eraseOp(op);
+        return mlir::success();
+    }
+};
+
 struct SumReduceOpLowering : public mlir::OpRewritePattern<mlir::c3::SumReduceOp> {
     using OpRewritePattern<mlir::c3::SumReduceOp>::OpRewritePattern;
 
@@ -749,6 +803,13 @@ struct MatMulOpLowering : public mlir::OpRewritePattern<mlir::c3::MatMulOp> {
                         act_vec = vb.create<mlir::arith::DivFOp>(vloc, one_v, d);
                     } else if (act == 3) { // Tanh
                         act_vec = vb.create<mlir::math::TanhOp>(vloc, val_vec);
+                    } else if (act == 4) { // SiLU: x / (1 + exp(-x))
+                        mlir::Value neg = vb.create<mlir::arith::NegFOp>(vloc, val_vec);
+                        mlir::Value e = vb.create<mlir::math::ExpOp>(vloc, neg);
+                        mlir::Value one_v = vb.create<mlir::arith::ConstantOp>(
+                            vloc, mlir::DenseElementsAttr::get(vec_ty, 1.0f));
+                        mlir::Value d = vb.create<mlir::arith::AddFOp>(vloc, one_v, e);
+                        act_vec = vb.create<mlir::arith::DivFOp>(vloc, val_vec, d);
                     }
 
                     vb.create<mlir::LLVM::StoreOp>(vloc, act_vec, out_ptr, /*alignment=*/16);
@@ -782,6 +843,12 @@ struct MatMulOpLowering : public mlir::OpRewritePattern<mlir::c3::MatMulOp> {
                         activated = sb.create<mlir::arith::DivFOp>(sloc, one, denom);
                     } else if (act == 3) {
                         activated = sb.create<mlir::math::TanhOp>(sloc, val);
+                    } else if (act == 4) { // SiLU: x / (1 + exp(-x))
+                        mlir::Value neg_sum = sb.create<mlir::arith::NegFOp>(sloc, val);
+                        mlir::Value exp_val = sb.create<mlir::math::ExpOp>(sloc, neg_sum);
+                        mlir::Value one = sb.create<mlir::arith::ConstantFloatOp>(sloc, f32, llvm::APFloat(1.0f));
+                        mlir::Value denom = sb.create<mlir::arith::AddFOp>(sloc, one, exp_val);
+                        activated = sb.create<mlir::arith::DivFOp>(sloc, val, denom);
                     }
                     sb.create<mlir::LLVM::StoreOp>(sloc, activated, out_cell_ptr);
                 };
@@ -1010,6 +1077,7 @@ static void runC3Lowering(mlir::ModuleOp module) {
     patterns.add<TransposeOpLowering, SumReduceOpLowering, MatMulOpLowering,
                  AddOpLowering, SubOpLowering, MulOpLowering, DivOpLowering,
                  NegOpLowering, ReLUOpLowering, SigmoidOpLowering, TanhOpLowering,
+                 SiLUOpLowering,
                  ExpOpLowering, LogOpLowering,
                  SoftmaxOpLowering, CrossEntropyOpLowering>(module.getContext());  // [P0.2] 加 Softmax + CrossEntropy lowering
     if (mlir::failed(mlir::applyPatternsAndFoldGreedily(module, std::move(patterns)))) {

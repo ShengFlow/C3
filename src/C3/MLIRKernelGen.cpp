@@ -85,7 +85,7 @@ namespace c3 {
 
 std::mutex c3_global_mlir_mutex;
 
-enum class MatMulActivation { None, ReLU, Sigmoid, Tanh };
+enum class MatMulActivation { None, ReLU, Sigmoid, Tanh, SiLU };
 
 namespace {
     struct TileCache {
@@ -1647,6 +1647,9 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
                             } else if (std::holds_alternative<TanhNode>(act_node->op)) {
                                 fused_act = MatMulActivation::Tanh;
                                 fused_skip = 2;
+                            } else if (std::holds_alternative<SiLUNode>(act_node->op)) {
+                                fused_act = MatMulActivation::SiLU;
+                                fused_skip = 2;
                             }
                         }
                     }
@@ -1719,6 +1722,9 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
             builder.create<mlir::c3::NegOp>(loc, in_ptrs[0], out_buf, node_n);
         } else if (std::holds_alternative<ReLUNode>(op)) {
             builder.create<mlir::c3::ReLUOp>(loc, in_ptrs[0], out_buf, node_n);
+        } else if (std::holds_alternative<SiLUNode>(op)) {
+            // SiLU = x * sigmoid(x)，dialect 侧一等 op，lowering 见 SiLUOpLowering
+            builder.create<mlir::c3::SiLUOp>(loc, in_ptrs[0], out_buf, node_n);
         } else if (std::holds_alternative<SigmoidNode>(op)) {
             builder.create<mlir::c3::SigmoidOp>(loc, in_ptrs[0], out_buf, node_n);
         } else if (std::holds_alternative<TanhNode>(op)) {
@@ -2135,6 +2141,10 @@ mlir::OwningOpRef<mlir::ModuleOp> buildMLIRModule(
         }
         else if (std::holds_alternative<ReLUNode>(op)) {
             builder.create<mlir::c3::ReLUOp>(loc, a, out, n);
+        }
+        else if (std::holds_alternative<SiLUNode>(op)) {
+            // SiLU = x * sigmoid(x)，dialect 侧一等 op，lowering 见 SiLUOpLowering
+            builder.create<mlir::c3::SiLUOp>(loc, a, out, n);
         }
         else if (std::holds_alternative<SigmoidNode>(op)) {
             builder.create<mlir::c3::SigmoidOp>(loc, a, out, n);

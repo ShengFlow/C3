@@ -12,6 +12,7 @@
 #include <unordered_set>
 
 #include "C3/MachineFingerprint.h"
+#include "C3/C3Config.h"   // forceRegionMergeEnabled()
 
 namespace ct {
 namespace c3 {
@@ -302,9 +303,18 @@ FusionPlan planRegionKernel(const Graph& graph, const RegionFusionPolicy& policy
         metric.saved_launch_bytes =
             (uint64_t)(metric.component_count - 1) * policy.launch_unit_bytes;
     }
-    metric.merged = (metric.component_count > 1) && has_shared_ext &&
-                    ((metric.saved_reload_bytes + metric.saved_launch_bytes) >
-                     (uint64_t)((double)metric.working_set_bytes * policy.min_benefit_ratio));
+    // 结构可并前提: 多分量 + 存在共享外部输入(同一次调用的分支间才有省重读/省 launch 语义)
+    const bool structurally_mergeable = (metric.component_count > 1) && has_shared_ext;
+    if (policy.force_merge) {
+        // [强制合并] 跳过收益门槛, 只保留结构前提。
+        // 用途: 解耦"划分是否正确"(结构等价性, G1 一致率) 与"划分是否划算"(收益模型)。
+        // 注意: saved_* / working_set 仍被填充, 供调用方观测(不做判定)。
+        metric.merged = structurally_mergeable;
+    } else {
+        metric.merged = structurally_mergeable &&
+                        ((metric.saved_reload_bytes + metric.saved_launch_bytes) >
+                         (uint64_t)((double)metric.working_set_bytes * policy.min_benefit_ratio));
+    }
 
     // ---- 组装单元 ----
     std::vector<FusionUnit> units;
@@ -350,6 +360,7 @@ FusionUnitKind FusionPlanner::nodeKind(const Node& node) {
                       std::is_same_v<T, MulNode> || std::is_same_v<T, DivNode> ||
                       std::is_same_v<T, NegNode> || std::is_same_v<T, ReLUNode> ||
                       std::is_same_v<T, SigmoidNode> || std::is_same_v<T, TanhNode> ||
+                      std::is_same_v<T, SiLUNode> ||
                       std::is_same_v<T, GtNode> || std::is_same_v<T, ExpNode> ||
                       std::is_same_v<T, LogNode>) {
             return FusionUnitKind::ELEMENTWISE;
@@ -373,6 +384,8 @@ FusionPlan FusionPlanner::planUnits(const Graph& graph, FusionStrategy strategy,
 RegionFusionPolicy RegionFusionPolicy::fromMachineDefaults() {
     RegionFusionPolicy p;
     p.launch_unit_bytes = MachineFingerprint::instance().launchUnitBytes();
+    // [强制合并] C3_FORCE_REGION_MERGE=1 时跳过收益门槛(代价判定后补), 默认关=现有行为
+    p.force_merge = forceRegionMergeEnabled();
     return p;
 }
 

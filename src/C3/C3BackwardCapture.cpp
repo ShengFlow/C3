@@ -2583,18 +2583,22 @@ void C3BackwardCapture::compileFFNMIMOBackwardAsync(
                     if (!u.isCompute()) continue;
                     fprintf(stderr, " region[n=%zu]", u.node_ids.size());
                 }
-                fprintf(stderr, " region_metric[comp=%zu reload=%llu launch=%llu ws=%llu merged=%d]\n",
+                fprintf(stderr, " region_metric[comp=%zu reload=%llu launch=%llu ws=%llu merged=%d force=%d]\n",
                         region.region_metric.component_count,
                         (unsigned long long)region.region_metric.saved_reload_bytes,
                         (unsigned long long)region.region_metric.saved_launch_bytes,
                         (unsigned long long)region.region_metric.working_set_bytes,
-                        region.region_metric.merged ? 1 : 0);
+                        region.region_metric.merged ? 1 : 0,
+                        rpol.force_merge ? 1 : 0);
                 // [迁移决策门 G1] 一致性校验: planner 打算发几个 region kernel vs MIMO 现发 1 个
                 size_t planner_wants = region.region_metric.merged ? 1u : region.compute_unit_count;
                 bool reconciled = (planner_wants == 1u); // MIMO 现为单内核
                 fprintf(stderr, "[BW-RECONCILE] mimo_kernels=1 planner_wants=%zu reconciled=%d%s\n",
                         planner_wants, reconciled ? 1 : 0,
-                        reconciled ? "" : " (mismatch: launch 税低估或 ws 高估, 见 C3_BACKWARD_FUSION_MIGRATION_DESIGN.md)");
+                        reconciled ? "" :
+                        (rpol.force_merge
+                             ? " (mismatch: 结构不可并——非代价门问题, 见 bw-reconcile-root-cause-diagnosis)"
+                             : " (mismatch: 代价门未过——用 C3_FORCE_REGION_MERGE=1 可分离'结构是否正确'与'是否划算', 见 2026-09-10 根因诊断)"));
             }
 
             CompileOptions opts;

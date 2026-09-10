@@ -162,6 +162,19 @@ struct SigmoidNode {
 };
 
 /**
+ * @struct SiLUNode
+ * @brief 一元 SiLU 激活节点：out = x * sigmoid(x) = x / (1 + exp(-x))
+ * @details PEL25 #9/#10 的 LLaMA/PaLM FFN(SwiGLU) 核心激活。此前 Graph 层只有
+ *          ReLU/Sigmoid/Tanh 一等节点，SiLU 仅在主仓 op::SiLU(调度层) 与
+ *          dialect C3_SiLUOp(MLIR 层) 存在，导致 ForwardCapture 无法捕获含
+ *          silu 的真实前向(FFN)、FusionPlanner 也无法把它归入逐元素族。
+ */
+struct SiLUNode {
+    static constexpr const char* name = "SiLU";
+    TensorDesc in_desc;
+};
+
+/**
  * @struct TanhNode
  * @brief 一元 Tanh 激活节点：out = (exp(x) - exp(-x)) / (exp(x) + exp(-x))
  */
@@ -252,8 +265,13 @@ struct FusedNode;
  *          - 虚函数表在 MLIR 降层时无意义，variant 可直接映射到 MLIR operation
  *          - 图遍历（canonicalize）使用 std::visit 比虚函数模式更高效且显式
  *          - 新增算子类型只需扩展 variant，不破坏现有代码
+ *
+ * @warning 索引稳定性：C3Engine.cpp / PGOManager.cpp 的 nodeVariantToOp 依赖
+ *          std::variant 的索引顺序（switch(nv.index())）。**新增节点类型只能
+ *          追加到末尾**，禁止在中间插入或删除，否则会破坏已编译产物的 op 映射。
+ *          既有索引 0-17 保持不变；SiLUNode 追加为 index 18。
  */
-using NodeVariant = std::variant<AddNode, SubNode, MulNode, DivNode, MatMulNode, NegNode, ReLUNode, SigmoidNode, TanhNode, GtNode, SumReduceNode, TransposeNode, ExpNode, LogNode, ConstNode, FusedNode, SoftmaxNode, CrossEntropyNode>;
+using NodeVariant = std::variant<AddNode, SubNode, MulNode, DivNode, MatMulNode, NegNode, ReLUNode, SigmoidNode, TanhNode, GtNode, SumReduceNode, TransposeNode, ExpNode, LogNode, ConstNode, FusedNode, SoftmaxNode, CrossEntropyNode, SiLUNode>;
 
 /**
  * @struct FusedNode

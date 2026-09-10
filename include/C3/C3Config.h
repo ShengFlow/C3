@@ -17,6 +17,7 @@
  *  - 后向融合 (Backward)      : CT_C3_DISABLE_BACKWARD       / C3_DISABLE_BACKWARD       / backwardFusionEnabled()
  *  - 热路径检测/编译触发       : CT_C3_DISABLE_HOTPATH        / C3_DISABLE_HOTPATH         / hotPathTrackingEnabled()
  *  - MatMul CBLAS 加速         : 运行时 C3_MATMUL_NO_CBLAS=1 / matmulNoCblasEnabled()
+ *  - Region 强制合并(跳过代价门) : 运行时 C3_FORCE_REGION_MERGE=1 / forceRegionMergeEnabled()
  *
  * @date 2026/8/7
  */
@@ -93,6 +94,17 @@ inline bool hotPathTrackingEnabled() {
 inline bool matmulNoCblasEnabled() {
     static const bool disabled = detail::envFlag("C3_MATMUL_NO_CBLAS");
     return disabled;
+}
+
+// ======================= Region 融合代价门 (强制合并) =======================
+/// 查询是否强制启用 RegionKernel 跨分量合并（跳过代价门，不做收益判定）
+/// @details 运行时 C3_FORCE_REGION_MERGE=1 开启。用途：先把"region 划分是否正确"
+///          与"划分是否划算"两个正交问题解耦——强制合并用于验证结构等价性
+///          (planner 判定 vs MIMO 实际范围)，代价判定作为独立优化层后补。
+///          仅影响 FusionPlanner 的分区判定，不改任何 kernel 正确性路径。
+inline bool forceRegionMergeEnabled() {
+    static const bool enabled = detail::envFlag("C3_FORCE_REGION_MERGE");
+    return enabled;
 }
 
 } // namespace c3

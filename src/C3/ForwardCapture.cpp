@@ -43,6 +43,7 @@ std::optional<NodeVariant> buildOpVariant(const ::Node* node) {
     if (nm.find("NegNode") != std::string::npos)      return NodeVariant{NegNode{inD(0)}};
     if (nm.find("ReLUNode") != std::string::npos)     return NodeVariant{ReLUNode{inD(0)}};
     if (nm.find("SigmoidNode") != std::string::npos)  return NodeVariant{SigmoidNode{inD(0)}};
+    if (nm.find("SiLUNode") != std::string::npos)     return NodeVariant{SiLUNode{inD(0)}};
     if (nm.find("TanhNode") != std::string::npos)     return NodeVariant{TanhNode{inD(0)}};
     if (nm.find("ExpNode") != std::string::npos)      return NodeVariant{ExpNode{inD(0)}};
     if (nm.find("LogNode") != std::string::npos)      return NodeVariant{LogNode{inD(0)}};

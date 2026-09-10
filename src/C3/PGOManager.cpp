@@ -27,6 +27,7 @@ namespace c3 {
 namespace {
 
 /// 将 C3 NodeVariant 映射到调度器 op 枚举（与 C3Engine.cpp 中定义一致）
+/// @note 依赖 std::variant 索引顺序；新增节点类型只能追加到末尾（见 Graph.h 警告）。
 static std::optional<op> nodeVariantToOp(const NodeVariant& nv) {
     switch (nv.index()) {
         case 0:  return op::Add;
@@ -38,6 +39,7 @@ static std::optional<op> nodeVariantToOp(const NodeVariant& nv) {
         case 6:  return op::ReLU;
         case 7:  return op::Sigmoid;
         case 8:  return op::Tanh;
+        case 18: return op::SiLU;   // SiLUNode 追加于 NodeVariant 末尾
         default: return std::nullopt;
     }
 }
