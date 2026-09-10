@@ -19,6 +19,7 @@
  *  - MatMul CBLAS 加速         : 运行时 C3_MATMUL_NO_CBLAS=1 / matmulNoCblasEnabled()
  *  - Region 强制合并(跳过代价门) : 运行时 C3_FORCE_REGION_MERGE=1 / forceRegionMergeEnabled()
  *  - planner 影子观测(G2 决策门) : 运行时 C3_PLANNER_SHADOW=1 / plannerShadowEnabled()
+ *  - Region 合并策略(ADR-0002)    : 运行时 C3_REGION_MERGE_ALLOW=1 / regionMergeAllowEnabled()
  *
  * @date 2026/8/7
  */
@@ -118,6 +119,19 @@ inline bool forceRegionMergeEnabled() {
 ///          默认关闭（保守）；与 C3_PLANNER_DIAG 可共存（后者额外输出详细分区与度量）。
 inline bool plannerShadowEnabled() {
     static const bool enabled = detail::envFlag("C3_PLANNER_SHADOW");
+    return enabled;
+}
+
+// ======================= Region 合并策略 (ADR-0002) =======================
+/// 查询是否启用"跨分量默认合并"策略（ADR-0002 方案 C）
+/// @details 运行时 C3_REGION_MERGE_ALLOW=1 开启。语义：跨分量合并默认允许，
+///          仅受规模保护上限（`max_region_nodes`）约束，取代现行的相对收益门槛。
+///          依据：实测跨分量合并收益仅 0.1% 量级（FFN 5.81µs / 单步 4900µs），
+///          该层判别力价值低；判别力下沉到"region 规模保护"。
+///          默认关闭 = 现行 Strict 策略（行为完全不变）。
+/// @note 若同时设置 C3_FORCE_REGION_MERGE=1，则强制合并优先（跳过一切判定）。
+inline bool regionMergeAllowEnabled() {
+    static const bool enabled = detail::envFlag("C3_REGION_MERGE_ALLOW");
     return enabled;
 }
 

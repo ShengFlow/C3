@@ -298,6 +298,12 @@ FusionPlan planRegionKernel(const Graph& graph, const RegionFusionPolicy& policy
         if (running > peak) peak = running;
     }
     metric.working_set_bytes = peak;
+    // regionable 节点总数(Allow 策略的规模保护依据)
+    {
+        size_t cnt = 0;
+        for (size_t i = 0; i < n; ++i) if (regionable[i]) cnt++;
+        metric.region_node_count = cnt;
+    }
     // launch 省税仅在同一次 backward 调用的分支间(共享外部输入)才计入
     if (has_shared_ext && metric.component_count > 1) {
         metric.saved_launch_bytes =
@@ -306,11 +312,17 @@ FusionPlan planRegionKernel(const Graph& graph, const RegionFusionPolicy& policy
     // 结构可并前提: 多分量 + 存在共享外部输入(同一次调用的分支间才有省重读/省 launch 语义)
     const bool structurally_mergeable = (metric.component_count > 1) && has_shared_ext;
     if (policy.force_merge) {
-        // [强制合并] 跳过收益门槛, 只保留结构前提。
+        // [强制合并] 跳过一切判定, 只保留结构前提。
         // 用途: 解耦"划分是否正确"(结构等价性, G1 一致率) 与"划分是否划算"(收益模型)。
-        // 注意: saved_* / working_set 仍被填充, 供调用方观测(不做判定)。
+        // 注意: saved_* / working_set / region_node_count 仍被填充, 供调用方观测。
         metric.merged = structurally_mergeable;
+    } else if (policy.merge_strategy == RegionMergeStrategy::Allow) {
+        // [ADR-0002 方案 C] 跨分量默认合并; 判别力下沉到"规模保护上限"。
+        // 依据: 实测跨分量合并收益仅 0.1% 量级, 相对收益门槛在该层判别力价值低。
+        metric.merged = structurally_mergeable &&
+                        (metric.region_node_count <= policy.max_region_nodes);
     } else {
+        // [Strict 现行策略] 相对收益门槛, 行为与 ADR-0002 之前完全一致。
         metric.merged = structurally_mergeable &&
                         ((metric.saved_reload_bytes + metric.saved_launch_bytes) >
                          (uint64_t)((double)metric.working_set_bytes * policy.min_benefit_ratio));
@@ -386,6 +398,9 @@ RegionFusionPolicy RegionFusionPolicy::fromMachineDefaults() {
     p.launch_unit_bytes = MachineFingerprint::instance().launchUnitBytes();
     // [强制合并] C3_FORCE_REGION_MERGE=1 时跳过收益门槛(代价判定后补), 默认关=现有行为
     p.force_merge = forceRegionMergeEnabled();
+    // [ADR-0002 方案 C] C3_REGION_MERGE_ALLOW=1 时跨分量默认合并(仅受规模保护约束)
+    p.merge_strategy = regionMergeAllowEnabled() ? RegionMergeStrategy::Allow
+                                                 : RegionMergeStrategy::Strict;
     return p;
 }
 

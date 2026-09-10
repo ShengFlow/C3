@@ -54,12 +54,24 @@ struct RegionMergeMetric {
     uint64_t saved_reload_bytes = 0;   ///< Σ (usage(e)-1) * numel(e), 共享外部输入因并入单内核省的重读
     uint64_t saved_launch_bytes = 0;   ///< (k-1) * launch_unit_bytes, 仅在 has_shared_ext 时计入
     uint64_t working_set_bytes = 0;    ///< Σ 非 graph-output 的 regionable 节点 numel(live 中间量代理)
+    size_t region_node_count = 0;      ///< regionable 节点总数（Allow 策略的规模保护依据）
     bool merged = false;               ///< 是否把多分量并成单 region
+};
+
+/// RegionKernel 跨分量合并的策略（ADR-0002 方案 C）
+enum class RegionMergeStrategy : uint8_t {
+    /// 现行策略：相对收益门槛 `(reload + launch) > ratio * ws`
+    Strict = 0,
+    /// [ADR-0002 方案 C] 跨分量默认合并：仅受"规模保护上限"约束。
+    /// 依据：实测跨分量合并收益仅 0.1% 量级（FFN 5.81µs vs 单步 4900µs），
+    ///       该层判别力价值低；故默认合并以与 MIMO 行为一致，并把判别力下沉到
+    ///       "region 规模保护"（防单内核代码膨胀 / 寄存器压力）。
+    Allow = 1
 };
 
 /// RegionKernel 跨分量合并的代价门参数（原型默认保守; 系数终态由 autotune 指纹给出）
 struct RegionFusionPolicy {
-    double min_benefit_ratio = 0.25;       ///< 收益须至少覆盖工作集 25% 才跨分量合并
+    double min_benefit_ratio = 0.25;       ///< 收益须至少覆盖工作集 25% 才跨分量合并（Strict 策略）
     uint64_t launch_unit_bytes = 400 * 1024; ///< 单次 launch 等价字节税(约 2µs @ 200GB/s), 终态由 autotune 校准
     /// 强制合并：跳过代价门收益判定，只要结构上可并（多分量 + 共享外部输入）就并。
     /// @details 用途: 把"region 划分是否正确"与"是否划算"解耦。强制模式用于验证
@@ -70,6 +82,14 @@ struct RegionFusionPolicy {
     ///          (如 FFN 下 23 节点)，若将来被运行时接管(G3)路径消费会增加缓冲/寄存器
     ///          压力；不应在真实执行场景启用，除非代价判定已重设计完成。
     bool force_merge = false;
+
+    /// 跨分量合并策略（ADR-0002）。默认 Strict = 保持既有行为不变。
+    /// env: C3_REGION_MERGE_ALLOW=1 切换到 Allow。
+    RegionMergeStrategy merge_strategy = RegionMergeStrategy::Strict;
+    /// [Allow 策略] 规模保护上限：region 节点数超过此值时不跨分量合并。
+    /// @details 防止单内核节点过多导致代码膨胀 / 寄存器压力。默认取宽松值，
+    ///          需按真实结构实测标定（ADR-0002 步 1）。仅 Allow 策略生效。
+    size_t max_region_nodes = 64;
 
     /// 从 MachineFingerprint(deploy 校准)构造策略: launch_unit_bytes 用指纹实测值
     /// (未校准回退保守默认)。运行时 Engine 启动后调用一次即可让代价门用机器实测。
