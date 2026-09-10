@@ -11,6 +11,7 @@
 #include "C3/C3Config.h"
 #include "C3/C3Engine.h"
 #include "C3/C3KernelRegistry.h"
+#include "C3/C3OrchestratedKernel.h"
 #include "C3/Graph.h"
 #include "C3/GraphMerger.h"
 #include "C3/FusionPlanner.h"
@@ -2684,6 +2685,41 @@ void C3BackwardCapture::runPartitionABTest(const Graph& fused_graph,
             missing == 0 ? "" : missingList.c_str());
 }
 
+// ======================= G3 真接管 =======================
+// 用 planner 判定 + partitionGraph 切分替代"整图单内核"。
+// 返回：
+//   - 编排内核：planner 判"不合并"(多子图) 且所有子图编译成功
+//   - nullptr  ：planner 判"合并"(单子图) 或子图编译失败 → 调用方回退整图单内核
+// 语义：仅当 planner 判定与"整图单内核"不同(判拆)时才接管; 判并则退化为整图(行为不变)。
+static std::shared_ptr<CompiledKernel> tryG3TakeoverKernel(
+    const Graph& fused_graph, const CompileOptions& opts, const char* label) {
+    const RegionFusionPolicy policy = RegionFusionPolicy::fromMachineDefaults();
+    const FusionPlan plan =
+        FusionPlanner::planUnits(fused_graph, FusionStrategy::RegionKernel, policy);
+    const std::vector<PartitionedSubGraph> subs = partitionGraph(fused_graph, plan);
+
+    if (subs.size() <= 1) return nullptr;  // planner 判"合并"(单子图) → 整图
+
+    std::vector<std::shared_ptr<CompiledKernel>> sub_kernels;
+    sub_kernels.reserve(subs.size());
+    for (const auto& s : subs) {
+        auto k = C3Engine::getInstance().compile(s.graph, opts);
+        if (!k) {
+            fprintf(stderr, "[G3-TAKEOVER] %s: 子图编译失败, 回退整图\n", label);
+            return nullptr;
+        }
+        sub_kernels.push_back(std::move(k));
+    }
+
+    auto orch = buildOrchestratedKernel(fused_graph, subs, sub_kernels);
+    if (!orch) {
+        fprintf(stderr, "[G3-TAKEOVER] %s: 编排内核构建失败, 回退整图\n", label);
+        return nullptr;
+    }
+    fprintf(stderr, "[G3-TAKEOVER] %s: 切 %zu 子图 → 编排内核接管\n", label, subs.size());
+    return orch;
+}
+
 void C3BackwardCapture::compileUnifiedMIMOBackwardAsync(
     const ::Node* relu_node, const ::Node* add_node, const ::Node* matmul_node,
     const TensorDesc& grad_desc, const TensorDesc& z_desc,
@@ -2769,7 +2805,11 @@ void C3BackwardCapture::compileUnifiedMIMOBackwardAsync(
             opts.enable_fusion = true;
 
             // 编译融合图为 JIT kernel
-            auto kernel = C3Engine::getInstance().compile(fused_graph, opts);
+            // [G3 真接管] planner 判定参与执行决策(env C3_G3_TAKEOVER=1, 默认关=整图)
+            auto kernel = g3TakeoverEnabled()
+                              ? tryG3TakeoverKernel(fused_graph, opts, "FC-MIMO")
+                              : nullptr;
+            if (!kernel) kernel = C3Engine::getInstance().compile(fused_graph, opts);
             if (kernel) {
                 // 注册到 C3KernelRegistry 中，使用 {0, 1, 2} 对应 inputs 中的 z, X, W
                 C3KernelRegistry::getInstance().installBackward(
@@ -2924,7 +2964,11 @@ void C3BackwardCapture::compileFFNMIMOBackwardAsync(
             opts.backend = C3Backend::MLIR;
             opts.enable_fusion = true;
 
-            auto kernel = C3Engine::getInstance().compile(fused_graph, opts);
+            // [G3 真接管] planner 判定参与执行决策(env C3_G3_TAKEOVER=1, 默认关=整图)
+            auto kernel = g3TakeoverEnabled()
+                              ? tryG3TakeoverKernel(fused_graph, opts, "FFN-MIMO")
+                              : nullptr;
+            if (!kernel) kernel = C3Engine::getInstance().compile(fused_graph, opts);
             if (kernel) {
                 // [2026-09-07 苏璃珞] 从 GraphMerger 的实际 external_input_ids 推导 num_inputs,
                 // 不再硬编码 10 —— 消除"子图结构一变就静默错喂"的脆弱。期望外部输入:
