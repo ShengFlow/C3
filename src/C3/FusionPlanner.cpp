@@ -397,17 +397,26 @@ std::vector<PartitionedSubGraph> partitionGraph(const Graph& graph, const Fusion
     std::vector<PartitionedSubGraph> subs;
     const size_t n = graph.nodeCount();
 
-    // 原图节点 -> 所属 compute unit 的 plan.units 下标（用于子图间依赖检测）
-    std::vector<size_t> node_unit_of(n, SIZE_MAX);
-    for (size_t ui = 0; ui < plan.units.size(); ++ui) {
-        if (!plan.units[ui].isCompute()) continue;
-        for (size_t id : plan.units[ui].node_ids)
-            if (id < n) node_unit_of[id] = ui;
-    }
+    // 判断一个 LEAF 单节点是否"需要执行":
+    //   Const(含图输入占位) 是物化边界, 不切子图, 只作外部输入(由驱动方喂常量/数据);
+    //   SumReduce / Softmax / CrossEntropy / Fused 是真实计算, 必须有自己的内核。
+    //   (对齐 FusionUnitKind::LEAF 的语义: "结构性节点自身一个 kernel")
+    auto isExecutableLeaf = [](const Node& nd) {
+        return !std::holds_alternative<ConstNode>(nd.op);
+    };
 
+    // 原图节点 -> 被切出的子图下标(仅对"进入某子图"的节点非 SIZE_MAX)
+    std::vector<size_t> node_sub_of(n, SIZE_MAX);
+
+    // ---- 第一遍: 切出所有需要执行的子图 ----
+    // compute unit 直接切; LEAF 单节点仅当是"可执行算子"(非 Const)时切出。
     for (size_t ui = 0; ui < plan.units.size(); ++ui) {
         const FusionUnit& u = plan.units[ui];
-        if (!u.isCompute()) continue;   // LEAF(图输入/结构边界)只作子图外部输入
+        if (!u.isCompute()) {
+            if (u.node_ids.size() != 1) continue;              // LEAF 恒单节点, 防御
+            const size_t nid = u.node_ids[0];
+            if (nid >= n || !isExecutableLeaf(graph.node(nid))) continue;
+        }
 
         PartitionedSubGraph sub;
         sub.unit_index = ui;
@@ -447,25 +456,27 @@ std::vector<PartitionedSubGraph> partitionGraph(const Graph& graph, const Fusion
             sub.output_orig_ids.push_back(oid);
         }
 
-        // 依赖检测：外部输入若来自另一个 compute unit 的输出，记为其 upstream
-        // （units 按 min_id 排序 → 拓扑序，故上游子图通常已在 subs 中）
-        for (size_t in : sub.input_orig_ids) {
-            if (in >= n) continue;
-            const size_t src_unit = node_unit_of[in];
-            if (src_unit == SIZE_MAX) continue;   // 来自图输入/LEAF 边界
-            for (size_t k = 0; k < subs.size(); ++k) {
-                if (subs[k].unit_index == src_unit) {
-                    sub.upstream_units.push_back(k);
-                    break;
-                }
-            }
-        }
-        std::sort(sub.upstream_units.begin(), sub.upstream_units.end());
-        sub.upstream_units.erase(
-            std::unique(sub.upstream_units.begin(), sub.upstream_units.end()),
-            sub.upstream_units.end());
+        const size_t sub_idx = subs.size();
+        for (size_t nid : u.node_ids)
+            if (nid < n) node_sub_of[nid] = sub_idx;
 
         subs.push_back(std::move(sub));
+    }
+
+    // ---- 第二遍: 统一检测子图间依赖 ----
+    // 输入若来自另一子图的输出(该节点被切出且被跨子图消费 → 必为对方的 output), 记 upstream。
+    // 两遍式(而非边切边检)确保"被消费的分隔符晚于消费者切出"时也能正确检测依赖。
+    for (size_t k = 0; k < subs.size(); ++k) {
+        for (size_t in : subs[k].input_orig_ids) {
+            if (in >= n) continue;
+            const size_t src = node_sub_of[in];
+            if (src == SIZE_MAX || src == k) continue;   // 图输入/Const 边界, 或自身
+            subs[k].upstream_units.push_back(src);
+        }
+        std::sort(subs[k].upstream_units.begin(), subs[k].upstream_units.end());
+        subs[k].upstream_units.erase(
+            std::unique(subs[k].upstream_units.begin(), subs[k].upstream_units.end()),
+            subs[k].upstream_units.end());
     }
     return subs;
 }

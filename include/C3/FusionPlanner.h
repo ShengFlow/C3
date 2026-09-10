@@ -163,8 +163,10 @@ private:
 /**
  * @struct PartitionedSubGraph
  * @brief 按 FusionPlan 切分出的单个可独立编译子图（G3 集成点基础）
- * @details 每个 compute unit 切出一个子图；LEAF 节点（图输入/结构边界）作为子图的外部输入。
- *          若某子图的外部输入来自另一个 compute unit 的输出，则该依赖记入 `upstream_units`。
+ * @details 每个 compute unit 切出一个子图；LEAF 中的真实计算节点（SumReduce/Softmax/
+ *          CrossEntropy/Fused）也各切出单节点子图（自身一个 kernel）。Const 节点（含
+ *          图输入占位、图内常量）作物化边界，仅作为子图的外部输入。
+ *          若某子图的外部输入来自另一个子图的输出，则该依赖记入 `upstream_units`。
  * @note 只做图变换，不触发编译/执行；默认路径不受影响。
  */
 struct PartitionedSubGraph {
@@ -178,15 +180,18 @@ struct PartitionedSubGraph {
 };
 
 /**
- * @brief 按 FusionPlan 的 compute units 切分图，产出可独立编译的子图序列（只读）
+ * @brief 按 FusionPlan 切分图，产出可独立编译的子图序列（只读；构成完整执行计划）
  * @param graph 原图
  * @param plan  对同一 graph 的规划结果
- * @return 子图序列；顺序与 plan.units 中 compute unit 的出现顺序一致
+ * @return 子图序列；顺序与 plan.units 中相应 unit 的出现顺序一致
  * @details 语义保证：
- *          - `unit_node_ids` 覆盖该 unit 全部节点，且拼接所有子图后 == 原图全部 compute 节点（无重无漏）
+ *          - `unit_node_ids` 覆盖该 unit 全部节点，且拼接所有子图后 == 原图全部
+ *            "需执行的节点"（compute 节点 + 真实计算型 LEAF，如 SumReduce/Softmax/
+ *            CrossEntropy/Fused；无重无漏）
  *          - 子图内节点按原图 id 升序添加（拓扑序），因此可独立编译
  *          - `orig_to_sub` 提供回填映射：子图节点 → 原图节点
- *          保守约束：不处理 LEAF 单元（输入占位/结构边界）自身的执行，它们只作为子图外部输入。
+ *          - Const 节点（含图输入占位、图内常量）不切子图，仅作物化边界：它们作为
+ *            子图外部输入出现，驱动方须对图输入喂数据、对图内常量喂其真实值。
  */
 std::vector<PartitionedSubGraph> partitionGraph(const Graph& graph, const FusionPlan& plan);
 
