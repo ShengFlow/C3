@@ -393,6 +393,83 @@ FusionPlan FusionPlanner::planUnits(const Graph& graph, FusionStrategy strategy,
     return planDefault(graph);
 }
 
+std::vector<PartitionedSubGraph> partitionGraph(const Graph& graph, const FusionPlan& plan) {
+    std::vector<PartitionedSubGraph> subs;
+    const size_t n = graph.nodeCount();
+
+    // 原图节点 -> 所属 compute unit 的 plan.units 下标（用于子图间依赖检测）
+    std::vector<size_t> node_unit_of(n, SIZE_MAX);
+    for (size_t ui = 0; ui < plan.units.size(); ++ui) {
+        if (!plan.units[ui].isCompute()) continue;
+        for (size_t id : plan.units[ui].node_ids)
+            if (id < n) node_unit_of[id] = ui;
+    }
+
+    for (size_t ui = 0; ui < plan.units.size(); ++ui) {
+        const FusionUnit& u = plan.units[ui];
+        if (!u.isCompute()) continue;   // LEAF(图输入/结构边界)只作子图外部输入
+
+        PartitionedSubGraph sub;
+        sub.unit_index = ui;
+        sub.unit_node_ids = u.node_ids;
+
+        const std::unordered_set<size_t> member(u.node_ids.begin(), u.node_ids.end());
+        std::unordered_map<size_t, size_t> ext_to_input;   // 原图 id -> 子图 input id
+
+        // node_ids 已按原图 id 升序（= 拓扑序），故 unit 内输入必已先添加
+        for (size_t nid : u.node_ids) {
+            const Node& nd = graph.node(nid);
+            std::vector<size_t> sub_inputs;
+            sub_inputs.reserve(nd.inputs.size());
+            for (size_t in : nd.inputs) {
+                if (member.count(in)) {
+                    sub_inputs.push_back(sub.orig_to_sub.at(in));
+                    continue;
+                }
+                auto it = ext_to_input.find(in);
+                if (it == ext_to_input.end()) {
+                    const TensorDesc d = graph.validNodeId(in) ? graph.node(in).out_desc
+                                                               : TensorDesc{};
+                    size_t sid = sub.graph.addInput(d);
+                    ext_to_input.emplace(in, sid);
+                    sub.input_orig_ids.push_back(in);
+                    it = ext_to_input.find(in);
+                }
+                sub_inputs.push_back(it->second);
+            }
+            sub.orig_to_sub.emplace(nid, sub.graph.addNode(nd.op, sub_inputs, nd.out_desc));
+        }
+
+        for (size_t oid : u.output_ids) {
+            auto it = sub.orig_to_sub.find(oid);
+            if (it == sub.orig_to_sub.end()) continue;
+            sub.graph.markOutput(it->second);
+            sub.output_orig_ids.push_back(oid);
+        }
+
+        // 依赖检测：外部输入若来自另一个 compute unit 的输出，记为其 upstream
+        // （units 按 min_id 排序 → 拓扑序，故上游子图通常已在 subs 中）
+        for (size_t in : sub.input_orig_ids) {
+            if (in >= n) continue;
+            const size_t src_unit = node_unit_of[in];
+            if (src_unit == SIZE_MAX) continue;   // 来自图输入/LEAF 边界
+            for (size_t k = 0; k < subs.size(); ++k) {
+                if (subs[k].unit_index == src_unit) {
+                    sub.upstream_units.push_back(k);
+                    break;
+                }
+            }
+        }
+        std::sort(sub.upstream_units.begin(), sub.upstream_units.end());
+        sub.upstream_units.erase(
+            std::unique(sub.upstream_units.begin(), sub.upstream_units.end()),
+            sub.upstream_units.end());
+
+        subs.push_back(std::move(sub));
+    }
+    return subs;
+}
+
 RegionFusionPolicy RegionFusionPolicy::fromMachineDefaults() {
     RegionFusionPolicy p;
     p.launch_unit_bytes = MachineFingerprint::instance().launchUnitBytes();

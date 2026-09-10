@@ -2409,6 +2409,113 @@ void C3BackwardCapture::diagnosePlannerReconcile(const Graph& fused_graph, const
                 label, fused_graph.nodeCount(), mimo_kernels, planner_wants,
                 rpol.force_merge ? 1 : 0, g1_matched, g1_total);
     }
+
+    // [ADR-0002 步 4] 可选: 1 内核 vs 按 planner 切分多内核的 A/B 实测(env 门控)
+    runPartitionABTest(fused_graph, rpol, label);
+}
+
+/// [ADR-0002 步 4] 整图单内核 vs 按 planner 判定切分多内核的编译/执行 A/B 实测
+void C3BackwardCapture::runPartitionABTest(const Graph& fused_graph,
+                                           const RegionFusionPolicy& rpol,
+                                           const char* label) {
+    if (!std::getenv("C3_PARTITION_AB")) return;
+
+    // 假输入(填非零常数): 内核执行时间只依赖 shape; 非零可避免全 0 触发的特殊路径
+    auto fakeInputs = [](const Graph& g) {
+        std::vector<Tensor> ins;
+        ins.reserve(g.inputs().size());
+        for (size_t iid : g.inputs()) {
+            const auto& d = g.node(iid).out_desc;
+            Tensor t(ShapeTag{}, d.shape, DType::kFloat, DeviceType::kCPU);
+            float* p = t.data_write<float>();
+            for (size_t i = 0; i < t.numel(); ++i) p[i] = 0.5f;
+            ins.push_back(std::move(t));
+        }
+        return ins;
+    };
+    auto now = [] { return std::chrono::high_resolution_clock::now(); };
+    auto ms = [](auto a, auto b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+
+    CompileOptions opts;
+    opts.backend = C3Backend::MLIR;
+    opts.enable_fusion = true;
+    constexpr int kRounds = 30;   // 交错测量轮数
+    constexpr int kInner = 3;     // 每轮每侧连续执行次数
+
+    // ---- A: 整图(单内核) ----
+    auto ta0 = now();
+    auto kA = C3Engine::getInstance().compile(fused_graph, opts);
+    const double compileA = ms(ta0, now());
+    if (!kA) {
+        fprintf(stderr, "[PARTITION-AB] %s: A(整图)编译失败, 跳过\n", label);
+        return;
+    }
+    std::vector<Tensor> insA = fakeInputs(fused_graph);
+    kA->execute(insA);                       // 预热
+
+    // ---- B: 按 planner 判定切分, 逐子图编译/执行 ----
+    FusionPlan plan = FusionPlanner::planUnits(fused_graph, FusionStrategy::RegionKernel, rpol);
+    std::vector<PartitionedSubGraph> subs = partitionGraph(fused_graph, plan);
+
+    std::vector<std::shared_ptr<CompiledKernel>> kBs;
+    std::vector<std::vector<Tensor>> insBs;
+    double compileB = 0.0;
+    for (auto& s : subs) {
+        auto tb0 = now();
+        auto kb = C3Engine::getInstance().compile(s.graph, opts);
+        compileB += ms(tb0, now());
+        if (!kb) {
+            fprintf(stderr, "[PARTITION-AB] %s: B(子图)编译失败, 跳过\n", label);
+            return;
+        }
+        kBs.push_back(kb);
+        insBs.push_back(fakeInputs(s.graph));
+    }
+    if (kBs.empty()) {
+        fprintf(stderr, "[PARTITION-AB] %s: 无子图, 跳过\n", label);
+        return;
+    }
+    for (size_t i = 0; i < kBs.size(); ++i) kBs[i]->execute(insBs[i]);   // 预热
+
+    // ---- 交错测量: 每轮 A 与 B 各测一次, 抵消漂移(热降频/后台干扰) ----
+    std::vector<double> sA, sB;
+    sA.reserve(kRounds);
+    sB.reserve(kRounds);
+    for (int r = 0; r < kRounds; ++r) {
+        auto t0 = now();
+        for (int i = 0; i < kInner; ++i) kA->execute(insA);
+        sA.push_back(ms(t0, now()) / kInner);
+
+        auto t1 = now();
+        for (int i = 0; i < kInner; ++i)
+            for (size_t i2 = 0; i2 < kBs.size(); ++i2) kBs[i2]->execute(insBs[i2]);
+        sB.push_back(ms(t1, now()) / kInner);
+    }
+    auto median = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        return v[v.size() / 2];
+    };
+    const double medA = median(sA), medB = median(sB);
+    const double minA = *std::min_element(sA.begin(), sA.end());
+    const double maxA = *std::max_element(sA.begin(), sA.end());
+    const double minB = *std::min_element(sB.begin(), sB.end());
+    const double maxB = *std::max_element(sB.begin(), sB.end());
+    const double dMed = medA > 0.0 ? (medB - medA) / medA * 100.0 : 0.0;
+
+    // 胜负计数(按每轮配对比较)
+    size_t winB = 0;
+    for (size_t i = 0; i < sA.size(); ++i)
+        if (sB[i] < sA[i]) winB++;
+
+    fprintf(stderr,
+            "[PARTITION-AB] %s: nodes=%zu rounds=%d | A(1内核) compile=%.1fms med=%.3fms "
+            "range=[%.3f,%.3f] | B(%zu内核) compile=%.1fms med=%.3fms range=[%.3f,%.3f] | "
+            "median_delta=%+.2f%% B_wins=%zu/%zu\n",
+            label, fused_graph.nodeCount(), kRounds, compileA, medA, minA, maxA,
+            subs.size(), compileB, medB, minB, maxB,
+            dMed, winB, sA.size());
 }
 
 void C3BackwardCapture::compileUnifiedMIMOBackwardAsync(

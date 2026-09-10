@@ -18,6 +18,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "Graph.h"
@@ -156,6 +157,38 @@ public:
 private:
     FusionPlanner() = default;
 };
+
+// ======================= 图切分 (G3 集成点基础) =======================
+
+/**
+ * @struct PartitionedSubGraph
+ * @brief 按 FusionPlan 切分出的单个可独立编译子图（G3 集成点基础）
+ * @details 每个 compute unit 切出一个子图；LEAF 节点（图输入/结构边界）作为子图的外部输入。
+ *          若某子图的外部输入来自另一个 compute unit 的输出，则该依赖记入 `upstream_units`。
+ * @note 只做图变换，不触发编译/执行；默认路径不受影响。
+ */
+struct PartitionedSubGraph {
+    Graph graph;                                    ///< 子图（可独立交给 C3Engine::compile）
+    size_t unit_index = SIZE_MAX;                   ///< 来源 FusionPlan::units 下标
+    std::vector<size_t> unit_node_ids;              ///< 覆盖的原图节点 id（拓扑序）
+    std::unordered_map<size_t, size_t> orig_to_sub; ///< 原图节点 id → 子图节点 id
+    std::vector<size_t> input_orig_ids;             ///< 子图 input[i] 对应的原图节点 id
+    std::vector<size_t> output_orig_ids;            ///< 子图 output[i] 对应的原图节点 id
+    std::vector<size_t> upstream_units;             ///< 依赖的其它子图下标（其 output 为本子图 input）
+};
+
+/**
+ * @brief 按 FusionPlan 的 compute units 切分图，产出可独立编译的子图序列（只读）
+ * @param graph 原图
+ * @param plan  对同一 graph 的规划结果
+ * @return 子图序列；顺序与 plan.units 中 compute unit 的出现顺序一致
+ * @details 语义保证：
+ *          - `unit_node_ids` 覆盖该 unit 全部节点，且拼接所有子图后 == 原图全部 compute 节点（无重无漏）
+ *          - 子图内节点按原图 id 升序添加（拓扑序），因此可独立编译
+ *          - `orig_to_sub` 提供回填映射：子图节点 → 原图节点
+ *          保守约束：不处理 LEAF 单元（输入占位/结构边界）自身的执行，它们只作为子图外部输入。
+ */
+std::vector<PartitionedSubGraph> partitionGraph(const Graph& graph, const FusionPlan& plan);
 
 } // namespace c3
 } // namespace ct

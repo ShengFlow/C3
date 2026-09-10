@@ -56,6 +56,9 @@
 namespace ct {
 namespace c3 {
 
+// 前向声明（FusionPlanner.h）: 仅按引用传参, 避免头文件耦合
+struct RegionFusionPolicy;
+
 /**
  * @class C3BackwardCapture
  * @brief 反向图 JIT 捕获与编译引擎
@@ -319,6 +322,18 @@ private:
      */
     void diagnosePlannerReconcile(const Graph& fused_graph, const char* label,
                                   size_t mimo_kernels);
+
+    /**
+     * @brief [ADR-0002 步 4] A/B 实测: 整图单内核 vs 按 planner 判定切分多内核
+     * @details env `C3_PARTITION_AB=1` 门控。用假输入(全 0 张量)分别编译并计时:
+     *          A = 整图一个内核; B = partitionGraph 切出的多个子图各一内核。
+     *          执行时间只依赖 shape, 故假数据足以测性能。不改变任何既有执行路径。
+     * @param fused_graph 待测图
+     * @param rpol        代价门策略(决定切分方式)
+     * @param label       诊断标签
+     */
+    void runPartitionABTest(const Graph& fused_graph, const RegionFusionPolicy& rpol,
+                            const char* label);
 
     // ======================= 反向 Graph 构建助手 =======================
 
