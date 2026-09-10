@@ -299,6 +299,20 @@ private:
     C3BackwardCapture(const C3BackwardCapture&) = delete;
     C3BackwardCapture& operator=(const C3BackwardCapture&) = delete;
 
+    // ======================= 迁移决策门 G1 诊断 =======================
+
+    /**
+     * @brief 在真实 MIMO fused_graph 上跑 FusionPlanner, 与现状 MIMO 单内核对拍(只读)
+     * @details env C3_PLANNER_DIAG=1 门控。输出 planner 分区粒度(default/region 两策略)
+     *          与现发内核数的一致性(`[BW-RECONCILE]`), 用于 G0->G3 迁移决策门的 G1 校验。
+     *          纯只读: 不触发编译/执行, 不改任何既有路径的行为。
+     * @param fused_graph  待校验的 backward 融合图
+     * @param label        诊断标签(区分路径, 如 "FFN-MIMO" / "FC-MIMO")
+     * @param mimo_kernels 现状 MIMO 实际发出的内核数(当前各路径均为 1)
+     */
+    void diagnosePlannerReconcile(const Graph& fused_graph, const char* label,
+                                  size_t mimo_kernels);
+
     // ======================= 反向 Graph 构建助手 =======================
 
     /**
