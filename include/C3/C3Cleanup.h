@@ -28,6 +28,7 @@ namespace c3 {
  *          3. C3Engine::clearCache()          —— 清空内存缓存
  *          4. RegionFusionRegistry::clear()   —— 释放区域融合注册表
  *          5. C3KernelRegistry::uninstallAll()—— 卸载所有注入的 kernel
+ *          6. C3Engine::drainFlatOutPool()    —— 释放 MIMO flat 输出缓冲池(§4.93)
  *
  *          顺序不可随意调整：必须先停止后台任务并清空缓存，再释放各注册表，
  *          确保所有 CompiledKernel / LLVM module 在静态析构前释放。
@@ -40,6 +41,10 @@ inline void shutdownAll() {
     C3Engine::getInstance().clearCache();
     RegionFusionRegistry::getInstance().clear();
     C3KernelRegistry::getInstance().uninstallAll();
+    // 6. [§4.93 A1] 释放 MIMO flat 输出缓冲池中已归还的 buffer(进程级常驻占用)。
+    //    放在最后: 前面各步释放 kernel/注册表时可能触发 Tensor 析构将 buffer 归还入池,
+    //    须在其后再 drain 才能清干净。池结构本身不析构, 故此后若有 Tensor 析构仍安全。
+    C3Engine::drainFlatOutPool();
 }
 
 } // namespace c3

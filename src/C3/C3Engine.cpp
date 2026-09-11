@@ -142,6 +142,40 @@ namespace {
 struct FlatOutPool {
     std::mutex mu;
     std::unordered_map<size_t, std::vector<char*>> free_bufs;
+    /// [§4.93 A1] 已被 drain() 关闭: 此后归还的 buffer 直接 free, 不再入池,
+    /// 避免 shutdown 之后重新积累。任何一次 acquire() 会将其复位(池重新投入使用)。
+    bool draining = false;
+
+    /// [§4.93 A1] 释放池中所有**已归还**的 buffer, 消除进程级常驻占用。
+    /// 安全性论证:
+    ///   ① 入池即代表该 buffer 的 shared_ptr 引用已归零 → free 不会 use-after-free;
+    ///   ② pool 与 mu **本身不析构**(instance() 用 new 且从不 delete) → 清理后若仍有
+    ///      Tensor 析构, 其 deleter 仍能安全加锁访问池(此时走 draining 分支直接释放),
+    ///      不会重蹈历史上「静态析构顺序 → lock 已销毁 mutex」的崩溃(fix #2)。
+    /// 故本方法可安全地由 ct::c3::shutdownAll() 在退出前调用。
+    void drain() {
+        std::vector<char*> all;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            draining = true;
+            for (auto& kv : free_bufs) {
+                all.insert(all.end(), kv.second.begin(), kv.second.end());
+            }
+            free_bufs.clear();
+        }
+        for (char* q : all) std::free(q);  // 锁外释放, 避免持锁做系统调用
+    }
+
+    /// [§4.93 A1] 池占用快照(诊断/回归用)
+    void snapshot(size_t& buffers, size_t& bytes) {
+        std::lock_guard<std::mutex> lk(mu);
+        buffers = 0;
+        bytes = 0;
+        for (const auto& kv : free_bufs) {
+            buffers += kv.second.size();
+            bytes += kv.first * kv.second.size();
+        }
+    }
 
     // [PEL25 2026-09-06 Stage 5 segfault fix] 删 tl_free() thread_local 路径
     // (f4823fe 引入的 perf 优化, 跟 lifetime 析构顺序冲突 — 见 acquire 注释)
@@ -162,6 +196,7 @@ struct FlatOutPool {
         char* p = nullptr;
         {
             std::lock_guard<std::mutex> lk(mu);
+            draining = false;  // [§4.93 A1] 池重新投入使用(抵消 shutdown 后的 drain)
             auto it = free_bufs.find(bytes);
             if (it != free_bufs.end() && !it->second.empty()) {
                 p = it->second.back();
@@ -186,8 +221,16 @@ struct FlatOutPool {
         // 后续可考虑: tl_free() 用 shared_ptr 包装 + atexit 提前清空, 兼得 perf + 正确性.
         return std::shared_ptr<char>(p, [bytes](char* q) {
             FlatOutPool& pool = FlatOutPool::instance();
-            std::lock_guard<std::mutex> lk(pool.mu);
-            pool.free_bufs[bytes].push_back(q);
+            bool free_now = false;
+            {
+                std::lock_guard<std::mutex> lk(pool.mu);
+                if (pool.draining) {
+                    free_now = true;  // [§4.93 A1] 池已关闭 → 直接释放, 不重新积累
+                } else {
+                    pool.free_bufs[bytes].push_back(q);
+                }
+            }
+            if (free_now) std::free(q);
         });
     }
 };
@@ -1826,6 +1869,18 @@ C3CacheStats C3Engine::getCacheStats() const {
         stats.pending_compiles = state.pending.size();
     }  // ← 锁释放，_to_reap 后续析构不会触发持锁等待
     return stats;
+}
+
+// [§4.93 A1] 释放 MIMO flat 输出缓冲池中已归还的 buffer, 消除进程级常驻占用。
+void C3Engine::drainFlatOutPool() {
+    FlatOutPool::instance().drain();
+}
+
+// [§4.93 A1] 缓冲池占用快照(诊断/回归用)
+FlatOutPoolStats C3Engine::getFlatOutPoolStats() {
+    FlatOutPoolStats out;
+    FlatOutPool::instance().snapshot(out.cached_buffers, out.cached_bytes);
+    return out;
 }
 
 std::shared_ptr<ProfileData> C3Engine::getProfileData(const std::string& cache_key) const {

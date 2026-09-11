@@ -110,6 +110,20 @@ struct C3CacheStats {
     size_t dedup_waits = 0;
 };
 
+/**
+ * @struct FlatOutPoolStats
+ * @brief [§4.93 A1] MIMO flat 输出缓冲池的占用快照
+ * @details 该池按 buffer 字节数分桶缓存已归还的 flat 输出缓冲, 用于消除多次 execute 的
+ *          malloc/free 抖动。池本身不析构(见 C3Engine.cpp FlatOutPool::instance 注释),
+ *          因此进程级常驻; 本快照用于观测其占用, 配合 drainFlatOutPool() 清理。
+ */
+struct FlatOutPoolStats {
+    /** @brief 池中已归还(可复用)的 buffer 个数 */
+    size_t cached_buffers = 0;
+    /** @brief 池中已归还 buffer 的总字节数 */
+    size_t cached_bytes = 0;
+};
+
 // [P0.5 2026-08-30 苏璃珞] compile 失败原因统计
 // 目的：给 C3 完善提供量化基线——之前 STATUS 描述 "反向全走 eager" 实际根因是
 // compile 失败（kernel==nullptr）→ installBackward 不调 → backward_entries_ 空。
@@ -516,6 +530,19 @@ public:
 
     /** @brief 查询当前缓存状态 */
     [[nodiscard]] C3CacheStats getCacheStats() const;
+
+    /**
+     * @brief [§4.93 A1] 释放 MIMO flat 输出缓冲池中已归还的 buffer
+     * @details 池中 buffer 的 shared_ptr 引用均已归零(归还即入池), 故释放不会 use-after-free。
+     *          池结构(mutex / map)本身**不析构**, 因此本调用之后若仍有 Tensor 析构,
+     *          其 deleter 仍可安全访问池(此时归还的 buffer 直接 free, 不再入池)。
+     *          已接入 ct::c3::shutdownAll(), 程序退出前调用即可获得零常驻泄漏。
+     * @note 调用后池暂停缓存, 直到下一次 acquire() 自动恢复, 避免 shutdown 后重新积累。
+     */
+    static void drainFlatOutPool();
+
+    /** @brief [§4.93 A1] 查询 MIMO flat 输出缓冲池占用快照(诊断/回归用) */
+    [[nodiscard]] static FlatOutPoolStats getFlatOutPoolStats();
 
     /**
      * @brief 根据缓存键获取 PGO profile 数据
