@@ -109,6 +109,12 @@ namespace {
 
     constexpr int64_t kDefaultTileM = 32;
     constexpr int64_t kDefaultTileN = 32;
+
+    // MatMulOp transpose 折叠标志(语义见 C3Ops.td MatMulOp description):
+    // 111 = NoTrans, 112 = Trans。此前以裸字面量散布于生成/折叠逻辑, 读代码时
+    // 容易被误当成 tile 或未定占位常量(见 STATUS §4.91 审查结论 C5)。
+    constexpr int kMatMulNoTrans = 111;
+    constexpr int kMatMulTrans   = 112;
 }
 
 // ======================= 辅助函数 =======================
@@ -1589,8 +1595,8 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
             auto mm_N = builder.create<mlir::arith::ConstantIntOp>(loc, matN, 64);
 
             // === Transpose Folding 转置折叠优化 (M2 阶段 2026-08-14) ===
-            int transA = 111; // 111 = CblasNoTrans, 112 = CblasTrans
-            int transB = 111;
+            int transA = kMatMulNoTrans;  // 语义: cblas NoTrans
+            int transB = kMatMulNoTrans;
             size_t in_id_a = node->inputs[0];
             size_t in_id_b = node->inputs[1];
             mlir::Value matmul_a_ptr = getInputPtr(in_id_a);
@@ -1598,14 +1604,14 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
 
             for (const auto& gn : nodes) {
                 if (gn.id == in_id_a && std::holds_alternative<TransposeNode>(gn.op)) {
-                    transA = 112;
+                    transA = kMatMulTrans;
                     matmul_a_ptr = getInputPtr(gn.inputs[0]);
                     break;
                 }
             }
             for (const auto& gn : nodes) {
                 if (gn.id == in_id_b && std::holds_alternative<TransposeNode>(gn.op)) {
-                    transB = 112;
+                    transB = kMatMulTrans;
                     matmul_b_ptr = getInputPtr(gn.inputs[0]);
                     break;
                 }
@@ -2133,7 +2139,7 @@ mlir::OwningOpRef<mlir::ModuleOp> buildMLIRModule(
             int64_t matN = mm.rhs_desc.shape.size() > 1 ? (int64_t)mm.rhs_desc.shape[1] : 0;
             builder.create<mlir::c3::MatMulOp>(loc, a, b, out, nullptr,
                                                matM, matK, matN,
-                                               111, 111, (int)MatMulActivation::None,
+                                               kMatMulNoTrans, kMatMulNoTrans, (int)MatMulActivation::None,
                                                /*tileM=*/0, /*tileN=*/0, /*biasNumel=*/0);
         }
         else if (std::holds_alternative<NegNode>(op)) {

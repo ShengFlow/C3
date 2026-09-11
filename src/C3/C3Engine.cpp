@@ -930,7 +930,7 @@ static std::string makeCacheKey(const Graph& graph, const CompileOptions& option
 /// 实际编译逻辑（同步和异步路径共用）
 static std::shared_ptr<CompiledKernel> doCompile(
     const Graph& working_graph, const CompileOptions& options,
-    const std::string& /*cache_key*/)
+    const std::string& cache_key)
 {
     try {
         // 运行时默认加载机器指纹(deploy 校准产物, 进程内一次, O(1) 就绪)。
@@ -999,7 +999,6 @@ static std::shared_ptr<CompiledKernel> doCompile(
                 }
             }
 
-            std::string cache_key = makeCacheKey(working_graph, options);
             static const bool use_oneshot = [] {
                 // One-Shot 管线仍有部分多维广播/转换组合无法稳定通过 MLIR
                 // conversion；默认必须走已验证的常规 MLIR 管线。仅显式设置
@@ -1043,7 +1042,7 @@ static std::shared_ptr<CompiledKernel> doCompile(
                 out_shapes.push_back({gen.elem_n});
             }
             kernel = std::make_shared<MultiNodeCompiledKernel>(
-                gen.multi_func, gen.deleter, makeCacheKey(working_graph, options),
+                gen.multi_func, gen.deleter, cache_key,
                 options.target_device, gen.num_inputs, gen.M, gen.K, gen.N,
                 gen.elem_n, out_shapes.size(), out_shapes,
                 gen.scratch_size, options.opt_level
@@ -1057,7 +1056,7 @@ static std::shared_ptr<CompiledKernel> doCompile(
             }
         } else if (gen.is_fused) {
             kernel = std::make_shared<FusedCompiledKernel>(
-                gen.fused_func, gen.deleter, makeCacheKey(working_graph, options),
+                gen.fused_func, gen.deleter, cache_key,
                 options.target_device, gen.num_inputs, gen.fused_out_shape,
                 options.opt_level
             );
@@ -1071,7 +1070,7 @@ static std::shared_ptr<CompiledKernel> doCompile(
                 out_shape = working_graph.node(out_id).out_desc.shape;
             }
             kernel = std::make_shared<ConcreteCompiledKernel>(
-                gen.func, gen.deleter, makeCacheKey(working_graph, options),
+                gen.func, gen.deleter, cache_key,
                 options.target_device, gen.is_matmul, gen.M, gen.K, gen.N,
                 out_shape, /*input_b_index=*/1, gen.func_any, options.opt_level
             );
@@ -1099,6 +1098,13 @@ std::shared_ptr<CompiledKernel> C3Engine::compile(
         working_graph = working_graph.fuse();
     }
 
+    // [2026-09-10 §4.91 审查修复 B3] cache key 只生成一次, 全程复用。
+    // 修复前: 同步 compile() 的 miss 路径上同一 key 最多被重算 6 次(锁内查 cache /
+    //   传参 / doCompile 内 OneShot + 3 个内核构造分支 / 写 cache / profiling),
+    //   而 makeCacheKey 内含 graph.toString() 全图序列化; 且 doCompile 第三参数原先被
+    //   `/*cache_key*/` 注释掉, 调用方算完即弃, 属纯浪费(与 §4.88 planner 重复计算同类)。
+    const std::string cache_key = makeCacheKey(working_graph, options);
+
     // PGO 模式：返回 PGOCompiledKernel（Tier 1 解释器 → 热路径检测后自动提升到 Tier 2）
     if (options.pgo_mode) {
         auto& pgo = PGOManager::getInstance();
@@ -1106,7 +1112,6 @@ std::shared_ptr<CompiledKernel> C3Engine::compile(
             pgo.setEnabled(true);
         }
 
-        std::string cache_key = makeCacheKey(working_graph, options);
         auto& state = getState();
 
         // 获取或创建 profile data
@@ -1135,7 +1140,6 @@ std::shared_ptr<CompiledKernel> C3Engine::compile(
 
         // 缓存查询
         if (options.enable_cache) {
-            std::string cache_key = makeCacheKey(working_graph, options);
             auto it = state.cache.find(cache_key);
             if (it != state.cache.end()) {
                 state.stats.hits++;
@@ -1155,14 +1159,13 @@ std::shared_ptr<CompiledKernel> C3Engine::compile(
         }
     }  // ← lock 在此析构，_to_reap 在函数末尾析构（无死锁）
 
-    auto kernel = doCompile(working_graph, options, makeCacheKey(working_graph, options));
+    auto kernel = doCompile(working_graph, options, cache_key);
 
     // 写入缓存
     // [Fix 2026-08-09 用户审查 P0-4]: 之前锁已释放后写 state.cache 跟 evictLRU,
     // 多个 compile() 并发时 unordered_map 写入 race → UB 可能崩溃。
     // 修法: 重新拿锁写,保证 thread-safe。
     if (options.enable_cache) {
-        std::string cache_key = makeCacheKey(working_graph, options);
         {
             std::lock_guard<std::mutex> lock(state.mutex);
             state.cache[cache_key] = {kernel, 0, std::chrono::steady_clock::now()};
@@ -1172,7 +1175,6 @@ std::shared_ptr<CompiledKernel> C3Engine::compile(
 
     // 如果 profiling 启用，包装为 ProfiledCompiledKernel
     if (options.enable_profiling) {
-        std::string cache_key = makeCacheKey(working_graph, options);
         auto pd_it = state.profile_data.find(cache_key);
         if (pd_it == state.profile_data.end()) {
             pd_it = state.profile_data.emplace(cache_key, std::make_shared<ProfileData>()).first;
@@ -1884,7 +1886,7 @@ void C3Engine::autoTune(const AutoTunerConfig& config) {
 
         // 编译（强制走统一的 MLIR 后端，JIT 1.0 Handwritten 已废弃删除）
         opts.backend = C3Backend::MLIR;
-        auto kernel = doCompile(g, opts, "");
+        auto kernel = doCompile(g, opts, makeCacheKey(g, opts));
 
         // Benchmark
         Tensor a_t(ShapeTag{}, std::vector<size_t>{M, K});
