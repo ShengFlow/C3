@@ -196,13 +196,55 @@ FusionPlan planRegionKernel(const Graph& graph, const RegionFusionPolicy& policy
     for (size_t id : graph_inputs) if (id < n) is_input[id] = true;
 
     // 可 region 化：非输入 且 非硬边界 op。含 Transpose(region 内可折叠进 GEMM)、
-    // 逐元素族、MatMul。SumReduce/Softmax/CrossEntropy/Fused/Const 为独立边界。
-    std::vector<bool> regionable(n, false);
-    for (size_t i = 0; i < n; ++i) {
-        if (is_input[i]) continue;
-        if (isRegionSeparator(nodes[i])) continue;
-        regionable[i] = true;
-    }
+    // 逐元素族、MatMul。SumReduce/Softmax/CrossEntropy/Fused/Const 默认独立边界
+    // （merge_sep=true 时并入相邻 region，见下方分隔符归属判据）。
+    auto build_regionable = [&](bool merge_sep) {
+        std::vector<bool> r(n, false);
+        for (size_t i = 0; i < n; ++i) {
+            if (is_input[i]) continue;
+            if (isRegionSeparator(nodes[i]) && !merge_sep) continue;
+            r[i] = true;
+        }
+        return r;
+    };
+
+    // live 峰值工作集：任意时刻同时存活(已产未死)中间量的最大 numel，图输出除外
+    // （无论如何都要写回）。拓扑序用节点 id 递增保证，中间量 m live 于 [m, last_use(m)]。
+    auto peak_live_ws = [&](const std::vector<bool>& rb) -> uint64_t {
+        std::vector<bool> is_out(n, false);
+        for (size_t o : graph.outputs()) if (o < n) is_out[o] = true;
+        struct Ev { size_t pos; int64_t delta; bool add; };  // add 先于 remove(同 pos)
+        std::vector<Ev> events;
+        for (size_t i = 0; i < n; ++i) {
+            if (!rb[i] || is_out[i]) continue;
+            if (nodes[i].outputs.empty()) continue;          // 死中间量(不产生 live)
+            size_t last_use = nodes[i].outputs[0];
+            for (size_t c : nodes[i].outputs) if (c > last_use) last_use = c;
+            events.push_back({i, (int64_t)nodeNumel(nodes[i]), true});
+            events.push_back({last_use, -(int64_t)nodeNumel(nodes[i]), false});
+        }
+        std::sort(events.begin(), events.end(),
+                  [](const Ev& a, const Ev& b) {
+                      return a.pos != b.pos ? a.pos < b.pos : (a.add && !b.add);
+                  });
+        uint64_t peak = 0, running = 0;
+        for (const Ev& e : events) {
+            if (e.add) running += (uint64_t)e.delta;
+            else       running -= (uint64_t)(-e.delta);
+            if (running > peak) peak = running;
+        }
+        return peak;
+    };
+
+    // ---- 分隔符归属判据（让自动融合全局更优的关键） ----
+    // 分隔符独立成 LEAF 的代价 = 多一次内核调用开销；region 内核在 C3 里实为
+    // "节点间顺序 + 节点内并行"，故分隔符可作为顺序节点并入。小图该开销占比高
+    // （FC-MIMO 多一个 SumReduce 内核 → 慢约 6%），大图应保持独立以留住 region 并行。
+    // 依赖是单向近似: ws 主要由 region 的 live 中间量决定, separator 影响小。
+    std::vector<bool> regionable = build_regionable(false);
+    const bool merge_sep = policy.merge_separator &&
+                           (peak_live_ws(regionable) <= policy.separator_merge_ws_bytes);
+    if (merge_sep) regionable = build_regionable(true);
 
     // union-find：连通 regionable 分量并成同一 region
     //（共享中间量不物化、允许多 GEMM——单内核顺序执行 + 多输出）
@@ -270,34 +312,8 @@ FusionPlan planRegionKernel(const Graph& graph, const RegionFusionPolicy& policy
         has_shared_ext = true;
         metric.saved_reload_bytes += (uint64_t)(cnt - 1) * (uint64_t)nodeNumel(nodes[e]);
     }
-    // live 峰值工作集: 任意时刻同时存活(已产未死)中间量的最大 numel。
-    // graph 输出除外(无论如何写回), 只算真中间量; 比"求和"更准(求和会高估)。
-    // 拓扑序用节点 id(递增, Graph 保证输入 id < 自身); 中间量 m live 于 [m, last_use(m)]。
-    const auto& graph_outputs = graph.outputs();
-    std::vector<bool> is_output(n, false);
-    for (size_t o : graph_outputs) if (o < n) is_output[o] = true;
-
-    struct Ev { size_t pos; int64_t delta; bool add; }; // add 先于 remove(同 pos)
-    std::vector<Ev> events;
-    for (size_t i = 0; i < n; ++i) {
-        if (!regionable[i] || is_output[i]) continue;
-        if (nodes[i].outputs.empty()) continue;      // 死中间量(不产生 live)
-        size_t last_use = nodes[i].outputs[0];
-        for (size_t c : nodes[i].outputs) if (c > last_use) last_use = c;
-        events.push_back({i, (int64_t)nodeNumel(nodes[i]), true});
-        events.push_back({last_use, -(int64_t)nodeNumel(nodes[i]), false});
-    }
-    std::sort(events.begin(), events.end(),
-              [](const Ev& a, const Ev& b) {
-                  return a.pos != b.pos ? a.pos < b.pos : (a.add && !b.add);
-              });
-    uint64_t peak = 0, running = 0;
-    for (const Ev& e : events) {
-        if (e.add) running += (uint64_t)e.delta;
-        else       running -= (uint64_t)(-e.delta);
-        if (running > peak) peak = running;
-    }
-    metric.working_set_bytes = peak;
+    // live 峰值工作集（与判据处同一算法，见 peak_live_ws）
+    metric.working_set_bytes = peak_live_ws(regionable);
     // regionable 节点总数(Allow 策略的规模保护依据)
     {
         size_t cnt = 0;
@@ -489,6 +505,13 @@ RegionFusionPolicy RegionFusionPolicy::fromMachineDefaults() {
     // [ADR-0002 方案 C] C3_REGION_MERGE_ALLOW=1 时跨分量默认合并(仅受规模保护约束)
     p.merge_strategy = regionMergeAllowEnabled() ? RegionMergeStrategy::Allow
                                                  : RegionMergeStrategy::Strict;
+    // [分隔符归属] C3_SEPARATOR_MERGE=1 时允许分隔符并入相邻 region(按 ws 上界判定);
+    // 默认关 = 分隔符一律独立 = 既有行为完全不变
+    p.merge_separator = separatorMergeEnabled();
+    if (const char* ws = std::getenv("C3_SEPARATOR_MERGE_WS")) {
+        const long long v = std::atoll(ws);
+        if (v >= 0) p.separator_merge_ws_bytes = (uint64_t)v;
+    }
     return p;
 }
 

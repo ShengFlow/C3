@@ -159,6 +159,28 @@ inline bool g3TakeoverEnabled() {
     return enabled;
 }
 
+// ======================= 分隔符归属 (自动融合可用性) =======================
+/// 查询是否允许区域分隔符并入相邻 region（而非各自独立成 LEAF 内核）。
+/// @details 运行时 C3_SEPARATOR_MERGE=1 开启。语义：
+///          - 分隔符(SumReduce/Softmax/CrossEntropy/Fused/Const)在 region 语义下本是
+///            硬边界, 但 region 内核实为"节点间顺序 + 节点内并行", 故可并入。
+///          - 独立成 LEAF 的代价 = 多一次内核调用开销; 小图占比高(FC-MIMO 多一个
+///            SumReduce 内核 → 慢约 6%), 大图因 region 并行收益大应保持独立。
+///          - 并入判据由 RegionFusionPolicy::separator_merge_ws_bytes 给出(工作集上界)。
+///          - **默认开启**(2026-09-10 §4.87 起)：该判据经 FC/FFN 实测为纯改进——
+///            小图(FC-MIMO ws 80KB/326KB)消除负收益(慢 4.17%/+1.27% → 持平/-0.49%),
+///            大图(FFN-MIMO ws 7MB)超出上界、划分不变、不受影响。
+///          - 显式设 `C3_SEPARATOR_MERGE=0` 可关闭(回到"分隔符一律独立")。
+/// @note 该开关是 G3 接管"全局更优"的关键: 补齐后 FC(该并)与 FFN(该拆)可各得其所。
+inline bool separatorMergeEnabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("C3_SEPARATOR_MERGE");
+        if (v == nullptr) return true;   // 默认开(§4.87)
+        return v[0] == '1';
+    }();
+    return enabled;
+}
+
 } // namespace c3
 } // namespace ct
 

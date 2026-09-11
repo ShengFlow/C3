@@ -92,6 +92,26 @@ struct RegionFusionPolicy {
     ///          需按真实结构实测标定（ADR-0002 步 1）。仅 Allow 策略生效。
     size_t max_region_nodes = 64;
 
+    /// [分隔符归属] 允许区域分隔符(SumReduce/Softmax/CrossEntropy/Fused/Const)
+    /// 并入相邻 region，而非各自独立成 LEAF 内核。
+    /// @details 背景：分隔符在 region 语义下本是"硬边界"（归约需跨线程同步，不能与
+    ///          逐元素/GEMM 并成**并行**内核）。但 region 内核在 C3 里实为"节点间顺序
+    ///          执行 + 节点内并行"，故分隔符完全可以作为其中一个顺序节点并入（MIMO
+    ///          整图单内核正是如此）。独立成 LEAF 的代价是**多一次内核调用开销**；
+    ///          对小图该开销占比显著（实测 FC-MIMO 多一个 SumReduce 内核 → 慢约 6%），
+    ///          对大图则因 region 并行收益更大而应保持独立。
+    /// @note 判据由 separator_merge_ws_bytes 给出（工作集上界）：region 工作集小于
+    ///       该上界时并入，否则独立。默认 true（§4.87 起，经 FC/FFN 实测为纯改进）。
+    ///       env: C3_SEPARATOR_MERGE=0 关闭（阈值由 C3_SEPARATOR_MERGE_WS 覆盖）。
+    bool merge_separator = true;
+    /// [分隔符归属] 并入的工作集上界(bytes)。仅 merge_separator=true 时生效。
+    /// @details 依据 §4.83 拐点标定：region 工作集小 → 内核调用开销占比高 → 并入更优；
+    ///          工作集大 → region 并行收益大 → 独立更优。
+    ///          默认 1MB 由实测标定：FC-MIMO(ws 80KB / 326KB) 判并入且受益；
+    ///          FFN-MIMO(ws 7MB) 判独立、划分与既有一致。落在两者之间留 3x 余量。
+    ///          语义上等价于"launch 税(launch_unit_bytes, 指纹校准)的数十倍"尺度。
+    uint64_t separator_merge_ws_bytes = 1024 * 1024;
+
     /// 从 MachineFingerprint(deploy 校准)构造策略: launch_unit_bytes 用指纹实测值
     /// (未校准回退保守默认)。运行时 Engine 启动后调用一次即可让代价门用机器实测。
     static RegionFusionPolicy fromMachineDefaults();
