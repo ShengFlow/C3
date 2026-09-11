@@ -30,6 +30,7 @@
 #endif
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <dlfcn.h>
@@ -831,6 +832,12 @@ struct EngineState {
     std::unordered_map<std::string, CacheEntry> cache;
     /// 进行中的异步编译（key → promise），用于去重
     std::unordered_map<std::string, PendingEntry> pending;
+    /// [§4.91 B4] 同步路径进行中的编译（key → 发起编译的线程 id）。
+    /// 记录 owner 线程而非仅一个 bool, 是为了让**同线程重入同 key** 时不必等待
+    /// （否则 doCompile 调用链若回到 compile() 会自死锁）。
+    std::unordered_map<std::string, std::thread::id> compiling_keys;
+    /// [§4.91 B4] 与 mutex 配对: 某 key 的编译结束（成功或失败）后唤醒等待者
+    std::condition_variable cache_cv;
     /// 后台编译任务的 future，用于生命周期管理和 shutdown 等待
     std::vector<std::future<void>> compile_futures;
     /// PGO profile 数据（key → ProfileData）
@@ -1132,32 +1139,72 @@ std::shared_ptr<CompiledKernel> C3Engine::compile(
 
     auto& state = getState();
     std::vector<std::future<void>> _to_reap;  // 锁外声明，让析构在锁释放后发生
+    bool claimed_inflight = false;
     {
-        std::lock_guard<std::mutex> lock(state.mutex);
+        std::unique_lock<std::mutex> lock(state.mutex);
 
-        // 回收已完成的异步编译 future
-        reapCompletedFutures(state, _to_reap);
+        bool counted_miss = false;
+        for (;;) {
+            // 回收已完成的异步编译 future
+            reapCompletedFutures(state, _to_reap);
 
-        // 缓存查询
-        if (options.enable_cache) {
-            auto it = state.cache.find(cache_key);
-            if (it != state.cache.end()) {
-                state.stats.hits++;
-                it->second.last_accessed = std::chrono::steady_clock::now();
-                auto kernel = it->second.kernel;
-                // 如果 profiling 启用，包装为 ProfiledCompiledKernel
-                if (options.enable_profiling) {
-                    auto pd_it = state.profile_data.find(cache_key);
-                    if (pd_it == state.profile_data.end()) {
-                        pd_it = state.profile_data.emplace(cache_key, std::make_shared<ProfileData>()).first;
+            // 缓存查询（被唤醒后重查: 可能已由他人编译完成并写入缓存）
+            if (options.enable_cache) {
+                auto it = state.cache.find(cache_key);
+                if (it != state.cache.end()) {
+                    state.stats.hits++;
+                    it->second.last_accessed = std::chrono::steady_clock::now();
+                    auto kernel = it->second.kernel;
+                    // 如果 profiling 启用，包装为 ProfiledCompiledKernel
+                    if (options.enable_profiling) {
+                        auto pd_it = state.profile_data.find(cache_key);
+                        if (pd_it == state.profile_data.end()) {
+                            pd_it = state.profile_data.emplace(cache_key, std::make_shared<ProfileData>()).first;
+                        }
+                        return std::make_shared<ProfiledCompiledKernel>(kernel, pd_it->second);
                     }
-                    return std::make_shared<ProfiledCompiledKernel>(kernel, pd_it->second);
+                    return kernel;
                 }
-                return kernel;
+                // 每次 compile() 调用最多记一次 miss（等待唤醒后重查不重复计数）
+                if (!counted_miss) { state.stats.misses++; counted_miss = true; }
             }
-            state.stats.misses++;
+
+            // [§4.91 B4] 同步路径 in-flight 去重。
+            // 仅在启用缓存时生效: 只有编译结果会写入 cache 供他人复用时, 让并发方等待才有意义;
+            // 缓存关闭时等待者被唤醒后仍须自行编译, 等待纯属白费, 故直接编译。
+            if (!options.enable_cache) { state.stats.sync_compiles++; break; }
+
+            auto cit = state.compiling_keys.find(cache_key);
+            if (cit == state.compiling_keys.end() ||
+                cit->second == std::this_thread::get_id()) {
+                // 无人编译, 或**本线程重入同 key**: 后者若等待会自死锁
+                // (doCompile 调用链理论上可能回到 compile()), 故直接取得编译权。
+                state.compiling_keys[cache_key] = std::this_thread::get_id();
+                claimed_inflight = true;
+                state.stats.sync_compiles++;
+                break;
+            }
+            // 他人正在编译同一 key → 等其结束, 唤醒后回到循环顶部重查缓存
+            state.stats.dedup_waits++;
+            state.cache_cv.wait(lock);
         }
     }  // ← lock 在此析构，_to_reap 在函数末尾析构（无死锁）
+
+    // [§4.91 B4] RAII 释放 in-flight 标记并唤醒等待者。
+    // 正常返回 / 抛异常 / 提前 return 都必须走到这里, 否则等待者会永久阻塞。
+    struct InFlightGuard {
+        EngineState* st;
+        std::string key;
+        bool armed;
+        ~InFlightGuard() {
+            if (!armed || !st) return;
+            {
+                std::lock_guard<std::mutex> lk(st->mutex);
+                st->compiling_keys.erase(key);
+            }
+            st->cache_cv.notify_all();
+        }
+    } inflight_guard{&state, cache_key, claimed_inflight};
 
     auto kernel = doCompile(working_graph, options, cache_key);
 
@@ -1850,6 +1897,8 @@ void C3Engine::clearCache() {
     state.stats.pending_compiles = 0;
     state.stats.async_completions = 0;
     state.stats.async_failures = 0;
+    state.stats.sync_compiles = 0;
+    state.stats.dedup_waits = 0;
     // 同步清理 PGO 缓存，确保测试间状态干净
     // （PGOManager::clear() 内部持有自己的 mutex，无死锁风险）
     PGOManager::getInstance().clear();

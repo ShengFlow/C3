@@ -104,6 +104,10 @@ struct C3CacheStats {
     size_t async_completions = 0;
     /** @brief 异步编译失败数 */
     size_t async_failures = 0;
+    /** @brief [§4.91 B4] 同步路径实际执行的编译次数(不含 cache 命中与去重后复用) */
+    size_t sync_compiles = 0;
+    /** @brief [§4.91 B4] 同步路径因他人正在编译同一 key 而等待的次数 */
+    size_t dedup_waits = 0;
 };
 
 // [P0.5 2026-08-30 苏璃珞] compile 失败原因统计
