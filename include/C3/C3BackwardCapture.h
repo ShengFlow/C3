@@ -58,6 +58,7 @@ namespace c3 {
 
 // 前向声明（FusionPlanner.h）: 仅按引用传参, 避免头文件耦合
 struct RegionFusionPolicy;
+struct FusionPlan;
 
 /**
  * @class C3BackwardCapture
@@ -312,16 +313,21 @@ private:
     // ======================= 迁移决策门 G1 诊断 =======================
 
     /**
-     * @brief 在真实 MIMO fused_graph 上跑 FusionPlanner, 与现状 MIMO 单内核对拍(只读)
-     * @details env C3_PLANNER_DIAG=1 门控。输出 planner 分区粒度(default/region 两策略)
-     *          与现发内核数的一致性(`[BW-RECONCILE]`), 用于 G0->G3 迁移决策门的 G1 校验。
+     * @brief 在真实 MIMO fused_graph 上跑 FusionPlanner, 与实际执行内核数对拍(只读)
+     * @details env C3_PLANNER_DIAG=1(详细诊断) / C3_PLANNER_SHADOW(默认开; 静默, 仅不一致告警) 门控。
+     *          输出 planner 分区粒度(default/region 两策略) 与实际内核数的一致性
+     *          (`[BW-RECONCILE]`), 用于 G0->G3 迁移决策门的 G1 校验。
      *          纯只读: 不触发编译/执行, 不改任何既有路径的行为。
-     * @param fused_graph  待校验的 backward 融合图
-     * @param label        诊断标签(区分路径, 如 "FFN-MIMO" / "FC-MIMO")
-     * @param mimo_kernels 现状 MIMO 实际发出的内核数(当前各路径均为 1)
+     * @param fused_graph    待校验的 backward 融合图
+     * @param region_plan    已算好的 RegionKernel 规划 —— 由调用方提供, 与 G3 接管共用**同一次**
+     *                       判定, 既避免重复计算, 也保证两者口径一致(此前各自独立计算)
+     * @param policy         该规划所用策略(用于打印 launch 税等)
+     * @param actual_kernels 实际执行路径发出的内核数(G3 接管生效 = 其子图数; 否则 = 1)
+     * @param label          诊断标签(区分路径, 如 "FFN-MIMO" / "FC-MIMO")
      */
-    void diagnosePlannerReconcile(const Graph& fused_graph, const char* label,
-                                  size_t mimo_kernels);
+    void diagnosePlannerReconcile(const Graph& fused_graph, const FusionPlan& region_plan,
+                                  const RegionFusionPolicy& policy, size_t actual_kernels,
+                                  const char* label);
 
     /**
      * @brief [ADR-0002 步 4] A/B 实测: 整图单内核 vs 按 planner 判定切分多内核

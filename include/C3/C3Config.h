@@ -145,17 +145,25 @@ inline bool regionMergeAllowEnabled() {
 
 // ======================= G3 真接管 (planner 参与执行决策) =======================
 /// 查询是否启用 G3 真接管：让 planner 判定真正参与 MIMO backward 的融合决策。
-/// @details 运行时 C3_G3_TAKEOVER=1 开启。语义：
+/// @details 运行时 `C3_G3_TAKEOVER=0` 可关闭。语义：
 ///          - 开启后, MIMO backward 编译路径用 FusionPlanner(RegionKernel + Strict)
 ///            + partitionGraph 切分替代"整图单内核"：planner 判"不合并"则切多内核
 ///            编排执行, 判"合并"则维持整图单内核。
-///          - 默认关闭 = 完全走现有 MIMO 整图单内核路径(行为逐位不变)。
-/// @warning **仅用于 G3 验收/影子接管实验**。开启后 FC-MIMO 因 SumReduce(分隔符)
-///          独立成内核会比整图慢约 6%(多 launch 税), 而 FFN-MIMO 快约 3.5-4%。
-///          这是 region 语义 vs 整图语义在分隔符处理上的固有 trade-off, 需 HITL 决策
-///          是否默认开启。触碰训练核心前务必先过决策门 + 数值逐位对拍。
+///          - **默认开启**(2026-09-10 §4.88 起)。依据(本会话实测):
+///            ① 数值: FFN 5-step loss / MNIST acc / A/B 设施(切分 vs 整图)均**逐位一致**;
+///            ② 性能: 补齐分隔符归属后(§4.87)FC 由"慢 4.17%"转为持平(-0.49%),
+///               FFN 32/64/128 三维度均不劣(128 维度 -10%), 即全局持平或更优;
+///            ③ 可回退: 显式 `C3_G3_TAKEOVER=0` 即回到整图单内核路径。
+///          - 影子观测(C3_PLANNER_SHADOW, 默认开)与实际执行共用同一次 planner 判定,
+///            正常情况下恒一致 → 静默; 不一致才告警。
+/// @warning 该开关让 planner 判定真正参与执行决策(触碰 backward 执行结构)。
+///          首次默认开启时务必跑完回归 + 数值对拍(本会话已完成)。
 inline bool g3TakeoverEnabled() {
-    static const bool enabled = detail::envFlag("C3_G3_TAKEOVER");
+    static const bool enabled = [] {
+        const char* v = std::getenv("C3_G3_TAKEOVER");
+        if (v == nullptr) return true;   // 默认开(§4.88)
+        return v[0] == '1';
+    }();
     return enabled;
 }
 

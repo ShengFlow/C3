@@ -2336,23 +2336,25 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteUnifiedMIMOBackw
 ///          - `C3_PLANNER_DIAG=1`   : 详细诊断 —— 输出分区明细/代价门度量/一致率
 ///          - `C3_PLANNER_SHADOW=1` : G2 影子观测 —— 静默一致, 仅不一致时告警(常态化累积证据)
 ///          两种模式都**不改变任何执行行为**(真实执行仍走 MIMO 手写目录)。
-void C3BackwardCapture::diagnosePlannerReconcile(const Graph& fused_graph, const char* label,
-                                                  size_t mimo_kernels) {
+void C3BackwardCapture::diagnosePlannerReconcile(const Graph& fused_graph,
+                                                  const FusionPlan& region_plan,
+                                                  const RegionFusionPolicy& policy,
+                                                  size_t actual_kernels, const char* label) {
     const bool diag = std::getenv("C3_PLANNER_DIAG") != nullptr;
     const bool shadow = plannerShadowEnabled();
     if (!diag && !shadow) return;  // 默认: 不进入诊断, 零开销
 
-    // 代价门用机器指纹实测 launch 税(部署时 c3ctl 校准, 运行时 O(1) 读)
-    MachineFingerprint::instance().loadDefault();
-    RegionFusionPolicy rpol = RegionFusionPolicy::fromMachineDefaults();
-    FusionPlan region = FusionPlanner::planUnits(fused_graph, FusionStrategy::RegionKernel, rpol);
+    // [去重] region 规划由调用方算好并传入(与 G3 接管共用同一次判定)——
+    // 此前此处与接管各自独立跑一遍 planUnits, 既重复计算又可能口径不一致。
+    const FusionPlan& region = region_plan;
+    (void)policy;
 
     if (diag) {
         // [详细诊断] 额外跑 default 策略分区, 逐单元打印结构明细
         FusionPlan plan = FusionPlanner::planUnits(fused_graph);
         fprintf(stderr, "[PLANNER-DIAG] %s graph nodes=%zu default_units=%zu region_units=%zu launch_b=%llu:",
                 label, fused_graph.nodeCount(), plan.compute_unit_count, region.compute_unit_count,
-                (unsigned long long)rpol.launch_unit_bytes);
+                (unsigned long long)policy.launch_unit_bytes);
         for (const auto& u : plan.units) {
             if (!u.isCompute()) continue;
             fprintf(stderr, " [%s n=%zu",
@@ -2376,12 +2378,12 @@ void C3BackwardCapture::diagnosePlannerReconcile(const Graph& fused_graph, const
                 (unsigned long long)region.region_metric.saved_launch_bytes,
                 (unsigned long long)region.region_metric.working_set_bytes,
                 region.region_metric.merged ? 1 : 0,
-                rpol.force_merge ? 1 : 0);
+                policy.force_merge ? 1 : 0);
     }
 
-    // 一致性校验: planner 打算发几个 region kernel vs MIMO 实际发几个
+    // 一致性校验: planner 打算发几个 region kernel vs 实际执行路径发几个
     size_t planner_wants = region.region_metric.merged ? 1u : region.compute_unit_count;
-    bool reconciled = (planner_wants == mimo_kernels);
+    bool reconciled = (planner_wants == actual_kernels);
 
     // [G1 稳态统计] 累加跨结构/维度的对拍结果, 输出聚合一致率(供 G2 决策使用)
     size_t g1_total = 0, g1_matched = 0;
@@ -2394,10 +2396,10 @@ void C3BackwardCapture::diagnosePlannerReconcile(const Graph& fused_graph, const
     }
 
     if (diag) {
-        fprintf(stderr, "[BW-RECONCILE] label=%s mimo_kernels=%zu planner_wants=%zu reconciled=%d%s\n",
-                label, mimo_kernels, planner_wants, reconciled ? 1 : 0,
+        fprintf(stderr, "[BW-RECONCILE] label=%s actual_kernels=%zu planner_wants=%zu reconciled=%d%s\n",
+                label, actual_kernels, planner_wants, reconciled ? 1 : 0,
                 reconciled ? "" :
-                (rpol.force_merge
+                (policy.force_merge
                      ? " (mismatch: 结构不可并——非代价门问题, 见 bw-reconcile-root-cause-diagnosis)"
                      : " (mismatch: 代价门未过——用 C3_FORCE_REGION_MERGE=1 可分离'结构是否正确'与'是否划算', 见 2026-09-10 根因诊断)"));
         fprintf(stderr, "[G1-RATIO] reconciled=%zu/%zu (%.1f%%)\n",
@@ -2405,17 +2407,18 @@ void C3BackwardCapture::diagnosePlannerReconcile(const Graph& fused_graph, const
                 g1_total ? 100.0 * (double)g1_matched / (double)g1_total : 0.0);
     }
 
-    // [G2 影子观测] 静默一致, 仅不一致时告警; 绝不改行为(真实执行仍走 MIMO 手写目录)
+    // [G2 影子观测] 静默一致, 仅不一致时告警; 绝不改行为
+    // (G3 接管默认开后 actual_kernels 即 planner 判定结果, 正常情况下恒一致 → 静默)
     if (shadow && !reconciled) {
         fprintf(stderr,
-                "[G2-SHADOW-MISMATCH] label=%s graph_nodes=%zu mimo_kernels=%zu planner_wants=%zu "
-                "force=%d cum=%zu/%zu (planner 判定与现状不符; 仍走 MIMO, 不改行为)\n",
-                label, fused_graph.nodeCount(), mimo_kernels, planner_wants,
-                rpol.force_merge ? 1 : 0, g1_matched, g1_total);
+                "[G2-SHADOW-MISMATCH] label=%s graph_nodes=%zu actual_kernels=%zu planner_wants=%zu "
+                "force=%d cum=%zu/%zu (planner 判定与实际执行不符)\n",
+                label, fused_graph.nodeCount(), actual_kernels, planner_wants,
+                policy.force_merge ? 1 : 0, g1_matched, g1_total);
     }
 
     // [ADR-0002 步 4] 可选: 1 内核 vs 按 planner 切分多内核的 A/B 实测(env 门控)
-    runPartitionABTest(fused_graph, rpol, label);
+    runPartitionABTest(fused_graph, policy, label);
 }
 
 /// [ADR-0002 步 4] 整图单内核 vs 按 planner 判定切分多内核的编译/执行 A/B 实测
@@ -2686,18 +2689,32 @@ void C3BackwardCapture::runPartitionABTest(const Graph& fused_graph,
 }
 
 // ======================= G3 真接管 =======================
-// 用 planner 判定 + partitionGraph 切分替代"整图单内核"。
+// [去重] MIMO 规划: planner 判定 + partitionGraph **只算一次**, 供影子观测与 G3 接管共用。
+// 此前影子与接管各自独立跑一遍 planUnits, 既重复计算(同一图同一策略)又可能口径不一致。
+struct MimoPartition {
+    RegionFusionPolicy policy;
+    FusionPlan plan;                        // RegionKernel 策略规划
+    std::vector<PartitionedSubGraph> subs;  // 按该规划切分出的子图
+};
+
+static MimoPartition computeMimoPartition(const Graph& fused_graph) {
+    MimoPartition mp;
+    // 代价门用机器指纹实测 launch 税(部署时 c3ctl 校准, 运行时 O(1) 读)
+    MachineFingerprint::instance().loadDefault();
+    mp.policy = RegionFusionPolicy::fromMachineDefaults();
+    mp.plan = FusionPlanner::planUnits(fused_graph, FusionStrategy::RegionKernel, mp.policy);
+    mp.subs = partitionGraph(fused_graph, mp.plan);
+    return mp;
+}
+
+// 用给定切分结果构建编排内核(接管执行)。
 // 返回：
 //   - 编排内核：planner 判"不合并"(多子图) 且所有子图编译成功
 //   - nullptr  ：planner 判"合并"(单子图) 或子图编译失败 → 调用方回退整图单内核
 // 语义：仅当 planner 判定与"整图单内核"不同(判拆)时才接管; 判并则退化为整图(行为不变)。
 static std::shared_ptr<CompiledKernel> tryG3TakeoverKernel(
-    const Graph& fused_graph, const CompileOptions& opts, const char* label) {
-    const RegionFusionPolicy policy = RegionFusionPolicy::fromMachineDefaults();
-    const FusionPlan plan =
-        FusionPlanner::planUnits(fused_graph, FusionStrategy::RegionKernel, policy);
-    const std::vector<PartitionedSubGraph> subs = partitionGraph(fused_graph, plan);
-
+    const Graph& fused_graph, const std::vector<PartitionedSubGraph>& subs,
+    const CompileOptions& opts, const char* label, size_t* out_kernels) {
     if (subs.size() <= 1) return nullptr;  // planner 判"合并"(单子图) → 整图
 
     std::vector<std::shared_ptr<CompiledKernel>> sub_kernels;
@@ -2716,6 +2733,7 @@ static std::shared_ptr<CompiledKernel> tryG3TakeoverKernel(
         fprintf(stderr, "[G3-TAKEOVER] %s: 编排内核构建失败, 回退整图\n", label);
         return nullptr;
     }
+    if (out_kernels) *out_kernels = subs.size();
     fprintf(stderr, "[G3-TAKEOVER] %s: 切 %zu 子图 → 编排内核接管\n", label, subs.size());
     return orch;
 }
@@ -2797,19 +2815,24 @@ void C3BackwardCapture::compileUnifiedMIMOBackwardAsync(
             fused_graph.markOutput(unified_info.output_remap[2][0]); // Output 2: grad_X (for backpropagation)
             fused_graph.markOutput(unified_info.output_remap[3][0]); // Output 3: grad_b (for bias update)
 
-            // [G1 校验] FC/通用 MIMO 路径的 planner 对拍(env C3_PLANNER_DIAG=1 门控; 纯只读)
-            diagnosePlannerReconcile(fused_graph, "FC-MIMO", /*mimo_kernels=*/1);
-
             CompileOptions opts;
             opts.backend = C3Backend::MLIR;
             opts.enable_fusion = true;
 
-            // 编译融合图为 JIT kernel
-            // [G3 真接管] planner 判定参与执行决策(env C3_G3_TAKEOVER=1, 默认关=整图)
-            auto kernel = g3TakeoverEnabled()
-                              ? tryG3TakeoverKernel(fused_graph, opts, "FC-MIMO")
-                              : nullptr;
+            // [G3 真接管 + G1/G2 校验] 规划只算一次, 接管与影子共用(避免重复计算/口径漂移)
+            const bool need_plan = g3TakeoverEnabled() || plannerShadowEnabled() ||
+                                   std::getenv("C3_PLANNER_DIAG") != nullptr;
+            MimoPartition mp;
+            if (need_plan) mp = computeMimoPartition(fused_graph);
+
+            // 编译融合图为 JIT kernel: planner 判定接管, 失败/判并则回退整图单内核
+            std::shared_ptr<CompiledKernel> kernel;
+            size_t actual_kernels = 1;   // 整图单内核(MIMO 手写路径)
+            if (g3TakeoverEnabled())
+                kernel = tryG3TakeoverKernel(fused_graph, mp.subs, opts, "FC-MIMO", &actual_kernels);
             if (!kernel) kernel = C3Engine::getInstance().compile(fused_graph, opts);
+            if (need_plan)
+                diagnosePlannerReconcile(fused_graph, mp.plan, mp.policy, actual_kernels, "FC-MIMO");
             if (kernel) {
                 // 注册到 C3KernelRegistry 中，使用 {0, 1, 2} 对应 inputs 中的 z, X, W
                 C3KernelRegistry::getInstance().installBackward(
@@ -2956,19 +2979,23 @@ void C3BackwardCapture::compileFFNMIMOBackwardAsync(
             fused_graph.markOutput(unified_info.output_remap[5][0]);  // 7: grad_x_up
             fused_graph.markOutput(unified_info.output_remap[5][1]);  // 8: grad_W_u
 
-            // [L2 诊断 2026-09-07 / G1 校验] 在真实 FFN MIMO fused_graph 上跑 planner 对拍
-            // (env C3_PLANNER_DIAG=1 门控; 纯只读, 不改编译/执行路径)
-            diagnosePlannerReconcile(fused_graph, "FFN-MIMO", /*mimo_kernels=*/1);
-
             CompileOptions opts;
             opts.backend = C3Backend::MLIR;
             opts.enable_fusion = true;
 
-            // [G3 真接管] planner 判定参与执行决策(env C3_G3_TAKEOVER=1, 默认关=整图)
-            auto kernel = g3TakeoverEnabled()
-                              ? tryG3TakeoverKernel(fused_graph, opts, "FFN-MIMO")
-                              : nullptr;
+            // [G3 真接管 + 校验] 规划只算一次, 接管与影子共用(避免重复计算/口径漂移)
+            const bool need_plan = g3TakeoverEnabled() || plannerShadowEnabled() ||
+                                   std::getenv("C3_PLANNER_DIAG") != nullptr;
+            MimoPartition mp;
+            if (need_plan) mp = computeMimoPartition(fused_graph);
+
+            std::shared_ptr<CompiledKernel> kernel;
+            size_t actual_kernels = 1;   // 整图单内核(MIMO 手写路径)
+            if (g3TakeoverEnabled())
+                kernel = tryG3TakeoverKernel(fused_graph, mp.subs, opts, "FFN-MIMO", &actual_kernels);
             if (!kernel) kernel = C3Engine::getInstance().compile(fused_graph, opts);
+            if (need_plan)
+                diagnosePlannerReconcile(fused_graph, mp.plan, mp.policy, actual_kernels, "FFN-MIMO");
             if (kernel) {
                 // [2026-09-07 苏璃珞] 从 GraphMerger 的实际 external_input_ids 推导 num_inputs,
                 // 不再硬编码 10 —— 消除"子图结构一变就静默错喂"的脆弱。期望外部输入:
