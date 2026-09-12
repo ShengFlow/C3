@@ -15,6 +15,7 @@
 #include "Tensor.h"
 #include "Ctools.h"
 
+#include <optional>
 #include <vector>
 #include <unordered_map>
 #include <memory>
@@ -74,14 +75,16 @@ public:
                           const std::vector<std::vector<size_t>>& first_input_shapes = {});
 
     /// 根据哈希查找匹配的 region 入口
-    RegionEntry* find(uint64_t hash);
+    std::optional<RegionEntry> find(uint64_t hash);
 
     /// 从当前位置向后尝试匹配（最长匹配优先）
     /// @param prefix_hashes 前缀哈希数组
     /// @param current_pos 当前位置（0-based，候选 region 的第一个 op 位置）
     /// @param input_shapes 当前 op 的输入形状
     /// @return 匹配到的 entry 或 nullptr
-    RegionEntry* matchFromPosition(
+    // [Fix 2026-09-10 §4.95 P1-11] 锁内按值拷贝返回: 此前返回 entries_ 元素裸指针,
+    // 锁释放后后台 install 触发 rehash → 指针失效(悬垂)。optional 空值表示未匹配。
+    std::optional<RegionEntry> matchFromPosition(
         const std::vector<uint64_t>& prefix_hashes,
         size_t current_pos,
         const std::vector<size_t>& input_shapes);
@@ -114,7 +117,8 @@ public:
     /// @param first_input_shapes 首个 op 的输入形状
     /// @return 匹配到的 RegionEntry，或 nullptr
     /// [perf 2026-09-05] 改为指针数组传参，避免热路径每次构造 vector<vector<size_t>> 的堆分配
-    RegionEntry* findRegionByFirstOp(
+    // [Fix 2026-09-10 §4.95 P1-11] 同 matchFromPosition: 锁内按值拷贝返回
+    std::optional<RegionEntry> findRegionByFirstOp(
         op first_op,
         const std::vector<const std::vector<size_t>*>& first_input_shapes);
 

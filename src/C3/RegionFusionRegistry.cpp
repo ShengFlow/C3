@@ -137,21 +137,21 @@ void RegionFusionRegistry::installWithCost(
     installed_count_.fetch_add(1, std::memory_order_release);
 }
 
-RegionEntry* RegionFusionRegistry::find(uint64_t hash) {
+std::optional<RegionEntry> RegionFusionRegistry::find(uint64_t hash) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = entries_.find(hash);
     if (it != entries_.end() && it->second.active) {
-        return &it->second;
+        return it->second;  // [Fix §4.95 P1-11] 锁内按值拷贝
     }
-    return nullptr;
+    return std::nullopt;
 }
 
-RegionEntry* RegionFusionRegistry::matchFromPosition(
+std::optional<RegionEntry> RegionFusionRegistry::matchFromPosition(
     const std::vector<uint64_t>& prefix_hashes,
     size_t current_pos,
     const std::vector<size_t>& /*input_shapes*/) {
     if (current_pos >= prefix_hashes.size() - 1) {
-        return nullptr;
+        return std::nullopt;
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
@@ -167,11 +167,11 @@ RegionEntry* RegionFusionRegistry::matchFromPosition(
 
         auto it = entries_.find(sub_hash);
         if (it != entries_.end() && it->second.active && it->second.len == len) {
-            return &it->second;
+            return it->second;  // [Fix §4.95 P1-11] 锁内按值拷贝
         }
     }
 
-    return nullptr;
+    return std::nullopt;
 }
 
 size_t RegionFusionRegistry::entryCount() const {
@@ -191,7 +191,7 @@ bool RegionFusionRegistry::mayMatchAsFirstOp(op first_op) const {
             (uint64_t(1) << static_cast<size_t>(first_op))) != 0;
 }
 
-RegionEntry* RegionFusionRegistry::findRegionByFirstOp(
+std::optional<RegionEntry> RegionFusionRegistry::findRegionByFirstOp(
     op first_op,
     const std::vector<const std::vector<size_t>*>& first_input_shapes) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -210,9 +210,9 @@ RegionEntry* RegionFusionRegistry::findRegionByFirstOp(
             }
             if (!shape_ok) continue;
         }
-        return &entry;
+        return entry;  // [Fix §4.95 P1-11] 锁内按值拷贝
     }
-    return nullptr;
+    return std::nullopt;
 }
 
 void RegionFusionRegistry::clear() {
