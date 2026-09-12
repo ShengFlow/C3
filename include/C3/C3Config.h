@@ -189,32 +189,30 @@ inline bool separatorMergeEnabled() {
     return enabled;
 }
 
-// ======================= 手写 MIMO pattern 退场 (影子对照阶段, ④) =======================
+// ======================= 手写 MIMO pattern 退场 (已切换默认, ④ 收口) =======================
 /// 查询是否启用**手写** MIMO pattern 的执行段识别(tryExecuteUnifiedMIMOBackward)。
-/// @details 手写 pattern(FC MatMul+Add / FFN SwiGLU)是 G3 通用接管的"前置识别器":
-///          执行段识别图结构 → miss 触发编译(G3 接管编译产出) → registry 命中执行。
-///          退场路径(§4.97 ④): 影子对照 —— 设 C3_MIMO_LEGACY=0 短路手写执行段,
-///          反向回退 fused/phase1/eager(数值应逐位一致, 性能可测退场代价);
-///          待通用识别器(planner 分区缓存)就绪后再默认切换。
-/// @note 默认开启(保持现状); C3_MIMO_LEGACY=0 为影子对照通道。
+/// @details 手写 pattern(FC MatMul+Add / FFN SwiGLU)曾是 G3 通用接管的"前置识别器"。
+///          退场(§4.103-4.107): 通用树式识别器(C3_MIMO_GENERIC)已等价覆盖 FC+FFN,
+///          影子对照 + 退场预演逐位一致 → 默认关闭手写执行段(回退通道保留)。
+/// @note 默认关闭(手写 pattern 已退场); C3_MIMO_LEGACY=1 可恢复(诊断/回退)。
 inline bool mimoLegacyEnabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("C3_MIMO_LEGACY");
-        if (v == nullptr) return true;   // 默认开(手写 pattern 现状)
+        if (v == nullptr) return false;  // 默认关(手写 pattern 退场, §4.107)
         return v[0] == '1';
     }();
     return enabled;
 }
 
-/// 查询是否启用通用链式识别器(手写 MIMO 退场阶段二, ADR-012)。
-/// @details C3_MIMO_GENERIC=1 时, tryExecuteUnifiedMIMOBackward 先试通用线性链捕获
-///          (真实拓扑走链 + 通用逐节点反向构建器 + 拓扑缝合 → planner/G3 接管),
-///          miss 时透传给手写识别器(FC/FFN)继续。默认关闭 → 默认行为零变化。
+/// 查询是否启用通用树式识别器(手写 MIMO 退场, ADR-012)。
+/// @details 通用树捕获(真实拓扑走树 + 通用逐节点反向构建器 + 拓扑缝合 → planner/G3
+///          接管)是 FC/FFN 反向的默认路径; miss 时透传给手写识别器(默认已关)。
+///          默认开启(§4.107 浸泡后切换); C3_MIMO_GENERIC=0 关闭回退。
 /// @note 通用路径与手写路径层叠共存: 通用在前、手写在后, 各自 nullopt 透传。
 inline bool mimoGenericEnabled() {
     static const bool enabled = [] {
         const char* v = std::getenv("C3_MIMO_GENERIC");
-        if (v == nullptr) return false;  // 默认关(影子/浸泡阶段)
+        if (v == nullptr) return true;   // 默认开(通用树式识别器为 FC/FFN 默认路径)
         return v[0] == '1';
     }();
     return enabled;

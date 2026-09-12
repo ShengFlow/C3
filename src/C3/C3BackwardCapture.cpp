@@ -780,7 +780,11 @@ static bool isGenericChainNode(const std::string& node_type) {
            nodeTypeIs(node_type, "AddNode") ||
            nodeTypeIs(node_type, "MatMulNode") ||
            nodeTypeIs(node_type, "SiLUNode") ||
-           nodeTypeIs(node_type, "MulNode");
+           nodeTypeIs(node_type, "MulNode") ||
+           // [§4.107 ④ v3] Tanh/Sigmoid 入树: 多节点反向图执行层缺陷已修(§4.106),
+           // 其 backward 图(双 Exp+Sub+Div 链 / neg+exp+div+sub+mul 链)可正确执行
+           nodeTypeIs(node_type, "TanhNode") ||
+           nodeTypeIs(node_type, "SigmoidNode");
 }
 
 bool C3BackwardCapture::supportsNodeType(const std::string& node_type) {
@@ -798,6 +802,10 @@ bool C3BackwardCapture::supportsNodeType(const std::string& node_type) {
            nodeTypeIs(node_type, "ExpNode") ||
            nodeTypeIs(node_type, "LogNode") ||
            nodeTypeIs(node_type, "TanhNode") ||
+           // [§4.107 ④ v3] SigmoidNode 恢复: 其反向图(neg/exp/add/div/sub/mul 链, 含
+           // lhs 标量 Sub)的多节点执行层缺陷同根因已修(§4.106)。test_c3_backward
+           // Test 2(Sigmoid backward)自 C3 路径验证。
+           nodeTypeIs(node_type, "SigmoidNode") ||
            // CrossEntropy: dispatch 有 case(630), 但 tryExecuteBackward 对 CE 短路 → 实际不可达。
            nodeTypeIs(node_type, "CrossEntropyNode");
 }
@@ -2865,9 +2873,12 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteGenericChainMIMO
 {
     // ---- 入口守卫: (单输入 ReLU) 或 (双输入 MatMul) ----
     const std::string t0 = std::string(typeid(*node).name());
-    const bool entry_relu = node->getInputs().size() == 1 && nodeTypeIs(t0, "ReLUNode");
+    const bool entry_act = node->getInputs().size() == 1 &&
+                           (nodeTypeIs(t0, "ReLUNode") ||
+                            nodeTypeIs(t0, "TanhNode") ||
+                            nodeTypeIs(t0, "SigmoidNode"));
     const bool entry_mm = node->getInputs().size() == 2 && nodeTypeIs(t0, "MatMulNode");
-    if (!entry_relu && !entry_mm) return std::nullopt;
+    if (!entry_act && !entry_mm) return std::nullopt;
 
     // ---- 真实拓扑走树(BFS): 白名单上游 + 单消费者守卫; 除 firing 外 MatMul 为叶子(层边界) ----
     constexpr size_t kMaxNodes = 8;
