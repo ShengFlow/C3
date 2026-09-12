@@ -99,6 +99,12 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteBackward(
     }();
     if (disabled) return std::nullopt;
 
+    // [Fix §4.108 2026-09-12] C3 backward 仅支持 CPU: 编译段(compileBackwardAsyncForInput)
+    // 有设备守卫, 但**执行段缺失** → 同进程内 CPU 段预热编译的 kernel 被后续 MPS 段命中,
+    // CPU 产物 Tensor 投给 MPS 张量在 GradAccumulator 相加 → 设备不匹配抛异常
+    // (test_autograd_v2 MPS 段 SIGABRT 即此)。非 CPU 一律回退 eager。
+    if (grad.device() != DeviceType::kCPU) return std::nullopt;
+
     // [P0.1 2026-08-30 苏璃珞] 真正开始尝试 C3 backward 路径（不算用户禁用场景）
     {
         std::lock_guard<std::mutex> lock(stats_mutex_);
