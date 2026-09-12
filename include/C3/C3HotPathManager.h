@@ -917,6 +917,19 @@ private:
             std::lock_guard<std::mutex> lk(mutex_);
             auto it = entries_.find(fused_key);
             if (it != entries_.end() && it->second.compiling) return;
+            // [Fix 2026-09-10 §4.95 P1-12] 冷却检查下沉到提交点: in_autograd 训练路径
+            // 直调 tryFuseRecentDispatches 时绕过 recordCall 的冷却, 每 batch 同 pattern
+            // 重复提交编译(FFN fused_hit=0 场景); 在此统一拦截(首次编译 last_compile_time
+            // 为 epoch 0, elapsed 巨大, 不受影响)
+            if (it != entries_.end()) {
+                auto now = std::chrono::steady_clock::now();
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                    now - it->second.last_compile_time).count();
+                if (elapsed < static_cast<decltype(elapsed)>(cfg.cooldown_sec)) {
+                    cooldown_hits_++;
+                    return;
+                }
+            }
             entries_[fused_key].compiling = true;
         }
 
@@ -1071,9 +1084,10 @@ private:
             }
         });
 
-        // 将 future 加入统一管理列表
+        // 将 future 加入统一管理列表(顺手收割已完成项, §4.95 P1-12)
         {
             std::lock_guard<std::mutex> lk(futures_mutex_);
+            reapFinishedFuturesLocked();
             pending_futures_.push_back(std::move(future));
         }
     }
@@ -1190,6 +1204,7 @@ private:
         // 将并发 future 纳入全局生命周期管理，防止进程退出 UAF
         {
             std::lock_guard<std::mutex> lk(futures_mutex_);
+            reapFinishedFuturesLocked();
             pending_futures_.push_back(std::move(future_fast));
             pending_futures_.push_back(std::move(future_extreme));
         }
@@ -1219,6 +1234,19 @@ private:
 
     // 待管理的异步编译任务 future（替代 detach 线程）
     std::vector<std::future<void>> pending_futures_;
+
+    /// [Fix 2026-09-10 §4.95 P1-12] 收割已完成 future(调用方须持有 futures_mutex_),
+    /// 防止长训练下 pending_futures_ 只增不减
+    void reapFinishedFuturesLocked() {
+        for (auto it = pending_futures_.begin(); it != pending_futures_.end();) {
+            if (!it->valid() ||
+                it->wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+                it = pending_futures_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
 
     std::atomic<size_t> calls_tracked_{0};
     std::atomic<size_t> compilations_triggered_{0};
