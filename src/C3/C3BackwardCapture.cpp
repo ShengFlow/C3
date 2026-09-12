@@ -772,6 +772,14 @@ static bool nodeTypeIs(const std::string& node_type, const char* cls) {
     return std::strcmp(p + i, cls) == 0;
 }
 
+// [ADR-012 ④ 阶段二] 通用链白名单(v1): ReLU/Add/MatMul 线性链(FC 结构)。
+// Tanh/Sigmoid 待 tanh 反向图执行层专项修复后纳入; 树拓扑(FFN)为 v2。
+static bool isGenericChainNode(const std::string& node_type) {
+    return nodeTypeIs(node_type, "ReLUNode") ||
+           nodeTypeIs(node_type, "AddNode") ||
+           nodeTypeIs(node_type, "MatMulNode");
+}
+
 bool C3BackwardCapture::supportsNodeType(const std::string& node_type) {
     // ========== 只支持单输入单输出（unary element-wise）节点的反向编译/融合 ==========
     // [Fix 2026-09-05 苏璃珞] 仅返回 buildBackwardGraphForTypeAndIndex 确有 case 的类型，
@@ -2144,6 +2152,13 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteUnifiedMIMOBackw
         }
     };
 
+    // [ADR-012 ④ 阶段二] 通用链式识别器: 位于手写识别器之前(默认关, C3_MIMO_GENERIC=1 启用)。
+    // miss 即透传 → 手写 FC/FFN 识别器继续, 层叠共存零默认行为变化。
+    if (mimoGenericEnabled()) {
+        auto r = tryExecuteGenericChainMIMO(node, grad, forward_inputs);
+        if (r.has_value()) return r;
+    }
+
     // [§4.97 ④ 影子对照] C3_MIMO_LEGACY=0 时短路手写执行段: 反向回退
     // fused/phase1/eager(数值应逐位一致), 用于测量退场代价与数值等价性
     if (!mimoLegacyEnabled()) return std::nullopt;
@@ -2827,6 +2842,332 @@ static std::shared_ptr<CompiledKernel> tryG3TakeoverKernel(
     if (out_kernels) *out_kernels = subs.size();
     fprintf(stderr, "[G3-TAKEOVER] %s: 切 %zu 子图 → 编排内核接管\n", label, subs.size());
     return orch;
+}
+
+// ======================= [ADR-012 ④ 阶段二] 通用链式识别器 =======================
+// 用真实拓扑走链 + 通用逐节点反向构建器 + 拓扑缝合替换手写 typeid 识别 + 手写图构建:
+//   - 走链: firing 节点(单输入, 白名单)沿 getUpStreamNodes() 向上游延伸;
+//     白名单 {ReLU,Add,MatMul}, 单消费者守卫(getDownstreamCount==1),
+//     含 MatMul 即层边界(不跨层), 链长 ≤5, 捕获须含 MatMul。
+//   - 恒等梯度(Add 同形输入)不建子图(规避无算力图 worker 缺陷), 以别名共享上游
+//     grad 输出槽 —— 与 legacy FC「grad_z 直连 mm_w/mm_x/add_b」结构一致。
+//   - 编译线程只收值语义 spec(零 Node* 引用, 沿用 MIMO pending 生命周期模式)。
+//   - planner/G3 接管与 legacy 同口径(computeMimoPartition + tryG3TakeoverKernel)。
+
+std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteGenericChainMIMO(
+    const ::Node* node, const Tensor& grad,
+    const std::vector<Tensor>& forward_inputs)
+{
+    // ---- 入口守卫: firing 节点单输入 + 白名单(v1: ReLU) ----
+    if (node->getInputs().size() != 1) return std::nullopt;
+    const std::string t0 = std::string(typeid(*node).name());
+    if (!nodeTypeIs(t0, "ReLUNode")) return std::nullopt;
+
+    // ---- 真实拓扑走链 ----
+    constexpr size_t kMaxChain = 5;
+    std::vector<const ::Node*> chain;   // index 0 = firing
+    std::vector<int> edge_input;        // 节点 i 的链边输入索引(指向 chain[i+1])
+    chain.push_back(node);
+    const ::Node* cur = node;
+    while (chain.size() < kMaxChain) {
+        const auto& ups = cur->getUpStreamNodes();
+        // 索引对齐守卫(DataCore::registerNode 按输入序 push, 理论上恒成立; 防未来路径破坏)
+        if (ups.size() != cur->getInputs().size()) break;
+        const ::Node* next = nullptr;
+        int next_j = -1;
+        for (size_t j = 0; j < ups.size(); ++j) {
+            if (!ups[j]) continue;                              // 外部输入(无 grad)
+            const std::string tn = std::string(typeid(*ups[j].get()).name());
+            if (!isGenericChainNode(tn)) continue;              // 外部(非白名单, 如 GradAccumulator)
+            if (next != nullptr) return std::nullopt;           // 分叉(两个白名单上游) → v1 线性链不支持
+            next = ups[j].get();
+            next_j = static_cast<int>(j);
+        }
+        if (!next) break;
+        // 单消费者守卫: next 的输出必须只被 cur 消费(否则 pending 只含一份 grad 会丢贡献)
+        if (next->getDownstreamCount() != 1) break;
+        edge_input.push_back(next_j);
+        chain.push_back(next);
+        // 含 MatMul 即层边界(不跨层捕获)
+        if (nodeTypeIs(std::string(typeid(*next).name()), "MatMulNode")) break;
+        cur = next;
+    }
+
+    // ---- 捕获条件: 链长 ≥2 且含 MatMul ----
+    bool has_mm = false;
+    for (const ::Node* c : chain) {
+        if (nodeTypeIs(std::string(typeid(*c).name()), "MatMulNode")) { has_mm = true; break; }
+    }
+    if (!has_mm) return std::nullopt;
+
+    // ---- spec + key(与编译侧严格一致) ----
+    GenericChainSpec spec;
+    spec.grad_desc = TensorDesc::fromShape(grad.sizes());
+    std::stringstream ss;
+    ss << "mimo_generic|g:";
+    for (auto s : grad.sizes()) ss << s << ",";
+    spec.types.reserve(chain.size());
+    spec.input_descs.reserve(chain.size());
+    for (size_t i = 0; i < chain.size(); ++i) {
+        const auto& ins = chain[i]->getInputs();
+        spec.types.push_back(std::string(typeid(*chain[i]).name()));
+        std::vector<TensorDesc> ds;
+        ds.reserve(ins.size());
+        ss << "|n" << i << ":" << spec.types[i] << "|in:";
+        for (const auto& t : ins) {
+            ds.push_back(TensorDesc::fromShape(t.sizes()));
+            for (auto s : t.sizes()) ss << s << ",";
+            ss << ";";
+        }
+        spec.input_descs.push_back(std::move(ds));
+    }
+    spec.edge_input = std::move(edge_input);
+    spec.edge_input.resize(chain.size(), -1);   // 尾节点无链边
+    spec.key = ss.str();
+
+    // ---- 执行段 ----
+    auto& registry = C3KernelRegistry::getInstance();
+    if (registry.hasBackwardKey(spec.key)) {
+        // 执行计划(编译线程在 install 前写入, 命中 kernel 时必已存在)
+        GenericExecPlan plan;
+        {
+            std::lock_guard<std::mutex> lock(stats_mutex_);
+            auto it = generic_exec_plan_cache_.find(spec.key);
+            if (it == generic_exec_plan_cache_.end()) return std::nullopt;  // 防御: 计划缺失即透传
+            plan = it->second;
+        }
+        // 外部 forward 张量按计划顺序喂入(firing 节点优先用 forward_inputs, 与 legacy 一致)
+        std::vector<Tensor> fwd_tensors;
+        fwd_tensors.reserve(plan.fwd_plan.size());
+        for (const auto& [i, j] : plan.fwd_plan) {
+            if (i == 0 && !forward_inputs.empty() && j < forward_inputs.size()) {
+                fwd_tensors.push_back(forward_inputs[j]);
+            } else {
+                fwd_tensors.push_back(chain[i]->getInputs()[j]);
+            }
+        }
+        auto result = registry.tryExecuteBackward(spec.key, grad, fwd_tensors);
+        if (result.has_value() && result->size() == plan.total_outputs) {
+            // 按 slot_map 拆给链上节点(别名槽共享 → 浅拷贝, 与 legacy pending 语义一致)
+            std::vector<Tensor> firing_out;
+            std::vector<std::pair<const ::Node*, std::vector<Tensor>>> pending_fill;
+            for (size_t i = 0; i < chain.size(); ++i) {
+                const size_t m = chain[i]->getInputs().size();
+                std::vector<Tensor> gs;
+                gs.reserve(m);
+                for (size_t j = 0; j < m; ++j) {
+                    const int slot = plan.slot_map[i][j];
+                    if (slot < 0 || static_cast<size_t>(slot) >= plan.total_outputs) {
+                        return std::nullopt;   // 计划与 kernel 不匹配(防御, 负缓存语义)
+                    }
+                    gs.push_back((*result)[slot]);
+                }
+                if (i == 0) firing_out = std::move(gs);
+                else pending_fill.emplace_back(chain[i], std::move(gs));
+            }
+            {
+                std::unique_lock<std::shared_mutex> lock(intercepted_mutex_);
+                for (auto& [n, gs] : pending_fill) {
+                    pending_mimo_intercepted_[n] = std::move(gs);
+                }
+            }
+            {
+                std::lock_guard<std::mutex> slock(stats_mutex_);
+                mimo_hit_count_++;
+            }
+            return firing_out;
+        }
+        // 负缓存语义(§4.97 批C): 已有内核但执行失败 → 不重编译, 落 nullopt 回退 eager
+        return std::nullopt;
+    }
+
+    // ---- miss → 异步编译 ----
+    compileGenericChainMIMOAsync(std::move(spec));
+    {
+        std::lock_guard<std::mutex> slock(stats_mutex_);
+        mimo_miss_count_++;
+    }
+    return std::nullopt;
+}
+
+void C3BackwardCapture::compileGenericChainMIMOAsync(GenericChainSpec spec) {
+    {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        if (pending_compiles_.find(spec.key) != pending_compiles_.end()) return;
+        pending_compiles_[spec.key] = true;
+    }
+    {
+        std::lock_guard<std::mutex> slock(stats_mutex_);
+        mimo_compile_count_++;
+    }
+    if (!taskStarted()) {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        pending_compiles_.erase(spec.key);
+        return;
+    }
+    try {
+    std::thread([this, spec = std::move(spec)]() {
+        struct TaskGuard { C3BackwardCapture* self; ~TaskGuard() { self->taskFinished(); } } guard{this};
+        try {
+            const size_t k = spec.types.size();
+
+            // ---- 逐节点逐输入构建子图; 恒等(Add 同形)不建图, 以别名槽共享 ----
+            std::vector<TensorDesc> gdesc(k);
+            gdesc[0] = spec.grad_desc;
+            std::vector<Graph> subgraphs;
+            std::vector<std::vector<size_t>> fwd_map_of;            // 每子图 fwd_input_map
+            std::vector<std::pair<size_t, size_t>> sub_owner;      // 子图 → (节点, 输入)
+            std::vector<std::vector<int>> slot_map(k);             // 每节点每输入 → 输出槽(-1 别名未解析)
+            for (size_t i = 0; i < k; ++i) {
+                const size_t m = spec.input_descs[i].size();
+                slot_map[i].assign(m, -1);
+                const bool is_add = nodeTypeIs(spec.types[i], "AddNode");
+                for (size_t j = 0; j < m; ++j) {
+                    if (is_add && !needsSumReduce(gdesc[i].shape, spec.input_descs[i][j].shape)) {
+                        // 恒等透传: grad(i,j) == 流入节点 i 的 grad 张量
+                        if (i == 0) {
+                            // firing 节点(ReLU)不可能命中; 防御性放弃整链
+                            std::lock_guard<std::mutex> lock(pending_mutex_);
+                            pending_compiles_.erase(spec.key);
+                            return;
+                        }
+                        slot_map[i][j] = slot_map[i - 1][spec.edge_input[i - 1]];
+                        if (slot_map[i][j] < 0) {   // 上游边也是别名且未解析(防御)
+                            std::lock_guard<std::mutex> lock(pending_mutex_);
+                            pending_compiles_.erase(spec.key);
+                            return;
+                        }
+                        continue;
+                    }
+                    auto bg = buildBackwardGraphForTypeAndIndex(
+                        spec.types[i], j, gdesc[i], spec.input_descs[i]);
+                    if (!bg.has_value() || bg->first.outputs().empty()) {
+                        // 结构不支持 → 放弃编译(执行侧回退 eager)
+                        std::lock_guard<std::mutex> lock(pending_mutex_);
+                        pending_compiles_.erase(spec.key);
+                        return;
+                    }
+                    slot_map[i][j] = static_cast<int>(subgraphs.size());
+                    subgraphs.push_back(std::move(bg->first));
+                    fwd_map_of.push_back(bg->second);
+                    sub_owner.push_back({i, j});
+                }
+                // 递推下一节点 grad desc: 链边输出(别名时形状透传)
+                if (i + 1 < k) {
+                    const int e = spec.edge_input[i];
+                    const int sl = (e >= 0) ? slot_map[i][static_cast<size_t>(e)] : -1;
+                    if (sl >= 0 && static_cast<size_t>(sl) < subgraphs.size()) {
+                        gdesc[i + 1] = subgraphs[sl].node(subgraphs[sl].outputs()[0]).out_desc;
+                    } else {
+                        gdesc[i + 1] = gdesc[i];
+                    }
+                }
+            }
+
+            // ---- 拓扑缝合: 每链边, 上游边输出 → 下一节点全部已建子图的 grad 输入 ----
+            MergeSpec mspec;
+            for (size_t i = 0; i + 1 < k; ++i) {
+                const int e = spec.edge_input[i];
+                if (e < 0) continue;
+                const int src = slot_map[i][static_cast<size_t>(e)];
+                if (src < 0) continue;
+                for (size_t j = 0; j < spec.input_descs[i + 1].size(); ++j) {
+                    const int dst = slot_map[i + 1][j];
+                    if (dst < 0) continue;   // 别名无子图, 不需要 grad 输入链接
+                    // 槽位归属校验: 别名槽指向他处(其 owner 非本节点本输入), 不建链
+                    if (sub_owner[static_cast<size_t>(dst)] !=
+                        std::pair<size_t, size_t>{i + 1, j}) continue;
+                    mspec.links.push_back(MergeLink{static_cast<size_t>(src), 0,
+                                                    static_cast<size_t>(dst), 0});
+                }
+            }
+            MergedGraphInfo unified = GraphMerger::merge(subgraphs, mspec);
+            Graph fused_graph = std::move(unified.graph);
+            fused_graph.clearOutputs();
+            for (size_t s = 0; s < subgraphs.size(); ++s) {
+                fused_graph.markOutput(unified.output_remap[s][0]);
+            }
+
+            // ---- 外部 fwd 张量顺序计划(子图声明序 × fwd_map) ----
+            std::vector<std::pair<size_t, size_t>> fwd_plan;
+            for (size_t s = 0; s < subgraphs.size(); ++s) {
+                for (size_t f : fwd_map_of[s]) {
+                    fwd_plan.push_back({sub_owner[s].first, f});
+                }
+            }
+
+            CompileOptions opts;
+            opts.backend = C3Backend::MLIR;
+            opts.enable_fusion = true;
+
+            // [G3 接管 + 校验] 与 legacy 同口径: 规划只算一次, 接管与影子共用
+            const bool need_plan = g3TakeoverEnabled() || plannerShadowEnabled() ||
+                                   std::getenv("C3_PLANNER_DIAG") != nullptr;
+            MimoPartition mp;
+            if (need_plan) mp = computeMimoPartition(fused_graph);
+
+            std::shared_ptr<CompiledKernel> kernel;
+            size_t actual_kernels = 1;
+            if (g3TakeoverEnabled())
+                kernel = tryG3TakeoverKernel(fused_graph, mp.subs, opts, "GEN-MIMO", &actual_kernels,
+                                             mp.plan.region_metric.merged);
+            if (!kernel) kernel = C3Engine::getInstance().compile(fused_graph, opts);
+            if (need_plan)
+                diagnosePlannerReconcile(fused_graph, mp.plan, mp.policy, actual_kernels, "GEN-MIMO");
+
+            // ---- 先写执行计划, 后装 kernel(偏序: 执行侧命中 kernel ⇒ 计划必在) ----
+            GenericExecPlan plan;
+            plan.total_outputs = subgraphs.size();
+            const size_t kFwdPlan = fwd_plan.size();
+            plan.fwd_plan = std::move(fwd_plan);
+            plan.slot_map = std::move(slot_map);
+            {
+                std::lock_guard<std::mutex> lock(stats_mutex_);
+                generic_exec_plan_cache_[spec.key] = std::move(plan);
+            }
+
+            if (kernel) {
+                // 防御校验: 外部输入 = grad + 计划张量数(与 legacy FFN 的 ext_ids 校验同哲学)
+                const auto& ext_ids = unified.external_input_ids;
+                const size_t kExpect = 1 + kFwdPlan;
+                if (ext_ids.size() != kExpect) {
+                    fprintf(stderr,
+                            "[GEN-MIMO-COMPILE-ERR] key=%s external input count=%zu (expect %zu) — 结构变化, 不注册\n",
+                            spec.key.c_str(), ext_ids.size(), kExpect);
+                } else {
+                    std::vector<size_t> fwd_map_id(kFwdPlan);
+                    for (size_t i = 0; i < fwd_map_id.size(); ++i) fwd_map_id[i] = i;
+                    C3KernelRegistry::getInstance().installBackward(
+                        spec.key, kernel, spec.grad_desc.shape, spec.grad_desc.shape,
+                        fwd_map_id, kExpect);
+                    #ifdef CT_DEBUG
+                    std::cerr << "[GEN-MIMO-COMPILE-SUCCESS] key=" << spec.key
+                              << " chain=" << k << " outputs=" << subgraphs.size() << std::endl;
+                    #endif
+                }
+            }
+        } catch (const std::exception& e) {
+            static std::mutex err_mu;
+            std::lock_guard<std::mutex> ek(err_mu);
+            static std::hash<std::string> h;
+            static std::unordered_set<size_t> seen;
+            size_t kh = h(std::string(e.what()) + "|" + spec.key);
+            if (seen.insert(kh).second) {
+                fprintf(stderr, "[GEN-MIMO-COMPILE-ERR] key=%s err=%s\n", spec.key.c_str(), e.what());
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(pending_mutex_);
+            pending_compiles_.erase(spec.key);
+        }
+    }).detach();
+    } catch (const std::system_error&) {
+        taskFinished();
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        pending_compiles_.erase(spec.key);
+        return;
+    }
 }
 
 void C3BackwardCapture::compileUnifiedMIMOBackwardAsync(

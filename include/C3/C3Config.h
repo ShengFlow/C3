@@ -206,6 +206,20 @@ inline bool mimoLegacyEnabled() {
     return enabled;
 }
 
+/// 查询是否启用通用链式识别器(手写 MIMO 退场阶段二, ADR-012)。
+/// @details C3_MIMO_GENERIC=1 时, tryExecuteUnifiedMIMOBackward 先试通用线性链捕获
+///          (真实拓扑走链 + 通用逐节点反向构建器 + 拓扑缝合 → planner/G3 接管),
+///          miss 时透传给手写识别器(FC/FFN)继续。默认关闭 → 默认行为零变化。
+/// @note 通用路径与手写路径层叠共存: 通用在前、手写在后, 各自 nullopt 透传。
+inline bool mimoGenericEnabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("C3_MIMO_GENERIC");
+        if (v == nullptr) return false;  // 默认关(影子/浸泡阶段)
+        return v[0] == '1';
+    }();
+    return enabled;
+}
+
 } // namespace c3
 } // namespace ct
 

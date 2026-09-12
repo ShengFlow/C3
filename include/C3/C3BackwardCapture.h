@@ -154,6 +154,35 @@ public:
         const TensorDesc& wu_desc, const TensorDesc& wd_desc, const TensorDesc& g_desc,
         const TensorDesc& u_desc, const TensorDesc& h_desc, const TensorDesc& gp_desc);
 
+    // ======================= 通用链式识别器 (手写 MIMO 退场阶段二, ADR-012) =======================
+    // 线性链捕获: firing 节点(单输入, 白名单)沿真实拓扑向上游走链(白名单 {ReLU,Add,MatMul},
+    // 单消费者守卫, 含 MatMul 即层边界), 通用逐节点反向构建器 + 拓扑缝合 → planner/G3 接管。
+    // 恒等梯度(Add 同形输入)不建子图, 以别名链接复用上游 grad 输出槽(规避无算力图 worker 缺陷)。
+    // 默认关闭(C3_MIMO_GENERIC=1 启用); 位于手写识别器之前, miss 即透传。
+
+    /**
+     * @brief 通用线性链反向融合的尝试执行
+     * @details 命中已编译 kernel 则执行并把链上其余节点梯度写入 pending_mimo_intercepted_,
+     *          返回 firing 节点的梯度向量; 未命中触发异步编译后返回 nullopt。
+     */
+    std::optional<std::vector<Tensor>> tryExecuteGenericChainMIMO(
+        const ::Node* node, const Tensor& grad,
+        const std::vector<Tensor>& forward_inputs);
+
+    /** @brief 通用链编译结构快照(值语义, 编译线程零 Node* 引用) */
+    struct GenericChainSpec {
+        std::string key;                              ///< registry 查找 key(与执行侧一致)
+        std::vector<std::string> types;               ///< 链上节点类型, index 0 = firing 节点
+        std::vector<std::vector<TensorDesc>> input_descs;  ///< 每节点 forward 输入 desc
+        std::vector<int> edge_input;                  ///< 节点 i 的链边输入索引(指向 i+1); 尾节点 -1
+        TensorDesc grad_desc;                         ///< 外部 grad desc(链最下游输入)
+    };
+
+    /**
+     * @brief 通用线性链反向融合异步编译(值语义, 只依赖 spec)
+     */
+    void compileGenericChainMIMOAsync(GenericChainSpec spec);
+
     /**
      * @brief 为指定输入索引异步编译 backward 单输出 kernel
      * @param node 当前 autograd 节点
@@ -688,6 +717,17 @@ private:
     // stats_mutex_ 保护；在 C3_PLANNER_DIAG=1 诊断与 C3_PLANNER_SHADOW 影子两条路径内累加(§4.97)
     size_t reconcile_total_ = 0;    ///< planner vs MIMO 对拍总次数
     size_t reconcile_matched_ = 0;  ///< 判定一致次数
+
+    // ========== [ADR-012 通用链式识别器] 执行计划缓存 ==========
+    // key → 执行计划: kernel 输出总数 + 外部 forward 张量顺序 + 每节点每输入的输出槽映射
+    // (别名槽共享上游 grad 输出槽)。编译线程在 install kernel 前写入 →
+    // 执行侧命中 kernel 时计划必已存在(偏序消除竞态)。stats_mutex_ 保护。
+    struct GenericExecPlan {
+        size_t total_outputs = 0;
+        std::vector<std::pair<size_t, size_t>> fwd_plan;  ///< 外部张量顺序: (链节点索引, 输入索引)
+        std::vector<std::vector<int>> slot_map;           ///< 每节点每输入 → kernel 输出槽(别名共享槽)
+    };
+    std::unordered_map<std::string, GenericExecPlan> generic_exec_plan_cache_;
 };
 
 } // namespace c3
