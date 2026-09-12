@@ -145,6 +145,18 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteBackward(
         return std::nullopt;
     }
 
+    // [Fix 2026-09-12 leaky_relu 梯度断链] 非 supportsNodeType 名单的单输入节点在**入口**短路:
+    // 此前 LReLU 不在名单, 但 MIMO/phase1 的 registry 命中(历史编译/注入残留)仍会走 C3
+    // 反向且产物数值错误(梯度静默错值, test_autograd_v2 5 项 FAIL 即此)。名单之外绝不
+    // 尝试任何 C3 backward 路径(MIMO/fused/phase1)。
+    {
+        const size_t _n = forward_inputs.empty() ? node->getInputs().size() : forward_inputs.size();
+        const std::string _tn = std::string(typeid(*node).name());
+        if (_n == 1 && !supportsNodeType(_tn)) {
+            return std::nullopt;
+        }
+    }
+
     // ===== 统一 MIMO 融合反向 (梯度传导 + 激活求导 + 权重收缩) 🌟 =====
     // [2026-08-31 恢复] 去掉 C3_ENABLE_MIMO_BACKWARD opt-in 门控，MIMO 默认开启
     //   （历史黄金态默认开：mimo_compile=2, hit=4678/epoch, MIMO bwd ~57ms/ep）。
@@ -723,19 +735,30 @@ std::optional<C3BackwardCapture::BackwardGraph> C3BackwardCapture::buildBackward
     return buildBackwardGraphForTypeAndIndex(node_type, 0, grad_desc, input_descs);
 }
 
+// [Fix 2026-09-12] 完整类名精确匹配: typeid().name() 形如 "9LReLUNode"(数字长度前缀
+// + 类名)。此前子串 find("ReLUNode") 与后缀匹配都命中 LReLUNode —— 因为 "LReLUNode"
+// 本身就以 "ReLUNode" 结尾(L 是前缀)。这是 leaky_relu 梯度断链的根因: LReLU 被误判
+// 支持, 计入融合序列且 phase1 命中错误内核, 梯度静默错值(test_autograd_v2 5 项 FAIL)。
+static bool nodeTypeIs(const std::string& node_type, const char* cls) {
+    const char* p = node_type.c_str();
+    size_t i = 0;
+    while (p[i] >= '0' && p[i] <= '9') ++i;  // 剥掉数字长度前缀
+    return std::strcmp(p + i, cls) == 0;
+}
+
 bool C3BackwardCapture::supportsNodeType(const std::string& node_type) {
     // ========== 只支持单输入单输出（unary element-wise）节点的反向编译/融合 ==========
     // [Fix 2026-09-05 苏璃珞] 仅返回 buildBackwardGraphForTypeAndIndex 确有 case 的类型，
     //   避免名义支持(返回 true)却编不出 kernel 的脱节。此前 GELU/LReLU/Sin/Cos/Abs/Min/Max
     //   被列在此却无对应 builder case(一律 nullopt), 只会进融合序列统计、永不产出 kernel。
     //   多输入单节点 kernel(Add/Sub/Mul/MatMul/Softmax 等)仍按注释回退 eager(正确性优先)。
-    return node_type.find("ReLUNode") != std::string::npos ||
-           node_type.find("TanhNode") != std::string::npos ||
-           node_type.find("NegNode") != std::string::npos ||
-           node_type.find("ExpNode") != std::string::npos ||
-           node_type.find("LogNode") != std::string::npos ||
+    return nodeTypeIs(node_type, "ReLUNode") ||
+           nodeTypeIs(node_type, "TanhNode") ||
+           nodeTypeIs(node_type, "NegNode") ||
+           nodeTypeIs(node_type, "ExpNode") ||
+           nodeTypeIs(node_type, "LogNode") ||
            // CrossEntropy: dispatch 有 case(630), 但 tryExecuteBackward 对 CE 短路 → 实际不可达。
-           node_type.find("CrossEntropyNode") != std::string::npos;
+           nodeTypeIs(node_type, "CrossEntropyNode");
 }
 
 C3BackwardCapture::Stats C3BackwardCapture::getStats() const {
