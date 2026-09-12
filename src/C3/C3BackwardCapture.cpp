@@ -1164,6 +1164,10 @@ C3BackwardCapture::BackwardGraph C3BackwardCapture::buildAddBackwardGraph(
     const TensorDesc& target = (input_index == 0) ? lhs_desc : rhs_desc;
     if (needsSumReduce(grad_desc.shape, target.shape)) {
         int axis = computeReduceAxis(grad_desc.shape, target.shape);
+        if (axis == -2) {
+            // [Fix §4.95 P2] 多轴广播 reduce 不支持 → 空图回退 eager
+            return {Graph{}, {}};
+        }
         size_t reduced = g.addNode(
             SumReduceNode{grad_desc, axis},
             {grad_in},
@@ -1991,6 +1995,9 @@ int C3BackwardCapture::computeReduceAxis(
     size_t target_rank = target_shape.size();
 
     if (grad_rank > target_rank) {
+        // [Fix §4.95 P2] 多轴多余维度仅 reduce 轴 0 会产出错误形状; 多轴时返回 -2
+        // 哨兵, 调用方回退 eager(此前靠 registry 形状校验护栏兜底)
+        if (grad_rank - target_rank > 1) return -2;
         // 多余的维度需要 reduce
         return 0; // reduce 第 0 维（第一个多余维度）
     }
@@ -2633,6 +2640,14 @@ void C3BackwardCapture::runPartitionABTest(const Graph& fused_graph,
     size_t compared = 0, mismatched = 0, missing = 0, nonfloat = 0, nonfinite = 0;
     std::string missingList;
     double maxDiff = 0.0;
+    // [Fix §4.95 P2] outsA 短于 gouts 时, 未覆盖输出必须计入 missing(此前提前退出
+    // 导致 missing=0, PASS 判定漏检)
+    if (outsA.size() < gouts.size()) {
+        for (size_t i = outsA.size(); i < gouts.size(); ++i) {
+            missing++;
+            missingList += std::to_string(gouts[i]) + ",";
+        }
+    }
     for (size_t i = 0; i < gouts.size() && i < outsA.size(); ++i) {
         auto it = tensorByOrig.find(gouts[i]);
         if (it == tensorByOrig.end()) {
@@ -2834,11 +2849,20 @@ void C3BackwardCapture::compileUnifiedMIMOBackwardAsync(
             if (need_plan)
                 diagnosePlannerReconcile(fused_graph, mp.plan, mp.policy, actual_kernels, "FC-MIMO");
             if (kernel) {
+                // [Fix §4.95 P2] 外部输入数硬编码 4 的防御校验(FFN 侧有 ext_ids==10
+                // 校验, FC 侧此前缺失): 不匹配时跳过注册, 回退 eager 而非静默错喂
+                if (fused_graph.inputCount() != 4) {
+                    #ifdef CT_DEBUG
+                    std::cerr << "[FC-MIMO] inputCount=" << fused_graph.inputCount()
+                              << " != 4, skip registry install (fallback eager)" << std::endl;
+                    #endif
+                } else {
                 // 注册到 C3KernelRegistry 中，使用 {0, 1, 2} 对应 inputs 中的 z, X, W
                 C3KernelRegistry::getInstance().installBackward(
                     mimo_key, kernel, grad_desc.shape, grad_desc.shape,
                     {0, 1, 2}, 4
                 );
+                }
                 #ifdef CT_DEBUG
                 std::cerr << "[MIMO-COMPILE-SUCCESS] compiled unified backward layer successfully! key=" << mimo_key << std::endl;
                 #endif
