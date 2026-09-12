@@ -154,28 +154,30 @@ public:
         const TensorDesc& wu_desc, const TensorDesc& wd_desc, const TensorDesc& g_desc,
         const TensorDesc& u_desc, const TensorDesc& h_desc, const TensorDesc& gp_desc);
 
-    // ======================= 通用链式识别器 (手写 MIMO 退场阶段二, ADR-012) =======================
-    // 线性链捕获: firing 节点(单输入, 白名单)沿真实拓扑向上游走链(白名单 {ReLU,Add,MatMul},
-    // 单消费者守卫, 含 MatMul 即层边界), 通用逐节点反向构建器 + 拓扑缝合 → planner/G3 接管。
-    // 恒等梯度(Add 同形输入)不建子图, 以别名链接复用上游 grad 输出槽(规避无算力图 worker 缺陷)。
+    // ======================= 通用树式识别器 (手写 MIMO 退场阶段二, ADR-012) =======================
+    // 树捕获: firing 节点(ReLU 单输入 / MatMul 双输入, 白名单)沿真实拓扑 BFS 走树
+    // (白名单 {ReLU,Add,MatMul,SiLU,Mul}, 单消费者守卫, 除 firing 外 MatMul 为叶子即层边界),
+    // 通用逐节点反向构建器 + 拓扑缝合 → planner/G3 接管。
+    // 恒等梯度(Add 同形输入)不建子图, 以别名槽共享上游 grad 输出(规避无算力图 worker 缺陷)。
     // 默认关闭(C3_MIMO_GENERIC=1 启用); 位于手写识别器之前, miss 即透传。
 
     /**
-     * @brief 通用线性链反向融合的尝试执行
-     * @details 命中已编译 kernel 则执行并把链上其余节点梯度写入 pending_mimo_intercepted_,
+     * @brief 通用树反向融合的尝试执行
+     * @details 命中已编译 kernel 则执行并把树上其余节点梯度写入 pending_mimo_intercepted_,
      *          返回 firing 节点的梯度向量; 未命中触发异步编译后返回 nullopt。
      */
     std::optional<std::vector<Tensor>> tryExecuteGenericChainMIMO(
         const ::Node* node, const Tensor& grad,
         const std::vector<Tensor>& forward_inputs);
 
-    /** @brief 通用链编译结构快照(值语义, 编译线程零 Node* 引用) */
+    /** @brief 通用树编译结构快照(值语义, 编译线程零 Node* 引用) */
     struct GenericChainSpec {
         std::string key;                              ///< registry 查找 key(与执行侧一致)
-        std::vector<std::string> types;               ///< 链上节点类型, index 0 = firing 节点
+        std::vector<std::string> types;               ///< 树节点类型, index 0 = firing 节点(BFS 加入序)
         std::vector<std::vector<TensorDesc>> input_descs;  ///< 每节点 forward 输入 desc
-        std::vector<int> edge_input;                  ///< 节点 i 的链边输入索引(指向 i+1); 尾节点 -1
-        TensorDesc grad_desc;                         ///< 外部 grad desc(链最下游输入)
+        std::vector<int> parent_idx;                  ///< 节点 i 的下游父节点索引(firing 根 = -1)
+        std::vector<int> parent_edge;                 ///< 父节点消费节点 i 输出的输入索引(根 = -1)
+        TensorDesc grad_desc;                         ///< 外部 grad desc(树最下游输入)
     };
 
     /**

@@ -772,12 +772,15 @@ static bool nodeTypeIs(const std::string& node_type, const char* cls) {
     return std::strcmp(p + i, cls) == 0;
 }
 
-// [ADR-012 ④ 阶段二] 通用链白名单(v1): ReLU/Add/MatMul 线性链(FC 结构)。
-// Tanh/Sigmoid 待 tanh 反向图执行层专项修复后纳入; 树拓扑(FFN)为 v2。
+// [ADR-012 ④ 阶段二] 通用树白名单(v2): ReLU/Add/MatMul/SiLU/Mul。
+// v1 线性链 {ReLU,Add,MatMul}(FC); v2 树拓扑加 SiLU/Mul(FFN SwiGLU)。
+// Tanh/Sigmoid 待 tanh 反向图执行层专项修复后纳入。
 static bool isGenericChainNode(const std::string& node_type) {
     return nodeTypeIs(node_type, "ReLUNode") ||
            nodeTypeIs(node_type, "AddNode") ||
-           nodeTypeIs(node_type, "MatMulNode");
+           nodeTypeIs(node_type, "MatMulNode") ||
+           nodeTypeIs(node_type, "SiLUNode") ||
+           nodeTypeIs(node_type, "MulNode");
 }
 
 bool C3BackwardCapture::supportsNodeType(const std::string& node_type) {
@@ -2844,12 +2847,12 @@ static std::shared_ptr<CompiledKernel> tryG3TakeoverKernel(
     return orch;
 }
 
-// ======================= [ADR-012 ④ 阶段二] 通用链式识别器 =======================
-// 用真实拓扑走链 + 通用逐节点反向构建器 + 拓扑缝合替换手写 typeid 识别 + 手写图构建:
-//   - 走链: firing 节点(单输入, 白名单)沿 getUpStreamNodes() 向上游延伸;
-//     白名单 {ReLU,Add,MatMul}, 单消费者守卫(getDownstreamCount==1),
-//     含 MatMul 即层边界(不跨层), 链长 ≤5, 捕获须含 MatMul。
-//   - 恒等梯度(Add 同形输入)不建子图(规避无算力图 worker 缺陷), 以别名共享上游
+// ======================= [ADR-012 ④ 阶段二] 通用树式识别器 =======================
+// 用真实拓扑走树 + 通用逐节点反向构建器 + 拓扑缝合替换手写 typeid 识别 + 手写图构建:
+//   - 走树: firing 节点(ReLU 单输入 / MatMul 双输入, 白名单)沿 getUpStreamNodes()
+//     BFS 延伸; 白名单 {ReLU,Add,MatMul,SiLU,Mul}, 单消费者守卫(getDownstreamCount==1),
+//     除 firing 外 MatMul 为叶子(层边界, 不跨层), 树节点数 ≤8, 捕获须含 MatMul。
+//   - 恒等梯度(Add 同形输入)不建子图(规避无算力图 worker 缺陷), 以别名共享父边
 //     grad 输出槽 —— 与 legacy FC「grad_z 直连 mm_w/mm_x/add_b」结构一致。
 //   - 编译线程只收值语义 spec(零 Node* 引用, 沿用 MIMO pending 生命周期模式)。
 //   - planner/G3 接管与 legacy 同口径(computeMimoPartition + tryG3TakeoverKernel)。
@@ -2858,47 +2861,50 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteGenericChainMIMO
     const ::Node* node, const Tensor& grad,
     const std::vector<Tensor>& forward_inputs)
 {
-    // ---- 入口守卫: firing 节点单输入 + 白名单(v1: ReLU) ----
-    if (node->getInputs().size() != 1) return std::nullopt;
+    // ---- 入口守卫: (单输入 ReLU) 或 (双输入 MatMul) ----
     const std::string t0 = std::string(typeid(*node).name());
-    if (!nodeTypeIs(t0, "ReLUNode")) return std::nullopt;
+    const bool entry_relu = node->getInputs().size() == 1 && nodeTypeIs(t0, "ReLUNode");
+    const bool entry_mm = node->getInputs().size() == 2 && nodeTypeIs(t0, "MatMulNode");
+    if (!entry_relu && !entry_mm) return std::nullopt;
 
-    // ---- 真实拓扑走链 ----
-    constexpr size_t kMaxChain = 5;
-    std::vector<const ::Node*> chain;   // index 0 = firing
-    std::vector<int> edge_input;        // 节点 i 的链边输入索引(指向 chain[i+1])
-    chain.push_back(node);
-    const ::Node* cur = node;
-    while (chain.size() < kMaxChain) {
+    // ---- 真实拓扑走树(BFS): 白名单上游 + 单消费者守卫; 除 firing 外 MatMul 为叶子(层边界) ----
+    constexpr size_t kMaxNodes = 8;
+    std::vector<const ::Node*> nodes;    // index 0 = firing, BFS 加入序
+    std::vector<int> parent_idx;         // 节点 i 的下游父节点索引(firing = -1)
+    std::vector<int> parent_edge;        // 父节点消费节点 i 输出的输入索引
+    nodes.push_back(node);
+    parent_idx.push_back(-1);
+    parent_edge.push_back(-1);
+    for (size_t qi = 0; qi < nodes.size() && nodes.size() < kMaxNodes; ++qi) {
+        const ::Node* cur = nodes[qi];
+        // 除 firing 外, MatMul 为叶子: 不延伸其上游(防跨层)
+        if (nodeTypeIs(std::string(typeid(*cur).name()), "MatMulNode") && qi != 0) continue;
         const auto& ups = cur->getUpStreamNodes();
         // 索引对齐守卫(DataCore::registerNode 按输入序 push, 理论上恒成立; 防未来路径破坏)
-        if (ups.size() != cur->getInputs().size()) break;
-        const ::Node* next = nullptr;
-        int next_j = -1;
+        if (ups.size() != cur->getInputs().size()) continue;
         for (size_t j = 0; j < ups.size(); ++j) {
             if (!ups[j]) continue;                              // 外部输入(无 grad)
-            const std::string tn = std::string(typeid(*ups[j].get()).name());
-            if (!isGenericChainNode(tn)) continue;              // 外部(非白名单, 如 GradAccumulator)
-            if (next != nullptr) return std::nullopt;           // 分叉(两个白名单上游) → v1 线性链不支持
-            next = ups[j].get();
-            next_j = static_cast<int>(j);
+            const ::Node* u = ups[j].get();
+            if (!isGenericChainNode(std::string(typeid(*u).name()))) continue;  // 外部(非白名单)
+            // 单消费者守卫: u 的输出必须只被 cur 消费(否则 pending 只含一份 grad 会丢贡献)
+            if (u->getDownstreamCount() != 1) continue;
+            // 重复入树防护(如同一张量被同一节点两输入引用): 已入树则跳过
+            bool dup = false;
+            for (const ::Node* n : nodes) { if (n == u) { dup = true; break; } }
+            if (dup) continue;
+            parent_idx.push_back(static_cast<int>(qi));
+            parent_edge.push_back(static_cast<int>(j));
+            nodes.push_back(u);
         }
-        if (!next) break;
-        // 单消费者守卫: next 的输出必须只被 cur 消费(否则 pending 只含一份 grad 会丢贡献)
-        if (next->getDownstreamCount() != 1) break;
-        edge_input.push_back(next_j);
-        chain.push_back(next);
-        // 含 MatMul 即层边界(不跨层捕获)
-        if (nodeTypeIs(std::string(typeid(*next).name()), "MatMulNode")) break;
-        cur = next;
     }
 
-    // ---- 捕获条件: 链长 ≥2 且含 MatMul ----
-    bool has_mm = false;
-    for (const ::Node* c : chain) {
+    // ---- 捕获条件: 树含 ≥2 节点且含 MatMul ----
+    bool has_mm = entry_mm;
+    for (const ::Node* c : nodes) {
         if (nodeTypeIs(std::string(typeid(*c).name()), "MatMulNode")) { has_mm = true; break; }
     }
     if (!has_mm) return std::nullopt;
+    if (nodes.size() < 2) return std::nullopt;
 
     // ---- spec + key(与编译侧严格一致) ----
     GenericChainSpec spec;
@@ -2906,11 +2912,11 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteGenericChainMIMO
     std::stringstream ss;
     ss << "mimo_generic|g:";
     for (auto s : grad.sizes()) ss << s << ",";
-    spec.types.reserve(chain.size());
-    spec.input_descs.reserve(chain.size());
-    for (size_t i = 0; i < chain.size(); ++i) {
-        const auto& ins = chain[i]->getInputs();
-        spec.types.push_back(std::string(typeid(*chain[i]).name()));
+    spec.types.reserve(nodes.size());
+    spec.input_descs.reserve(nodes.size());
+    for (size_t i = 0; i < nodes.size(); ++i) {
+        const auto& ins = nodes[i]->getInputs();
+        spec.types.push_back(std::string(typeid(*nodes[i]).name()));
         std::vector<TensorDesc> ds;
         ds.reserve(ins.size());
         ss << "|n" << i << ":" << spec.types[i] << "|in:";
@@ -2921,8 +2927,8 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteGenericChainMIMO
         }
         spec.input_descs.push_back(std::move(ds));
     }
-    spec.edge_input = std::move(edge_input);
-    spec.edge_input.resize(chain.size(), -1);   // 尾节点无链边
+    spec.parent_idx = std::move(parent_idx);
+    spec.parent_edge = std::move(parent_edge);
     spec.key = ss.str();
 
     // ---- 执行段 ----
@@ -2943,7 +2949,7 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteGenericChainMIMO
             if (i == 0 && !forward_inputs.empty() && j < forward_inputs.size()) {
                 fwd_tensors.push_back(forward_inputs[j]);
             } else {
-                fwd_tensors.push_back(chain[i]->getInputs()[j]);
+                fwd_tensors.push_back(nodes[i]->getInputs()[j]);
             }
         }
         auto result = registry.tryExecuteBackward(spec.key, grad, fwd_tensors);
@@ -2951,8 +2957,8 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteGenericChainMIMO
             // 按 slot_map 拆给链上节点(别名槽共享 → 浅拷贝, 与 legacy pending 语义一致)
             std::vector<Tensor> firing_out;
             std::vector<std::pair<const ::Node*, std::vector<Tensor>>> pending_fill;
-            for (size_t i = 0; i < chain.size(); ++i) {
-                const size_t m = chain[i]->getInputs().size();
+            for (size_t i = 0; i < nodes.size(); ++i) {
+                const size_t m = nodes[i]->getInputs().size();
                 std::vector<Tensor> gs;
                 gs.reserve(m);
                 for (size_t j = 0; j < m; ++j) {
@@ -2963,7 +2969,7 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteGenericChainMIMO
                     gs.push_back((*result)[slot]);
                 }
                 if (i == 0) firing_out = std::move(gs);
-                else pending_fill.emplace_back(chain[i], std::move(gs));
+                else pending_fill.emplace_back(nodes[i], std::move(gs));
             }
             {
                 std::unique_lock<std::shared_mutex> lock(intercepted_mutex_);
@@ -3011,28 +3017,92 @@ void C3BackwardCapture::compileGenericChainMIMOAsync(GenericChainSpec spec) {
         try {
             const size_t k = spec.types.size();
 
-            // ---- 逐节点逐输入构建子图; 恒等(Add 同形)不建图, 以别名槽共享 ----
+            // ---- 逐节点逐输入构建子图(BFS 序: 父先于子); 恒等(Add 同形)不建图, 以别名槽共享 ----
+            // firing 节点多输入(MatMul 双输入)建**单图双输出**子图(共享一个 grad 外部输入)——
+            // 否则两子图各声明一个 grad 外部输入, GraphMerger 不去重 → 外部输入数 +1,
+            // registry 喂入约定([grad]+fwd)无法表达第二 grad 槽。与 legacy FFN S0(buildMMDual)同构。
             std::vector<TensorDesc> gdesc(k);
             gdesc[0] = spec.grad_desc;
             std::vector<Graph> subgraphs;
-            std::vector<std::vector<size_t>> fwd_map_of;            // 每子图 fwd_input_map
-            std::vector<std::pair<size_t, size_t>> sub_owner;      // 子图 → (节点, 输入)
-            std::vector<std::vector<int>> slot_map(k);             // 每节点每输入 → 输出槽(-1 别名未解析)
+            std::vector<std::vector<size_t>> fwd_map_of;            // 每子图 fwd 输入索引(节点输入序)
+            std::vector<std::pair<size_t, size_t>> sub_owner;      // 子图 → (所属节点, 首输入)
+            std::vector<std::vector<int>> slot_map(k);             // 每节点每输入 → 全局输出槽(-1 别名)
+            std::vector<std::pair<size_t, size_t>> slot_owner;     // 全局槽 → (节点, 输入)
+            std::vector<size_t> slot_sub;                          // 全局槽 → 子图索引
+            std::vector<size_t> slot_out;                          // 全局槽 → 子图内输出索引
+            size_t out_prefix = 0;                                 // 已分配输出槽数
             for (size_t i = 0; i < k; ++i) {
+                // grad desc 递推: 节点 i 的 grad 来自父的边子图输出(别名时形状透传)
+                if (i > 0) {
+                    const int p = spec.parent_idx[i];
+                    const int pe = spec.parent_edge[i];
+                    if (p < 0 || pe < 0) {   // 防御: 树结构损坏
+                        std::lock_guard<std::mutex> lock(pending_mutex_);
+                        pending_compiles_.erase(spec.key);
+                        return;
+                    }
+                    const int sl = slot_map[p][static_cast<size_t>(pe)];
+                    if (sl >= 0 && static_cast<size_t>(sl) < slot_sub.size()) {
+                        const auto& sg = subgraphs[slot_sub[static_cast<size_t>(sl)]];
+                        gdesc[i] = sg.node(sg.outputs()[slot_out[static_cast<size_t>(sl)]]).out_desc;
+                    } else {
+                        gdesc[i] = gdesc[static_cast<size_t>(p)];
+                    }
+                }
                 const size_t m = spec.input_descs[i].size();
                 slot_map[i].assign(m, -1);
                 const bool is_add = nodeTypeIs(spec.types[i], "AddNode");
+                if (i == 0 && m > 1) {
+                    // firing 多输入: v2 仅支持 MatMul 双输入(单图双输出)
+                    if (!nodeTypeIs(spec.types[i], "MatMulNode") || m != 2) {
+                        std::lock_guard<std::mutex> lock(pending_mutex_);
+                        pending_compiles_.erase(spec.key);
+                        return;
+                    }
+                    const TensorDesc& gd = gdesc[0];
+                    const TensorDesc& a_d = spec.input_descs[0][0];
+                    const TensorDesc& b_d = spec.input_descs[0][1];
+                    Graph g;
+                    size_t grad_in = g.addInput(gd);
+                    size_t b_in = g.addInput(b_d);
+                    TensorDesc bT_d = TensorDesc::fromShape({b_d.shape[1], b_d.shape[0]});
+                    size_t bT = g.addNode(TransposeNode{b_d, 0, 1}, {b_in}, bT_d);
+                    TensorDesc ga_d = TensorDesc::fromShape({gd.shape[0], bT_d.shape[1]});
+                    size_t ga = g.addNode(MatMulNode{gd, bT_d}, {grad_in, bT}, ga_d);
+                    size_t a_in = g.addInput(a_d);
+                    TensorDesc aT_d = TensorDesc::fromShape({a_d.shape[1], a_d.shape[0]});
+                    size_t aT = g.addNode(TransposeNode{a_d, 0, 1}, {a_in}, aT_d);
+                    TensorDesc gb_d = TensorDesc::fromShape({aT_d.shape[0], gd.shape[1]});
+                    size_t gb = g.addNode(MatMulNode{aT_d, gd}, {aT, grad_in}, gb_d);
+                    g.markOutput(ga);
+                    g.markOutput(gb);
+                    slot_map[0][0] = static_cast<int>(out_prefix);
+                    slot_map[0][1] = static_cast<int>(out_prefix + 1);
+                    out_prefix += 2;
+                    subgraphs.push_back(std::move(g));
+                    fwd_map_of.push_back({1, 0});   // 图输入序 [grad, b, a] → 节点输入索引
+                    sub_owner.push_back({0, 0});
+                    slot_owner.push_back({0, 0});
+                    slot_owner.push_back({0, 1});
+                    slot_sub.push_back(0);
+                    slot_sub.push_back(0);
+                    slot_out.push_back(0);
+                    slot_out.push_back(1);
+                    continue;
+                }
                 for (size_t j = 0; j < m; ++j) {
                     if (is_add && !needsSumReduce(gdesc[i].shape, spec.input_descs[i][j].shape)) {
-                        // 恒等透传: grad(i,j) == 流入节点 i 的 grad 张量
+                        // 恒等透传: grad(i,j) == 流入节点 i 的 grad 张量(父边槽)
                         if (i == 0) {
-                            // firing 节点(ReLU)不可能命中; 防御性放弃整链
+                            // firing 节点(ReLU)不可能命中; 防御性放弃整树
                             std::lock_guard<std::mutex> lock(pending_mutex_);
                             pending_compiles_.erase(spec.key);
                             return;
                         }
-                        slot_map[i][j] = slot_map[i - 1][spec.edge_input[i - 1]];
-                        if (slot_map[i][j] < 0) {   // 上游边也是别名且未解析(防御)
+                        slot_map[i][j] =
+                            slot_map[static_cast<size_t>(spec.parent_idx[i])]
+                                    [static_cast<size_t>(spec.parent_edge[i])];
+                        if (slot_map[i][j] < 0) {   // 父边也是别名且未解析(防御)
                             std::lock_guard<std::mutex> lock(pending_mutex_);
                             pending_compiles_.erase(spec.key);
                             return;
@@ -3047,45 +3117,44 @@ void C3BackwardCapture::compileGenericChainMIMOAsync(GenericChainSpec spec) {
                         pending_compiles_.erase(spec.key);
                         return;
                     }
-                    slot_map[i][j] = static_cast<int>(subgraphs.size());
+                    slot_map[i][j] = static_cast<int>(out_prefix);
+                    ++out_prefix;
                     subgraphs.push_back(std::move(bg->first));
                     fwd_map_of.push_back(bg->second);
                     sub_owner.push_back({i, j});
-                }
-                // 递推下一节点 grad desc: 链边输出(别名时形状透传)
-                if (i + 1 < k) {
-                    const int e = spec.edge_input[i];
-                    const int sl = (e >= 0) ? slot_map[i][static_cast<size_t>(e)] : -1;
-                    if (sl >= 0 && static_cast<size_t>(sl) < subgraphs.size()) {
-                        gdesc[i + 1] = subgraphs[sl].node(subgraphs[sl].outputs()[0]).out_desc;
-                    } else {
-                        gdesc[i + 1] = gdesc[i];
-                    }
+                    slot_owner.push_back({i, j});
+                    slot_sub.push_back(subgraphs.size() - 1);
+                    slot_out.push_back(0);
                 }
             }
 
-            // ---- 拓扑缝合: 每链边, 上游边输出 → 下一节点全部已建子图的 grad 输入 ----
+            // ---- 拓扑缝合: 每父子边, 父边输出 → 子节点全部已建子图的 grad 输入 ----
             MergeSpec mspec;
-            for (size_t i = 0; i + 1 < k; ++i) {
-                const int e = spec.edge_input[i];
-                if (e < 0) continue;
-                const int src = slot_map[i][static_cast<size_t>(e)];
+            for (size_t c = 1; c < k; ++c) {
+                const int p = spec.parent_idx[c];
+                const int pe = spec.parent_edge[c];
+                if (p < 0 || pe < 0) continue;
+                const int src = slot_map[static_cast<size_t>(p)][static_cast<size_t>(pe)];
                 if (src < 0) continue;
-                for (size_t j = 0; j < spec.input_descs[i + 1].size(); ++j) {
-                    const int dst = slot_map[i + 1][j];
+                for (size_t j = 0; j < spec.input_descs[c].size(); ++j) {
+                    const int dst = slot_map[c][j];
                     if (dst < 0) continue;   // 别名无子图, 不需要 grad 输入链接
                     // 槽位归属校验: 别名槽指向他处(其 owner 非本节点本输入), 不建链
-                    if (sub_owner[static_cast<size_t>(dst)] !=
-                        std::pair<size_t, size_t>{i + 1, j}) continue;
-                    mspec.links.push_back(MergeLink{static_cast<size_t>(src), 0,
-                                                    static_cast<size_t>(dst), 0});
+                    if (slot_owner[static_cast<size_t>(dst)] !=
+                        std::pair<size_t, size_t>{c, j}) continue;
+                    mspec.links.push_back(MergeLink{slot_sub[static_cast<size_t>(src)],
+                                                    slot_out[static_cast<size_t>(src)],
+                                                    slot_sub[static_cast<size_t>(dst)], 0});
                 }
             }
             MergedGraphInfo unified = GraphMerger::merge(subgraphs, mspec);
             Graph fused_graph = std::move(unified.graph);
             fused_graph.clearOutputs();
             for (size_t s = 0; s < subgraphs.size(); ++s) {
-                fused_graph.markOutput(unified.output_remap[s][0]);
+                const auto& outs = subgraphs[s].outputs();
+                for (size_t o = 0; o < outs.size(); ++o) {
+                    fused_graph.markOutput(unified.output_remap[s][o]);
+                }
             }
 
             // ---- 外部 fwd 张量顺序计划(子图声明序 × fwd_map) ----
@@ -3117,7 +3186,7 @@ void C3BackwardCapture::compileGenericChainMIMOAsync(GenericChainSpec spec) {
 
             // ---- 先写执行计划, 后装 kernel(偏序: 执行侧命中 kernel ⇒ 计划必在) ----
             GenericExecPlan plan;
-            plan.total_outputs = subgraphs.size();
+            plan.total_outputs = out_prefix;   // 全局输出槽数(子图多输出已计入)
             const size_t kFwdPlan = fwd_plan.size();
             plan.fwd_plan = std::move(fwd_plan);
             plan.slot_map = std::move(slot_map);
@@ -3142,7 +3211,7 @@ void C3BackwardCapture::compileGenericChainMIMOAsync(GenericChainSpec spec) {
                         fwd_map_id, kExpect);
                     #ifdef CT_DEBUG
                     std::cerr << "[GEN-MIMO-COMPILE-SUCCESS] key=" << spec.key
-                              << " chain=" << k << " outputs=" << subgraphs.size() << std::endl;
+                              << " nodes=" << k << " outputs=" << out_prefix << std::endl;
                     #endif
                 }
             }
