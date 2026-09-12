@@ -35,79 +35,20 @@ static const char* nodeName(const NodeVariant& op) {
 CanonicalizeRules CanonicalizeRules::defaults() {
     CanonicalizeRules rules;
 
-    // 规则 1: Add(x, 0) → x
-    rules.addRule("Add(x,0)->x", [](const Node& node) -> std::optional<NodeVariant> {
-        if (!std::holds_alternative<AddNode>(node.op)) return std::nullopt;
-        // 实际匹配在 canonicalize 中自底向上遍历处理
-        return std::nullopt;
-    });
-
-    // 规则 2: Mul(x, 1) → x
-    rules.addRule("Mul(x,1)->x", [](const Node& node) -> std::optional<NodeVariant> {
-        if (!std::holds_alternative<MulNode>(node.op)) return std::nullopt;
-        return std::nullopt;
-    });
-
-    // 规则 3: Mul(x, 0) → 0
-    rules.addRule("Mul(x,0)->0", [](const Node& node) -> std::optional<NodeVariant> {
-        if (!std::holds_alternative<MulNode>(node.op)) return std::nullopt;
-        return std::nullopt;
-    });
-
-    // 规则 4: Sub(x, x) → 0
-    rules.addRule("Sub(x,x)->0", [](const Node& node) -> std::optional<NodeVariant> {
-        if (!std::holds_alternative<SubNode>(node.op)) return std::nullopt;
-        return std::nullopt;
-    });
-
-    // 规则 5: Div(x, x) → 1
-    rules.addRule("Div(x,x)->1", [](const Node& node) -> std::optional<NodeVariant> {
-        if (!std::holds_alternative<DivNode>(node.op)) return std::nullopt;
-        return std::nullopt;
-    });
-
-    // 规则 6: Neg(Neg(x)) → x
-    rules.addRule("Neg(Neg(x))->x", [](const Node& node) -> std::optional<NodeVariant> {
-        if (!std::holds_alternative<NegNode>(node.op)) return std::nullopt;
-        return std::nullopt;
-    });
-
-    // 规则 7: Add(x, x) → Mul(x, 2)
-    rules.addRule("Add(x,x)->Mul(x,2)", [](const Node& node) -> std::optional<NodeVariant> {
-        if (!std::holds_alternative<AddNode>(node.op)) return std::nullopt;
-        return std::nullopt;
-    });
-
-    // 规则 8: Sub(x, 0) → x
-    rules.addRule("Sub(x,0)->x", [](const Node& node) -> std::optional<NodeVariant> {
-        if (!std::holds_alternative<SubNode>(node.op)) return std::nullopt;
-        return std::nullopt;
-    });
-
-    // 规则 9: Div(x, 1) → x
-    rules.addRule("Div(x,1)->x", [](const Node& node) -> std::optional<NodeVariant> {
-        if (!std::holds_alternative<DivNode>(node.op)) return std::nullopt;
-        return std::nullopt;
-    });
-
-    // 规则 10: Sub(0, x) → Neg(x)
-    rules.addRule("Sub(0,x)->Neg(x)", [](const Node& node) -> std::optional<NodeVariant> {
-        if (!std::holds_alternative<SubNode>(node.op)) return std::nullopt;
-        return std::nullopt;
-    });
-
-    // 规则 11: Mul(x, -1) → Neg(x)
-    rules.addRule("Mul(x,-1)->Neg(x)", [](const Node& node) -> std::optional<NodeVariant> {
-        if (!std::holds_alternative<MulNode>(node.op)) return std::nullopt;
-        return std::nullopt;
-    });
-
-    // 规则 12: Div(x, const(y)) -> Mul(x, 1/y)
-    rules.addRule("Div(x,const(y))->Mul(x,1/y)", [](const Node& node) -> std::optional<NodeVariant> {
-        if (!std::holds_alternative<DivNode>(node.op)) return std::nullopt;
-        return std::nullopt;
-    });
-
+    // [Fix 2026-09-12 §4.97] 12 条规则的实际匹配硬编码在 canonicalize() 的自底向上
+    // 遍历分支中(以 rule_names 字符串为键); 历史 lambda 恒返回 nullopt(无效实现),
+    // 压缩为统一占位。规则名是 canonicalize 匹配分支的键, 必须完整保留。
+    static const char* kRuleNames[] = {
+        "Add(x,0)->x", "Mul(x,1)->x", "Mul(x,0)->0", "Sub(x,x)->0",
+        "Div(x,x)->1", "Neg(Neg(x))->x", "Add(x,x)->Mul(x,2)", "Sub(x,0)->x",
+        "Div(x,1)->x", "Sub(0,x)->Neg(x)", "Mul(x,-1)->Neg(x)",
+        "Div(x,const(y))->Mul(x,1/y)",
+    };
+    for (const char* name : kRuleNames) {
+        rules.addRule(name, [](const Node&) -> std::optional<NodeVariant> {
+            return std::nullopt;
+        });
+    }
     return rules;
 }
 
