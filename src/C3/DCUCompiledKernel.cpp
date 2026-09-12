@@ -46,10 +46,12 @@ DCUCompiledKernel::~DCUCompiledKernel() {
         d_output_buffer_ = nullptr; 
     }
     if (d_input_buffers_) {
-        for (size_t i = 0; i < 2; ++i) { 
-            if (d_input_buffers_[i]) hsa_memory_free(d_input_buffers_[i]); 
+        // [Fix 2026-09-10 §4.95 P1-06] 按实际容量释放(此前硬编码 2, >2 输入泄漏 VRAM)
+        for (size_t i = 0; i < d_input_buffers_count_; ++i) {
+            if (d_input_buffers_[i]) hsa_memory_free(d_input_buffers_[i]);
         }
         delete[] d_input_buffers_; d_input_buffers_ = nullptr;
+        d_input_buffers_count_ = 0;
     }
     
     // 2. Destroy HSA queue (must destroy before executable)
@@ -254,7 +256,18 @@ bool DCUCompiledKernel::copyInputsToDevice(const std::vector<Tensor>& inputs) {
 #ifndef WITH_DCU
     (void)inputs; return false;
 #else
-    if (!d_input_buffers_) d_input_buffers_ = new void*[inputs.size()]();
+    // [Fix 2026-09-10 §4.95 P1-06] 输入数量变化时扩容(此前按首次大小分配, 更多输入越界写)
+    if (!d_input_buffers_) {
+        d_input_buffers_ = new void*[inputs.size()]();
+        d_input_buffers_count_ = inputs.size();
+    } else if (d_input_buffers_count_ < inputs.size()) {
+        for (size_t i = 0; i < d_input_buffers_count_; ++i) {
+            if (d_input_buffers_[i]) { hsa_memory_free(d_input_buffers_[i]); d_input_buffers_[i] = nullptr; }
+        }
+        delete[] d_input_buffers_;
+        d_input_buffers_ = new void*[inputs.size()]();
+        d_input_buffers_count_ = inputs.size();
+    }
     for (size_t i = 0; i < inputs.size(); ++i) {
         size_t bytes = inputs[i].numel() * sizeof(float);
         if (d_input_buffers_[i]) hsa_memory_free(d_input_buffers_[i]);
@@ -376,6 +389,10 @@ std::vector<Tensor> DCUCompiledKernel::execute(const std::vector<Tensor>& inputs
                                  kernel_name_ + "'");
     }
 
+    if (inputs.empty()) {
+        throw std::runtime_error("DCUCompiledKernel::execute: empty inputs for kernel '" +
+                                 kernel_name_ + "'");
+    }
     size_t output_numel = inputs[0].numel();
     std::vector<size_t> output_shape = inputs[0].shape();
     if (!allocateDeviceMemory(output_numel * sizeof(float))) {

@@ -56,6 +56,7 @@ private:
 
     // Device memory (allocated using hsa_amd_memory_pool_allocate VRAM)
     void** d_input_buffers_ = nullptr;
+    size_t d_input_buffers_count_ = 0;  ///< [§4.95 P1-06] d_input_buffers_ 已分配槽位数
     void* d_output_buffer_ = nullptr;
     size_t d_output_bytes_ = 0;
 #endif

@@ -439,9 +439,11 @@ public:
                 }));
             }
             
-            // 等待所有并行的切片任务完成
+            // [Fix 2026-09-10 §4.95 P1-07] 等待并传播 worker 异常:
+            // 此前只 f.wait() 不 f.get(), func_ 抛异常时被静默存入 future,
+            // 输出 buffer 未写完即返回垃圾数据。get() 会把首个异常抛给调用方。
             for (auto& f : futures) {
-                f.wait();
+                f.get();
             }
         } else {
             // 单核串行执行路径 (包括小张量或 MatMul)

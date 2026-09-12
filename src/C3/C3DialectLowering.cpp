@@ -39,6 +39,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 
@@ -316,6 +317,16 @@ struct BinaryOpLowering : public mlir::OpRewritePattern<SrcOp> {
         mlir::Value rhs = op.getRhs();
         mlir::Value out = op.getOut();
         int64_t bmod = op.getBmod();
+        // [Fix 2026-09-10 §4.95 P1-09] 不支持的部分广播(如 [M,1]→[M,N])到达此处
+        // 说明生成侧未拦截: 拒绝 lowering(编译失败回退 eager), 绝不再按同尺寸
+        // 整块读 rhs 造成越界读。哨兵值与 MLIRKernelGen.cpp 同名常量一致。
+        static constexpr int64_t kBroadcastUnsupported =
+            std::numeric_limits<int64_t>::min();
+        if (bmod == kBroadcastUnsupported) {
+            throw std::runtime_error(
+                "BinaryOpLowering: unsupported partial broadcast shape (e.g. [M,1]→[M,N]); "
+                "refusing to lower to avoid out-of-bounds read");
+        }
 
         auto f32 = rewriter.getF32Type();
         auto ptr_type = mlir::LLVM::LLVMPointerType::get(rewriter.getContext());

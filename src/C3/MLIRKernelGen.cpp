@@ -110,6 +110,10 @@ namespace {
     constexpr int64_t kDefaultTileM = 32;
     constexpr int64_t kDefaultTileN = 32;
 
+    /// [§4.95 P1-09] BinaryOp 广播取模哨兵: 「不支持的部分广播」(如 [M,1]→[M,N])。
+    /// 与 C3DialectLowering.cpp 中同名常量保持同值(两文件各自定义, 值不可变)。
+    constexpr int64_t kBroadcastUnsupported = std::numeric_limits<int64_t>::min();
+
     // MatMulOp transpose 折叠标志(语义见 C3Ops.td MatMulOp description):
     // 111 = NoTrans, 112 = Trans。此前以裸字面量散布于生成/折叠逻辑, 读代码时
     // 容易被误当成 tile 或未定占位常量(见 STATUS §4.91 审查结论 C5)。
@@ -241,6 +245,7 @@ static void buildFused(mlir::OpBuilder& builder, mlir::Location loc,
                        const std::vector<std::vector<size_t>>& op_inputs,
                        const std::vector<size_t>& op_node_ids,
                        const std::vector<size_t>& arg_node_ids,
+                       const std::vector<int64_t>& arg_numels,
                        int64_t known_numel = 0) {
     auto ptr_type = mlir::LLVM::LLVMPointerType::get(builder.getContext());
     auto f32 = builder.getF32Type();
@@ -294,8 +299,16 @@ static void buildFused(mlir::OpBuilder& builder, mlir::Location loc,
             /// 从预加载的指针加载元素值
             auto loadExternal = [&](size_t node_id) -> mlir::Value {
                 mlir::Value ptr = preloaded_ptrs.at(node_id);
+                // [Fix 2026-09-10 §4.95 P1-08] numel==1 的标量 arg(lhs 标量广播)
+                // 固定读索引 0: 此前一律用 idx_i64, idx>=1 时越界读 1 元素 buffer。
+                mlir::Value idx = idx_i64;
+                auto na_it = node_to_arg.find(node_id);
+                if (na_it != node_to_arg.end() && na_it->second < arg_numels.size() &&
+                    arg_numels[na_it->second] == 1) {
+                    idx = b.create<mlir::arith::ConstantIntOp>(loc, 0, 64);
+                }
                 mlir::Value elem_addr = b.create<mlir::LLVM::GEPOp>(
-                    loc, ptr_type, f32, ptr, mlir::ValueRange{idx_i64});
+                    loc, ptr_type, f32, ptr, mlir::ValueRange{idx});
                 return b.create<mlir::LLVM::LoadOp>(loc, f32, elem_addr);
             };
 
@@ -1574,7 +1587,10 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
             if (lhs.size() == 1 && !rhs.empty() && rhs.back() == lhs[0]) {
                 return -(int64_t)lhs[0]; // 1D vector broadcast to last dim (LHS)
             }
-            return 0; // unsupported broadcast pattern
+            // [Fix 2026-09-10 §4.95 P1-09] 不支持的部分广播(如 [M,1]→[M,N])原返回 0,
+            // 与「同尺寸/无广播」共用 0 ⇒ BinaryOpLowering 按同尺寸整块读 rhs → 越界读。
+            // 改为专用哨兵, lowering 侧遇到即报编译错误(回退 eager, 拒绝静默错读)。
+            return kBroadcastUnsupported;
         };
 
         // 节点自身输出 numel（用于 element-wise 循环计数）
@@ -2068,7 +2084,14 @@ mlir::OwningOpRef<mlir::ModuleOp> buildMLIRModule(
         mlir::Value inputs = entry->getArgument(0);
         mlir::Value out_val = entry->getArgument(1);
         mlir::Value n_val = entry->getArgument(2);
-        buildFused(builder, loc, inputs, out_val, n_val, fnode.ops, fnode.op_inputs, fnode.op_node_ids, fnode.arg_node_ids);
+        // [Fix 2026-09-10 §4.95 P1-08] 传入各 arg 的 numel, 供 buildFused 对标量 arg 短路
+        std::vector<int64_t> arg_numels;
+        arg_numels.reserve(fnode.arg_node_ids.size());
+        for (size_t nid : fnode.arg_node_ids) {
+            arg_numels.push_back(static_cast<int64_t>(graph.node(nid).out_desc.numel));
+        }
+        buildFused(builder, loc, inputs, out_val, n_val, fnode.ops, fnode.op_inputs,
+                   fnode.op_node_ids, fnode.arg_node_ids, arg_numels);
         builder.create<mlir::func::ReturnOp>(loc);
     } else {
         // 普通算子：使用 C3KernelFunc 签名 (ptr, ptr, ptr, i64, i64, i64, i64) → void
