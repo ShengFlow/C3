@@ -1673,6 +1673,9 @@ CompileFuture C3Engine::compileMergedAsync(
     const MergeSpec& spec,
     const CompileOptions& options)
 {
+    // [Fix §4.97 文档化] 本路径无 watchdog(与 compileAsync 的 ADR-011 模式不对称):
+    // 编译卡死时调用方 future.get() 会永久阻塞。当前 merge 编译仅由受控流程触发,
+    // 故接受此取舍; 若未来暴露给不可信调用方, 须复用 ADR-011 watchdog 模式。
     // 1. 立即生成 merged cache key 以支持去重
     std::string merged_key = GraphMerger::mergedCacheKey(sub_graphs, spec);
     // 在 key 前缀加入 compile 维度，区分 Handwritten vs MLIR、opt level 等

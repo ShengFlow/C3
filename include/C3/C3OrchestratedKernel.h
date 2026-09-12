@@ -182,7 +182,13 @@ inline std::shared_ptr<OrchestratedKernel> buildOrchestratedKernel(
     std::vector<size_t> gin = graph.inputs();
     std::vector<size_t> gout = graph.outputs();
     return std::make_shared<OrchestratedKernel>(
-        "orchestrated|" + std::to_string(subs.size()), std::move(gin), std::move(gout),
+        // [Fix §4.97] cacheKey 加入子图结构摘要(原仅 "orchestrated|N" 无语义,
+        // 未来 JITCache 键控会撞键): nodeCount 序列
+        [&]() -> std::string {
+            std::string ck = "orchestrated|" + std::to_string(subs.size());
+            for (const auto& s : subs) ck += "|" + std::to_string(s.graph.nodeCount());
+            return ck;
+        }(), std::move(gin), std::move(gout),
         std::move(sks), std::move(order), std::move(const_tensors));
 }
 
