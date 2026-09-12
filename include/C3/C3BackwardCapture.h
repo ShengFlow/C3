@@ -685,7 +685,7 @@ private:
     std::unordered_map<std::string, size_t> backward_fallback_reasons_;  ///< fallback 原因分类
 
     // ========== [G1 迁移决策门 2026-09-10] planner 对拍稳态统计 ==========
-    // stats_mutex_ 保护；仅在 C3_PLANNER_DIAG=1 的诊断路径内累加
+    // stats_mutex_ 保护；在 C3_PLANNER_DIAG=1 诊断与 C3_PLANNER_SHADOW 影子两条路径内累加(§4.97)
     size_t reconcile_total_ = 0;    ///< planner vs MIMO 对拍总次数
     size_t reconcile_matched_ = 0;  ///< 判定一致次数
 };

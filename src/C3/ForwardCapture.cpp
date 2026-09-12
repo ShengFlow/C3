@@ -97,7 +97,6 @@ ForwardCaptureResult ForwardCapture::capture(const Tensor& root) {
         return id;
     };
 
-    bool first_op = true;
     for (const ::Node* node : topo) {
         auto variant = buildOpVariant(node);
         if (!variant) {
@@ -136,7 +135,6 @@ ForwardCaptureResult ForwardCapture::capture(const Tensor& root) {
         size_t out_id = g.addNode(*variant, c3_ins,
                                   TensorDesc::fromShape(node->getResultShape()));
         res.node_to_c3[node] = out_id;
-        if (first_op && node == root_node.get()) { first_op = false; }
     }
 
     auto root_it = res.node_to_c3.find(root_node.get());

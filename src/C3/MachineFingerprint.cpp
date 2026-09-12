@@ -72,7 +72,11 @@ bool MachineFingerprint::load(const std::string& path) {
         else if (key == "method_version") d.method_version = val;
         else if (key == "bandwidth_gbps") d.bandwidth_gbps = std::atof(val.c_str());
         else if (key == "launch_us") d.launch_us = std::atof(val.c_str());
-        else if (key == "launch_unit_bytes") d.launch_unit_bytes = (uint64_t)std::atoll(val.c_str());
+        else if (key == "launch_unit_bytes") {
+            // [Fix §4.97] 损坏/负值 atoll → 巨大 uint64 会误导 planner 代价门; 非法值置 0(后续兜底)
+            long long v = std::atoll(val.c_str());
+            d.launch_unit_bytes = (v > 0) ? static_cast<uint64_t>(v) : 0;
+        }
     }
     if (d.launch_unit_bytes == 0 && d.launch_us > 0 && d.bandwidth_gbps > 0) {
         d.launch_unit_bytes = (uint64_t)(d.launch_us * d.bandwidth_gbps * 1000.0);
