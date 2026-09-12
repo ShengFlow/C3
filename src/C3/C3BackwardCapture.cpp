@@ -2144,6 +2144,10 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteUnifiedMIMOBackw
         }
     };
 
+    // [§4.97 ④ 影子对照] C3_MIMO_LEGACY=0 时短路手写执行段: 反向回退
+    // fused/phase1/eager(数值应逐位一致), 用于测量退场代价与数值等价性
+    if (!mimoLegacyEnabled()) return std::nullopt;
+
     // 检查是否为支持的激活节点
     std::string current_type = std::string(typeid(*node).name());
 

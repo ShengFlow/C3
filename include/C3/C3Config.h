@@ -189,6 +189,23 @@ inline bool separatorMergeEnabled() {
     return enabled;
 }
 
+// ======================= 手写 MIMO pattern 退场 (影子对照阶段, ④) =======================
+/// 查询是否启用**手写** MIMO pattern 的执行段识别(tryExecuteUnifiedMIMOBackward)。
+/// @details 手写 pattern(FC MatMul+Add / FFN SwiGLU)是 G3 通用接管的"前置识别器":
+///          执行段识别图结构 → miss 触发编译(G3 接管编译产出) → registry 命中执行。
+///          退场路径(§4.97 ④): 影子对照 —— 设 C3_MIMO_LEGACY=0 短路手写执行段,
+///          反向回退 fused/phase1/eager(数值应逐位一致, 性能可测退场代价);
+///          待通用识别器(planner 分区缓存)就绪后再默认切换。
+/// @note 默认开启(保持现状); C3_MIMO_LEGACY=0 为影子对照通道。
+inline bool mimoLegacyEnabled() {
+    static const bool enabled = [] {
+        const char* v = std::getenv("C3_MIMO_LEGACY");
+        if (v == nullptr) return true;   // 默认开(手写 pattern 现状)
+        return v[0] == '1';
+    }();
+    return enabled;
+}
+
 } // namespace c3
 } // namespace ct
 
