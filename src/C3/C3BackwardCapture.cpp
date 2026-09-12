@@ -2219,6 +2219,9 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteUnifiedMIMOBackw
                 std::vector<Tensor> act_res = {grad_h, grad_W_d};
                 return act_res;
             }
+            // [Fix §4.97 批C] 已有内核但执行失败(结果缺/空): 不触发重编译 —— 内核已在
+            // registry, 每 batch 重编译白烧 CPU 且大概率仍失败; 直接落 nullopt 回退 eager
+            return std::nullopt;
         }
 
         // miss → 触发异步编译
@@ -2758,8 +2761,11 @@ static MimoPartition computeMimoPartition(const Graph& fused_graph) {
 // 语义：仅当 planner 判定与"整图单内核"不同(判拆)时才接管; 判并则退化为整图(行为不变)。
 static std::shared_ptr<CompiledKernel> tryG3TakeoverKernel(
     const Graph& fused_graph, const std::vector<PartitionedSubGraph>& subs,
-    const CompileOptions& opts, const char* label, size_t* out_kernels) {
-    if (subs.size() <= 1) return nullptr;  // planner 判"合并"(单子图) → 整图
+    const CompileOptions& opts, const char* label, size_t* out_kernels,
+    bool planner_merged = false) {
+    // [Fix §4.97 批C] 退化判定与 planner 合并口径统一: merged=true 时即使 subs>1
+    // 也不接管(与"判并则整图"注释一致); subs<=1 保留为快路径
+    if (planner_merged || subs.size() <= 1) return nullptr;  // planner 判"合并" → 整图
 
     std::vector<std::shared_ptr<CompiledKernel>> sub_kernels;
     sub_kernels.reserve(subs.size());
@@ -2873,7 +2879,8 @@ void C3BackwardCapture::compileUnifiedMIMOBackwardAsync(
             std::shared_ptr<CompiledKernel> kernel;
             size_t actual_kernels = 1;   // 整图单内核(MIMO 手写路径)
             if (g3TakeoverEnabled())
-                kernel = tryG3TakeoverKernel(fused_graph, mp.subs, opts, "FC-MIMO", &actual_kernels);
+                kernel = tryG3TakeoverKernel(fused_graph, mp.subs, opts, "FC-MIMO", &actual_kernels,
+                                             mp.plan.region_metric.merged);
             if (!kernel) kernel = C3Engine::getInstance().compile(fused_graph, opts);
             if (need_plan)
                 diagnosePlannerReconcile(fused_graph, mp.plan, mp.policy, actual_kernels, "FC-MIMO");
@@ -3045,7 +3052,8 @@ void C3BackwardCapture::compileFFNMIMOBackwardAsync(
             std::shared_ptr<CompiledKernel> kernel;
             size_t actual_kernels = 1;   // 整图单内核(MIMO 手写路径)
             if (g3TakeoverEnabled())
-                kernel = tryG3TakeoverKernel(fused_graph, mp.subs, opts, "FFN-MIMO", &actual_kernels);
+                kernel = tryG3TakeoverKernel(fused_graph, mp.subs, opts, "FFN-MIMO", &actual_kernels,
+                                             mp.plan.region_metric.merged);
             if (!kernel) kernel = C3Engine::getInstance().compile(fused_graph, opts);
             if (need_plan)
                 diagnosePlannerReconcile(fused_graph, mp.plan, mp.policy, actual_kernels, "FFN-MIMO");
