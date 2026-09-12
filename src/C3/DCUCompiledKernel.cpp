@@ -413,7 +413,8 @@ std::vector<Tensor> DCUCompiledKernel::execute(const std::vector<Tensor>& inputs
 
 // ======================= installIntoRegistry =======================
 
-bool DCUCompiledKernel::installIntoRegistry(op op_type, const KernelShapeInfo& shapes) {
+bool DCUCompiledKernel::installIntoRegistry(op op_type, const KernelShapeInfo& shapes,
+                                             std::shared_ptr<CompiledKernel> /*self*/) {
     (void)op_type; (void)shapes;
     return false;
 }

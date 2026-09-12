@@ -102,7 +102,8 @@ public:
     [[nodiscard]] const std::string& cacheKey() const override { return cache_key_; }
     [[nodiscard]] DeviceType targetDevice() const override { return options_.target_device; }
     [[nodiscard]] size_t workspaceBytes() const override { return 0; }
-    bool installIntoRegistry(op op_type, const KernelShapeInfo& shapes) override;
+    bool installIntoRegistry(op op_type, const KernelShapeInfo& shapes,
+                             std::shared_ptr<CompiledKernel> self) override;
 
     /** @brief 检查是否已有 O2 或 Ofast kernel */
     [[nodiscard]] bool isPromoted() const {
@@ -132,7 +133,9 @@ public:
     }
 
     /** @brief 最近一次 deopt 的原因（含 tier 标签，如 "ofast: ..." / "o2: ..."） */
-    [[nodiscard]] const std::string& lastDeoptReason() const {
+    // [Fix §4.95 P1-05] 按值返回: 此前返回 const& 在锁释放后暴露引用,
+    // 并发 recordDeopt 写入触发 string 重分配 → 脏读/UAF。
+    [[nodiscard]] std::string lastDeoptReason() const {
         std::lock_guard<std::mutex> lock(deopt_mutex_);
         return last_deopt_reason_;
     }
@@ -165,7 +168,8 @@ public:
      *          线程安全：内部 mutex 保护。
      *          编译成功时不会自动清空（用户可调用 clearLastCompileError() 重置）。
      */
-    [[nodiscard]] const std::string& lastCompileError() const {
+    // [Fix §4.95 P1-05] 按值返回(同 lastDeoptReason, 避免锁释放后引用暴露)。
+    [[nodiscard]] std::string lastCompileError() const {
         std::lock_guard<std::mutex> lock(compile_error_mutex_);
         return last_compile_error_;
     }

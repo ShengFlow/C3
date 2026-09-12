@@ -112,7 +112,7 @@ PGOCompiledKernel::PGOCompiledKernel(
 std::vector<Tensor> PGOCompiledKernel::execute(const std::vector<Tensor>& inputs) {
     // ====== Deoptimization 支持 (ADR-006) ======
     // 优先级 1: Ofast kernel（若未被 deopt 禁用）
-    if (auto k = ofast_kernel_) {
+    if (auto k = std::atomic_load(&ofast_kernel_)) {
         if (!ofast_disabled_.load(std::memory_order_acquire)) {
             try {
                 auto start = std::chrono::steady_clock::now();
@@ -135,7 +135,7 @@ std::vector<Tensor> PGOCompiledKernel::execute(const std::vector<Tensor>& inputs
     }
 
     // 优先级 2: O2 kernel（若未被 deopt 禁用）
-    if (auto k = o2_kernel_) {
+    if (auto k = std::atomic_load(&o2_kernel_)) {
         if (!o2_disabled_.load(std::memory_order_acquire)) {
             try {
                 auto start = std::chrono::steady_clock::now();
@@ -207,7 +207,8 @@ void PGOCompiledKernel::recordCompileError(const char* tier, const std::string& 
     }
 }
 
-bool PGOCompiledKernel::installIntoRegistry(op op_type, const KernelShapeInfo& shapes) {
+bool PGOCompiledKernel::installIntoRegistry(op op_type, const KernelShapeInfo& shapes,
+                                             std::shared_ptr<CompiledKernel> /*self*/) {
     // PGOCompiledKernel 本身不直接安装到注册表
     // 编译后的 kernel 由编译链完成时安装
     (void)op_type;
@@ -330,7 +331,9 @@ void PGOCompiledKernel::compileO2() {
 
         {
             std::lock_guard<std::mutex> lock(compile_mutex_);
-            o2_kernel_ = std::move(kernel);
+            // [Fix §4.95 P1-04] atomic_store 与读侧 atomic_load 配对
+            // (shared_ptr 非原子, 无锁读写会撕裂)
+            std::atomic_store(&o2_kernel_, std::move(kernel));
         }
 
         // 尝试安装到 C3 注册表（仅支持单节点图）
@@ -339,8 +342,9 @@ void PGOCompiledKernel::compileO2() {
             auto op_type = nodeVariantToOp(out_node.op);
             if (op_type.has_value()) {
                 auto shapes = graphToShapeInfo(graph_);
-                if (o2_kernel_) {
-                    o2_kernel_->installIntoRegistry(op_type.value(), shapes);
+                auto k2 = std::atomic_load(&o2_kernel_);
+                if (k2) {
+                    k2->installIntoRegistry(op_type.value(), shapes, k2);
                 }
             }
         }
@@ -369,7 +373,7 @@ void PGOCompiledKernel::compileOfast() {
 
         {
             std::lock_guard<std::mutex> lock(compile_mutex_);
-            ofast_kernel_ = std::move(kernel);
+            std::atomic_store(&ofast_kernel_, std::move(kernel));
         }
 
         // 尝试安装到 C3 注册表（仅支持单节点图）
@@ -378,7 +382,10 @@ void PGOCompiledKernel::compileOfast() {
             auto op_type = nodeVariantToOp(out_node.op);
             if (op_type.has_value()) {
                 auto shapes = graphToShapeInfo(graph_);
-                ofast_kernel_->installIntoRegistry(op_type.value(), shapes);
+                auto kf = std::atomic_load(&ofast_kernel_);
+                if (kf) {
+                    kf->installIntoRegistry(op_type.value(), shapes, kf);
+                }
             }
         }
     } catch (const std::exception& e) {
@@ -717,7 +724,7 @@ void PGOCompiledKernel::promote() {
     if (compilation_triggered_.exchange(true)) {
         // 已经触发过，但可能还没完成
         // 如果 O2 和 Ofast 都没有，则重新触发
-        if (!o2_kernel_ && !ofast_kernel_) {
+        if (!std::atomic_load(&o2_kernel_) && !std::atomic_load(&ofast_kernel_)) {
             // 直接在当前线程中编译
             compileO2();
             compileOfast();

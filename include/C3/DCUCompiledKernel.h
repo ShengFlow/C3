@@ -32,7 +32,8 @@ public:
     [[nodiscard]] DeviceType targetDevice() const override { return DeviceType::kDCU; }
     [[nodiscard]] size_t workspaceBytes() const override { return workspace_bytes_; }
 
-    bool installIntoRegistry(op op_type, const KernelShapeInfo& shapes) override;
+    bool installIntoRegistry(op op_type, const KernelShapeInfo& shapes,
+                             std::shared_ptr<CompiledKernel> self) override;
 
 private:
     std::string code_object_;

@@ -229,7 +229,8 @@ public:
      * @param shapes 形状签名
      * @return 安装成功返回 true；默认实现返回 false（未实现）
      */
-    virtual bool installIntoRegistry(op op_type, const KernelShapeInfo& shapes) {
+    virtual bool installIntoRegistry(op op_type, const KernelShapeInfo& shapes,
+                                     std::shared_ptr<CompiledKernel> /*self*/) {
         (void)op_type; (void)shapes;
         return false;
     }
@@ -268,8 +269,11 @@ public:
     [[nodiscard]] DeviceType targetDevice() const override { return inner_->targetDevice(); }
     [[nodiscard]] size_t workspaceBytes() const override { return inner_->workspaceBytes(); }
 
-    bool installIntoRegistry(op op_type, const KernelShapeInfo& shapes) override {
-        return inner_->installIntoRegistry(op_type, shapes);
+    bool installIntoRegistry(op op_type, const KernelShapeInfo& shapes,
+                             std::shared_ptr<CompiledKernel> /*self*/) override {
+        // [Fix §4.95 P1-01] 传内部内核的真实 shared_ptr: registry 持有后, 外层
+        // ProfiledCompiledKernel 被释放也不影响内核存活(此前空 deleter 别名不持寿命)。
+        return inner_->installIntoRegistry(op_type, shapes, inner_);
     }
 
     /** @brief 获取内部 kernel 的引用 */

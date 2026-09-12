@@ -112,7 +112,8 @@ public:
         return out_shape_;
     }
 
-    bool installIntoRegistry(op op_type, const KernelShapeInfo& shapes) override {
+    bool installIntoRegistry(op op_type, const KernelShapeInfo& shapes,
+                             std::shared_ptr<CompiledKernel> /*self*/) override {
         (void)op_type; (void)shapes;
         return false; // 融合 kernel 暂不注册到 registry
     }
@@ -495,7 +496,8 @@ public:
         return std::nullopt;
     }
 
-    bool installIntoRegistry(op op_type, const KernelShapeInfo& shapes) override {
+    bool installIntoRegistry(op op_type, const KernelShapeInfo& shapes,
+                             std::shared_ptr<CompiledKernel> /*self*/) override {
         (void)op_type; (void)shapes;
         return false; // 多节点 kernel 暂不注册到 registry
     }
@@ -581,10 +583,12 @@ public:
         if (out_shapes_.empty()) return std::nullopt;
         return out_shapes_[0];
     }
-    bool installIntoRegistry(op op_type, const KernelShapeInfo& shapes) override {
-        std::shared_ptr<CompiledKernel> self =
-            std::shared_ptr<CompiledKernel>(this, [](CompiledKernel*) {});
-        C3KernelRegistry::getInstance().install(op_type, targetDevice(), self, shapes);
+    bool installIntoRegistry(op op_type, const KernelShapeInfo& shapes,
+                             std::shared_ptr<CompiledKernel> self) override {
+        // [Fix §4.95 P1-01] 用调用方传入的真实 shared_ptr 持寿命。
+        // 此前 `shared_ptr(this, [](CompiledKernel*){})` 空 deleter 别名**不持寿命**:
+        // cache evict(>256)/clearCache 释放对象后 registry 悬垂 → 后续 dispatch UAF。
+        C3KernelRegistry::getInstance().install(op_type, targetDevice(), std::move(self), shapes);
         return true;
     }
 
@@ -660,10 +664,12 @@ public:
         if (out_shapes_.empty()) return std::nullopt;
         return out_shapes_[0];
     }
-    bool installIntoRegistry(op op_type, const KernelShapeInfo& shapes) override {
-        std::shared_ptr<CompiledKernel> self =
-            std::shared_ptr<CompiledKernel>(this, [](CompiledKernel*) {});
-        C3KernelRegistry::getInstance().install(op_type, targetDevice(), self, shapes);
+    bool installIntoRegistry(op op_type, const KernelShapeInfo& shapes,
+                             std::shared_ptr<CompiledKernel> self) override {
+        // [Fix §4.95 P1-01] 用调用方传入的真实 shared_ptr 持寿命。
+        // 此前 `shared_ptr(this, [](CompiledKernel*){})` 空 deleter 别名**不持寿命**:
+        // cache evict(>256)/clearCache 释放对象后 registry 悬垂 → 后续 dispatch UAF。
+        C3KernelRegistry::getInstance().install(op_type, targetDevice(), std::move(self), shapes);
         return true;
     }
 
@@ -783,19 +789,17 @@ public:
         return out_shape_;
     }
 
-    bool installIntoRegistry(op op_type, const KernelShapeInfo& shapes) override {
+    bool installIntoRegistry(op op_type, const KernelShapeInfo& shapes,
+                             std::shared_ptr<CompiledKernel> self) override {
         KernelShapeInfo s = shapes;
         if (is_matmul_) {
             s.is_matmul = true;
             s.M = M_; s.K = K_; s.N = N_;
         }
-        // [Fix 2026-08-09 用户审查 P0-#4]: 用 shared_ptr<CompiledKernel> 持寿命
-        // 替代裸 C3KernelFunc, 避免 cache evict/uninstallAll 后 func 悬垂 UAF
-        std::shared_ptr<CompiledKernel> self =
-            std::shared_ptr<CompiledKernel>(this, [](CompiledKernel*) {});
-        // deleter 用空 lambda (ConcreteCompiledKernel 不被 registry 持, 仍由 C3Engine 寿命管理)
-        // 真正持寿命通过 C3Engine compile 内部持 shared_ptr<ConcreteCompiledKernel>
-        C3KernelRegistry::getInstance().install(op_type, device_, self, s);
+        // [Fix 2026-09-10 §4.95 P1-01] 用调用方传入的真实 shared_ptr 持寿命。
+        // 旧注释(P0-#4)称"用 shared_ptr 持寿命"但空 deleter 实际不持寿命;
+        // "仍由 C3Engine 寿命管理"亦不成立(cache evict 后即悬垂)。
+        C3KernelRegistry::getInstance().install(op_type, device_, std::move(self), s);
         return true;
     }
 
@@ -1844,7 +1848,7 @@ std::shared_ptr<CompiledKernel> C3Engine::compileAndInject(
     auto shapes = graphToShapeInfo(graph);
 
     // 4. 安装到注册表（仅单节点图支持自动注入，多节点/融合图跳过）
-    kernel->installIntoRegistry(op_type.value(), shapes);
+    kernel->installIntoRegistry(op_type.value(), shapes, kernel);
 
     return kernel;
 }
