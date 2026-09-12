@@ -1218,6 +1218,22 @@ std::shared_ptr<CompiledKernel> C3Engine::compile(
                 if (!counted_miss) { state.stats.misses++; counted_miss = true; }
             }
 
+            // [Fix §4.95 交叉去重] 同步 vs 异步: pending 中有同 key 的异步编译时,
+            // 锁外等待其完成, 回来重查缓存(异步完成会写 cache)。异步失败(异常/nullptr)
+            // 时重查仍 miss, 自然落入自行编译。等待期间不持锁, 无死锁风险。
+            if (options.enable_cache) {
+                auto pit = state.pending.find(cache_key);
+                if (pit != state.pending.end() && pit->second.future.valid()) {
+                    auto fut = pit->second.future;
+                    lock.unlock();
+                    try {
+                        (void)fut.get();  // 异常吞掉, 唤醒后重查 cache 决定去向
+                    } catch (...) {}
+                    lock.lock();
+                    continue;
+                }
+            }
+
             // [§4.91 B4] 同步路径 in-flight 去重。
             // 仅在启用缓存时生效: 只有编译结果会写入 cache 供他人复用时, 让并发方等待才有意义;
             // 缓存关闭时等待者被唤醒后仍须自行编译, 等待纯属白费, 故直接编译。
