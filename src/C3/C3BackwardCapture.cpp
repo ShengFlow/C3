@@ -423,8 +423,15 @@ void C3BackwardCapture::compileBackwardAsync(const ::Node* node, const Tensor& g
 
         // 捕获 type_name 字符串（而非 node 指针），规避反向结束后节点释放导致的 UAF
         std::string type = type_name;
-        if (!taskStarted()) return;
+        if (!taskStarted()) {
+            // [Fix §4.97] shutdown 已启动: 回滚 pending 标记(否则残留永不 erase)
+            std::lock_guard<std::mutex> lock(pending_mutex_);
+            pending_compiles_.erase(per_key);
+            return;
+        }
         // 【修复】不能用 std::async → future 析构会阻塞 → 变相同步
+        // [Fix §4.97] thread 构造失败(资源不足)时回滚计数与标记, 否则 shutdown 永久阻塞
+        try {
         std::thread([this, type, i, grad_desc, input_descs, per_key]() {
             struct TaskGuard { C3BackwardCapture* self; ~TaskGuard() { self->taskFinished(); } } guard{this};
             // 构建该输入的反向 C3 Graph
@@ -480,6 +487,14 @@ void C3BackwardCapture::compileBackwardAsync(const ::Node* node, const Tensor& g
             std::lock_guard<std::mutex> lock(pending_mutex_);
             pending_compiles_.erase(per_key);
         }).detach();
+        } catch (const std::system_error&) {
+            // [Fix §4.97] 线程创建失败(资源不足): 回滚计数与 pending 标记,
+            // 否则 shutdown() 永久阻塞且标记残留
+            taskFinished();
+            std::lock_guard<std::mutex> lock(pending_mutex_);
+            pending_compiles_.erase(per_key);
+            return;
+        }
     }
 }
 
@@ -537,8 +552,13 @@ void C3BackwardCapture::compileBackwardAsyncForInput(
     };
     std::string type = type_name;
 
-    if (!taskStarted()) return;
+    if (!taskStarted()) {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        pending_compiles_.erase(per_key);
+        return;
+    }
     // 【修复】不能用 std::async → future 析构会阻塞 → 变相同步
+    try {
     std::thread([this, type, input_index, grad_desc, input_descs, per_key]() {
         struct TaskGuard { C3BackwardCapture* self; ~TaskGuard() { self->taskFinished(); } } guard{this};
         // [BW-DIAG 2026-09-02] C3_BW_DIAG=1：定位「支持但装不上」的 per-key 编译失败原因
@@ -609,6 +629,12 @@ void C3BackwardCapture::compileBackwardAsyncForInput(
         std::lock_guard<std::mutex> lock(pending_mutex_);
         pending_compiles_.erase(per_key);
     }).detach();
+    } catch (const std::system_error&) {
+        taskFinished();
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        pending_compiles_.erase(per_key);
+        return;
+    }
 }
 
 std::optional<Graph> C3BackwardCapture::buildBackwardGraph(
@@ -1687,7 +1713,12 @@ void C3BackwardCapture::compileFusedBackwardAsync(const BackwardSequence& seq) {
     // 异步编译融合 kernel
     // 【重要】不能用 std::async，因为 std::future 析构会阻塞等待 → 变同步
     //     用 std::thread + detach 才是真正的后台异步
-    if (!taskStarted()) return;
+    if (!taskStarted()) {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        pending_compiles_.erase(fused_key);
+        return;
+    }
+    try {
     std::thread([this, seq, fused_key, reg_grad_shape, reg_input_shape]() {
         struct TaskGuard { C3BackwardCapture* self; ~TaskGuard() { self->taskFinished(); } } guard{this};
         // ======================= 诊断：编译耗时时间戳 =======================
@@ -1910,6 +1941,12 @@ void C3BackwardCapture::compileFusedBackwardAsync(const BackwardSequence& seq) {
         std::lock_guard<std::mutex> lock(pending_mutex_);
         pending_compiles_.erase(fused_key);
     }).detach();
+    } catch (const std::system_error&) {
+        taskFinished();
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        pending_compiles_.erase(fused_key);
+        return;
+    }
 }
 
 // ======================= 融合执行入口 =======================
@@ -2819,7 +2856,12 @@ void C3BackwardCapture::compileUnifiedMIMOBackwardAsync(
     }
     std::string compile_err = "";
 
-    if (!taskStarted()) return;
+    if (!taskStarted()) {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        pending_compiles_.erase(mimo_key);
+        return;
+    }
+    try {
     std::thread([this, current_type, mimo_key, grad_desc, z_desc, x_desc, w_desc]() {
         struct TaskGuard { C3BackwardCapture* self; ~TaskGuard() { self->taskFinished(); } } guard{this};
         try {
@@ -2926,6 +2968,12 @@ void C3BackwardCapture::compileUnifiedMIMOBackwardAsync(
             pending_compiles_.erase(mimo_key);
         }
     }).detach();
+    } catch (const std::system_error&) {
+        taskFinished();
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        pending_compiles_.erase(mimo_key);
+        return;
+    }
 }
 
 // ======================= [2026-09-06] 无 bias SwiGLU FFN 反向 MIMO 编译 =======================
@@ -2975,7 +3023,12 @@ void C3BackwardCapture::compileFFNMIMOBackwardAsync(
         mimo_compile_count_++;
     }
 
-    if (!taskStarted()) return;
+    if (!taskStarted()) {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        pending_compiles_.erase(ffn_key);
+        return;
+    }
+    try {
     std::thread([this, ffn_key, grad_desc, x_desc, wg_desc, wu_desc, wd_desc,
                  g_desc, u_desc, h_desc, gp_desc]() {
         struct TaskGuard { C3BackwardCapture* self; ~TaskGuard() { self->taskFinished(); } } guard{this};
@@ -3095,6 +3148,12 @@ void C3BackwardCapture::compileFFNMIMOBackwardAsync(
             pending_compiles_.erase(ffn_key);
         }
     }).detach();
+    } catch (const std::system_error&) {
+        taskFinished();
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        pending_compiles_.erase(ffn_key);
+        return;
+    }
 }
 
 } // namespace c3
