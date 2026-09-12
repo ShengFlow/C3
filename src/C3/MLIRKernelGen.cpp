@@ -1046,8 +1046,56 @@ static bool isComputeNodeMLIR(const Node& node, const std::vector<size_t>& input
 }
 
 /// 为多节点图构建 MLIR 模块
+// [tanh 专项修复 2026-09-12] 中间 buffer 池槽数共享判据: 2 槽 round-robin 复用仅在
+// 「链式串行」图下安全; DAG(一节点读多个中间输入, 或中间输出被多消费者共享)下会产生
+// 读-写冲突: 两中间节点同槽且前者仍有后续读者(实测 tanh 反向图 exp_x/exp_nx 同槽,
+// sub/add 在后读 exp_x) → 后写覆盖 → 读错值(Sub 交换/NaN 恒等)。
+// 静态 liveness 检测: 冲突或存在 FusedNode 原地复用 → 降级独占槽位(正确性优先;
+// 中间节点数很小的反向图 scratch 增量可忽略, 链式大图不触发保持 2 槽性能)。
+// 该函数是「kernel 内槽位布局」与「GeneratedKernel::scratch_size 分配」的唯一真源,
+// 两处必须一致(不一致 = 越界写)。
+static size_t computePoolBufCount(
+    const std::vector<const Node*>& compute_nodes,
+    const std::unordered_map<size_t, size_t>& node_to_buffer,
+    const std::unordered_map<size_t, size_t>& node_buffer_reuse,
+    size_t num_intermediates) {
+    size_t pool_buf_count =
+        (num_intermediates == 0) ? 0 : std::min(num_intermediates, (size_t)2);
+    if (num_intermediates == 0) return 0;
+    std::vector<size_t> prod_pos(num_intermediates, 0);
+    std::vector<size_t> live_end(num_intermediates, 0);
+    for (size_t pi = 0; pi < compute_nodes.size(); ++pi) {
+        auto it = node_to_buffer.find(compute_nodes[pi]->id);
+        if (it != node_to_buffer.end() && it->second != SIZE_MAX) {
+            prod_pos[it->second] = pi;
+            live_end[it->second] = pi;   // producer 自身至少活到写时刻
+        }
+    }
+    for (size_t pi = 0; pi < compute_nodes.size(); ++pi) {
+        for (size_t in_id : compute_nodes[pi]->inputs) {
+            auto it = node_to_buffer.find(in_id);
+            if (it != node_to_buffer.end() && it->second != SIZE_MAX) {
+                live_end[it->second] = std::max(live_end[it->second], pi);
+            }
+        }
+    }
+    bool conflict = !node_buffer_reuse.empty();   // FusedNode 原地复用: 保守独占
+    for (size_t i = 0; i < num_intermediates && !conflict; ++i) {
+        for (size_t j = i + 1; j < num_intermediates; ++j) {
+            // 2 槽 round-robin 下同槽; j 的写入发生在 i 的最后读者之前 → 冲突
+            if ((i % 2) == (j % 2) && prod_pos[j] <= live_end[i]) {
+                conflict = true;
+                break;
+            }
+        }
+    }
+    if (conflict) pool_buf_count = num_intermediates;   // 独占槽位
+    return pool_buf_count;
+}
+
 static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
-    mlir::MLIRContext& context, const Graph& graph)
+    mlir::MLIRContext& context, const Graph& graph,
+    size_t* out_pool_buf_count = nullptr)
 {
     auto loc = mlir::UnknownLoc::get(&context);
     mlir::OpBuilder builder(&context);
@@ -1195,7 +1243,11 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
     // 保守分配：每个中间节点独占槽位（f8161c6 为多归约图正确性）。
     // [2026-08-31 实验] Sigmoid/Softmax backward 已回退 eager，多归约 DAG 不再触达
     //   此处；恢复 2 槽复用以贴近黄金态分配，实测是否消除 MIMO 标量化性能回归。
-    size_t pool_buf_count = (num_intermediates == 0) ? 0 : std::min(num_intermediates, (size_t)2);
+    // [tanh 专项修复 2026-09-12] 槽数走共享判据(唯一真源), 与 generateFromGraphMLIR
+    // 的 scratch_size 分配严格一致(不一致 = 越界写)。
+    size_t pool_buf_count = computePoolBufCount(compute_nodes, node_to_buffer,
+                                                node_buffer_reuse, num_intermediates);
+    if (out_pool_buf_count) *out_pool_buf_count = pool_buf_count;
     std::vector<size_t> logical_to_pool(num_intermediates, SIZE_MAX);
     for (size_t i = 0; i < num_intermediates; ++i) logical_to_pool[i] = (pool_buf_count == 0) ? SIZE_MAX : (i % pool_buf_count);
     std::vector<mlir::Value> tmp_buffers;
@@ -1319,6 +1371,17 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
                std::find(compute_nodes[j + 1]->inputs.begin(),
                          compute_nodes[j + 1]->inputs.end(),
                          compute_nodes[j]->id) != compute_nodes[j + 1]->inputs.end() &&
+               // [tanh 专项修复 2026-09-12] 非交换二元算子(Sub/Div)若前驱不在 inputs[0],
+               // 链构建的「前驱换位到 inputs[0]」会反转操作数语义(sub(a,b)→sub(b,a);
+               // 实测 tanh 反向 G4c 产出 exp(-x)-exp(x)、G4 产出 coth)。交换律算子(Add/Mul)
+               // 不受影响, 保持放宽。非交换且前驱不在 inputs[0] → 断链, 该节点独立生成。
+               [&]() -> bool {
+                   const NodeVariant& nv = compute_nodes[j + 1]->op;
+                   if (!std::holds_alternative<SubNode>(nv) &&
+                       !std::holds_alternative<DivNode>(nv)) return true;
+                   return !compute_nodes[j + 1]->inputs.empty() &&
+                          compute_nodes[j + 1]->inputs[0] == compute_nodes[j]->id;
+               }() &&
                in_consumer_count[compute_nodes[j]->id] == 1) {
             ++j;
         }
@@ -2013,13 +2076,14 @@ static bool tryBuildLinalgElementwise(const Graph& graph, GeneratedKernel& out, 
 // buildMLIRModule 从 file-static 改成公开 API, 跟 MLIRToLLVMIR.cpp 的
 // mlirToLLVMIRFromGraph 复用同一份 build / lower 逻辑
 mlir::OwningOpRef<mlir::ModuleOp> buildMLIRModule(
-    mlir::MLIRContext& context, const Graph& graph)
+    mlir::MLIRContext& context, const Graph& graph,
+    size_t* out_pool_buf_count)
 {
     // 多节点图：使用多节点 MLIR kernel
     if (countComputeNodesMLIR(graph) > 1) {
         mlir::OwningOpRef<mlir::ModuleOp> module;
         try {
-            module = buildMultiNodeMLIR(context, graph);
+            module = buildMultiNodeMLIR(context, graph, out_pool_buf_count);
         } catch (const std::out_of_range& e) {
             fprintf(stderr, "[DBG-AT] buildMultiNodeMLIR out_of_range: %s\n", e.what());
             fprintf(stderr, "  graph nodes (%zu):\n", graph.nodeCount());
@@ -2263,7 +2327,8 @@ GeneratedKernel generateFromGraphMLIR(const Graph& graph, int opt_level) {
         context->getOrLoadDialect<mlir::c3::C3Dialect>();
     }
 
-    auto module = buildMLIRModule(*context, graph);
+    size_t pool_buf_count = 0;
+    auto module = buildMLIRModule(*context, graph, &pool_buf_count);
     applyLoweringPipeline(*module, opt_level);
 
     // [TEMP-DBG] 环境变量 C3_MLIR_DUMP=1 时打印 lowering 后的 module
@@ -2386,8 +2451,9 @@ GeneratedKernel generateFromGraphMLIR(const Graph& graph, int opt_level) {
                 num_constants++;
             }
         }
-        // 与 buildMultiNodeMLIR 的 2 槽复用分配保持一致。
-        size_t pool_buf_count = (num_intermediates == 0) ? 0 : std::min(num_intermediates, (size_t)2);
+        // [tanh 专项修复 2026-09-12] 槽数取自 buildMultiNodeMLIR 回传(共享判据唯一真源),
+        // 与 kernel 内槽位布局严格一致(此前此处硬编码 2 槽公式, 冲突检测独占时不一致
+        // → wrapper 分配不足 → 越界写崩溃)。
         result.scratch_size = max_numel * pool_buf_count + num_constants;
 
         for (const auto& node : nodes) {

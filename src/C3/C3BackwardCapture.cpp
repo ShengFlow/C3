@@ -789,13 +789,15 @@ bool C3BackwardCapture::supportsNodeType(const std::string& node_type) {
     //   避免名义支持(返回 true)却编不出 kernel 的脱节。此前 GELU/LReLU/Sin/Cos/Abs/Min/Max
     //   被列在此却无对应 builder case(一律 nullopt), 只会进融合序列统计、永不产出 kernel。
     //   多输入单节点 kernel(Add/Sub/Mul/MatMul/Softmax 等)仍按注释回退 eager(正确性优先)。
-    // [Fix 2026-09-12] TanhNode 暂移出名单: 其 C3 反向多节点图执行有缺陷
-    // (测试实测 ga=[1,1,1], 恒等输出; 图内 exp/neg/sub 链执行产物全错),
-    // 回退 eager 保证正确性(与 CE 短路同哲学)。待反向图执行层专项修复后恢复。
+    // [Fix 2026-09-12 tanh 专项] TanhNode 已恢复: 其 C3 反向多节点图执行缺陷已修复
+    // (根因有二: ① buildMultiNodeMLIR 2 槽池 round-robin 在 DAG 下读写冲突, 已加
+    // liveness 检测冲突降级独占槽位; ② elementwise 链融合「前驱换位 inputs[0]」对
+    // 非交换算子 Sub/Div 反转操作数, 已加断链条件)。test_tanh_grad 通过。
     return nodeTypeIs(node_type, "ReLUNode") ||
            nodeTypeIs(node_type, "NegNode") ||
            nodeTypeIs(node_type, "ExpNode") ||
            nodeTypeIs(node_type, "LogNode") ||
+           nodeTypeIs(node_type, "TanhNode") ||
            // CrossEntropy: dispatch 有 case(630), 但 tryExecuteBackward 对 CE 短路 → 实际不可达。
            nodeTypeIs(node_type, "CrossEntropyNode");
 }

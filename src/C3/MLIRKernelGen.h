@@ -52,7 +52,8 @@ GeneratedKernel generateFromGraphMLIR(const Graph& graph, int opt_level = 2);
  * @return OwningOpRef<ModuleOp>
  * @throw std::runtime_error 当 graph 校验失败
  */
-mlir::OwningOpRef<mlir::ModuleOp> buildMLIRModule(mlir::MLIRContext& context, const Graph& graph);
+mlir::OwningOpRef<mlir::ModuleOp> buildMLIRModule(mlir::MLIRContext& context, const Graph& graph,
+                                        size_t* out_pool_buf_count = nullptr);
 
 /**
  * @brief [v0.5.2 公开] 对 MLIR Module 跑标准 lowering pipeline
