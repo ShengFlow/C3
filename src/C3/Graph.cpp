@@ -582,13 +582,20 @@ Graph Graph::fuse() const {
 
             // 继续向前遍历唯一的逐元素前驱
             bool found_next = false;
-            for (size_t in_id : node.inputs) {
+            for (size_t ii = 0; ii < node.inputs.size(); ++ii) {
+                size_t in_id = node.inputs[ii];
                 if (!validNodeId(in_id)) continue;
                 if (std::holds_alternative<ConstNode>(nodes_[in_id].op)) continue;
                 if (fused[in_id]) continue;
                 // 如果前驱节点有多个消费者，停止向前
                 if (consumer_count[in_id] > 1) continue;
                 if (!is_elementwise(nodes_[in_id].op)) continue;
+                // [Fix §4.108 2026-09-12] FusedNode 执行层按「链前驱 = inputs[0]」解析
+                // (本 fuse 无 reorder); 唯一逐元素前驱不在 inputs[0] 时融合会错乱操作数
+                // (实测 sigmoid 树: Sub(y,sq)/Mul(grad,sub) 前驱均 inputs[1], 融合后
+                // grad_b 3.46 vs eager 0.96)。断链保持独立节点走多节点 lowering。
+                // 与 buildMultiNodeMLIR 元素链融合的断链修复同源(§4.106)。
+                if (ii != 0) break;
                 current = in_id;
                 found_next = true;
                 break;

@@ -235,6 +235,17 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteBackward(
 
     // 多输入节点：每个上游梯度一个独立单输出 kernel，逐 key 查找并执行。
     // 任一输入的 kernel 缺失 → 整体回退 eager（保证正确性），仅触发缺失输入编译。
+    // [Fix §4.108] Tanh/Sigmoid 反向图输入语义为 forward 输出 y(融合 forward 不物化
+    // pre-activation, 旧图重算读陈旧存储); 喂入用 node->getResult(), 空则回退原输入。
+    const std::string fwd_type_name = type_name;
+    const bool feed_result_y =
+        (fwd_type_name.find("TanhNode") != std::string::npos ||
+         fwd_type_name.find("SigmoidNode") != std::string::npos) &&
+        node->getResult() != nullptr;
+    std::vector<Tensor> fwd_feed = forward_inputs;
+    if (feed_result_y && !fwd_feed.empty()) {
+        fwd_feed[0] = *node->getResult();
+    }
     std::vector<Tensor> out;
     out.reserve(n_inputs);
     for (size_t i = 0; i < n_inputs; ++i) {
@@ -252,7 +263,7 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteBackward(
             }
         }
         auto result = C3KernelRegistry::getInstance().tryExecuteBackward(
-            base_key + "|in:" + std::to_string(i), grad, forward_inputs);
+            base_key + "|in:" + std::to_string(i), grad, fwd_feed);
         if (!result.has_value() || result->empty()) {
             {
                 std::lock_guard<std::mutex> lock(stats_mutex_);
@@ -342,7 +353,7 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteBackward(
             // 消除 miss→eager 回退与后台编译竞态导致的梯度未完整落盘（见 C3-BUG-20260903-01）。
             {
                 auto retry = C3KernelRegistry::getInstance().tryExecuteBackward(
-                    base_key + "|in:" + std::to_string(i), grad, forward_inputs);
+                    base_key + "|in:" + std::to_string(i), grad, fwd_feed);
                 if (retry.has_value() && !retry->empty()) {
                     out.push_back(std::move(retry->at(0)));
                     continue; // 该输入已用 C3 内核同步算完，继续处理下一输入
@@ -866,38 +877,31 @@ C3BackwardCapture::BackwardGraph C3BackwardCapture::buildSigmoidBackwardGraph(
     const TensorDesc& grad_desc,
     const TensorDesc& input_desc)
 {
+    // [Fix §4.108 2026-09-12] 语义变更: input_desc 为 **forward 输出 y = sigmoid(x)**(而非 x)。
+    // 根因: forward 走融合 kernel(MatMul+Add+Sigmoid region fusion/hotpath)时不物化
+    // 中间 pre-activation, 旧图重算 sigmoid(x)(exp 链)读到陈旧存储 → 梯度错
+    // (§4.107 Test 14 实测 grad 偏 0.015; eager 用 saved y 不受影响 → 两侧对拍不可见)。
+    // 反向公式改用 saved y: grad * y * (1 - y) = grad * (y - y*y) —— 3 节点、无标量广播、
+    // 无重算, 与 eager/PyTorch 语义一致。
     Graph g;
 
-    // 输入: [grad, x]
+    // 输入: [grad, y]
     size_t grad_in = g.addInput(grad_desc);
-    size_t x_in = g.addInput(input_desc);
+    size_t y_in = g.addInput(input_desc);
 
-    // Sigmoid(x): 1.0 / (1.0 + exp(-x))
-    TensorDesc neg_desc = TensorDesc::fromShape(input_desc.shape);
-    size_t neg_x = g.addNode(NegNode{neg_desc}, {x_in}, neg_desc);
+    TensorDesc same_desc = TensorDesc::fromShape(input_desc.shape);
 
-    // exp(-x)
-    size_t exp_neg = g.addNode(ExpNode{neg_desc}, {neg_x}, neg_desc);
+    // y²
+    size_t y_sq = g.addNode(MulNode{same_desc, same_desc}, {y_in, y_in}, same_desc);
 
-    // 1 + exp(-x)
-    TensorDesc one_desc = TensorDesc::fromShape({1});
-    size_t one_node = g.addConstant(1.0, one_desc);
-    size_t denom = g.addNode(AddNode{neg_desc, neg_desc}, {one_node, exp_neg}, neg_desc);
+    // y - y²  (= y * (1 - y), 无 lhs 标量广播)
+    size_t one_minus = g.addNode(SubNode{same_desc, same_desc}, {y_in, y_sq}, same_desc);
 
-    // 1.0 / (1.0 + exp(-x)) = sigmoid(x)
-    size_t sigmoid = g.addNode(DivNode{neg_desc, neg_desc}, {one_node, denom}, neg_desc);
-
-    // 1 - sigmoid(x)
-    size_t one_minus_sig = g.addNode(SubNode{neg_desc, neg_desc}, {one_node, sigmoid}, neg_desc);
-
-    // sigmoid(x) * (1 - sigmoid(x))
-    size_t sig_times_one_minus = g.addNode(MulNode{neg_desc, neg_desc}, {sigmoid, one_minus_sig}, neg_desc);
-
-    // sigmoid(x) * (1 - sigmoid(x)) * grad
-    size_t result = g.addNode(MulNode{grad_desc, neg_desc}, {grad_in, sig_times_one_minus}, neg_desc);
+    // grad * y * (1 - y)
+    size_t result = g.addNode(MulNode{grad_desc, same_desc}, {grad_in, one_minus}, same_desc);
 
     g.markOutput(result);
-    // [Fix 2026-08-11 最小集 build] 图输入 [grad, x]，x 对应 forward_inputs[0]
+    // 图输入 [grad, y]，y 对应 forward 输出(执行侧喂 node->getResult())
     return {std::move(g), {0}};
 }
 
@@ -1176,52 +1180,33 @@ C3BackwardCapture::BackwardGraph C3BackwardCapture::buildTanhBackwardGraph(
     const TensorDesc& grad_desc,
     const TensorDesc& input_desc)
 {
+    // [Fix §4.108 2026-09-12] 语义变更: input_desc 为 **forward 输出 y = tanh(x)**(而非 x)。
+    // 根因: forward 走融合 kernel(MatMul+Add+Act)时不物化中间 pre-activation,
+    // 旧图重算 tanh(x)(双 Exp 链)读到陈旧存储 → 梯度错(§4.107 Test 14 同类, tanh 潜伏)。
+    // 反向公式改用 saved y: grad * (1 - y²) = grad * (y - y*y) —— 3 节点、无标量广播、
+    // 无重算, 与 eager 的 y*(1-y*y) 语义一致(PyTorch 同款)。
     Graph g;
 
-    // 输入: [grad, x]
+    // 输入: [grad, y]
     size_t grad_in = g.addInput(grad_desc);
-    size_t x_in = g.addInput(input_desc);
+    size_t y_in = g.addInput(input_desc);
 
     TensorDesc same_desc = TensorDesc::fromShape(input_desc.shape);
 
-    // Tanh(x)
-    auto expf_func = [&](const TensorDesc& d, size_t input_id) -> size_t {
-        return g.addNode(ExpNode{d}, {input_id}, d);
-    };
+    // y²
+    size_t y_sq = g.addNode(MulNode{same_desc, same_desc}, {y_in, y_in}, same_desc);
 
-    // exp(x)
-    size_t exp_x = expf_func(same_desc, x_in);
-
-    // exp(-x): 需要先 negate
-    size_t neg_x = g.addNode(NegNode{same_desc}, {x_in}, same_desc);
-    size_t exp_neg_x = expf_func(same_desc, neg_x);
-
-    // exp(x) - exp(-x)
-    size_t numerator = g.addNode(SubNode{same_desc, same_desc}, {exp_x, exp_neg_x}, same_desc);
-
-    // exp(x) + exp(-x)
-    size_t denominator = g.addNode(AddNode{same_desc, same_desc}, {exp_x, exp_neg_x}, same_desc);
-
-    // tanh(x) = (exp(x) - exp(-x)) / (exp(x) + exp(-x))
-    size_t tanh = g.addNode(DivNode{same_desc, same_desc}, {numerator, denominator}, same_desc);
-
-    // tanh(x) * tanh(x)
-    size_t tanh_sq = g.addNode(MulNode{same_desc, same_desc}, {tanh, tanh}, same_desc);
-
-    // 1 - tanh(x)²  →  (-tanh²) + 1
-    // [Fix 2026-09-12] 原 Sub(1, tanh²) 的 lhs 是标量(lhs 标量广播), 多节点路径
-    // 对该形态的处理有缺陷(test_tanh_grad 梯度错位: ga[0] 得 ga[1] 的值 0.42)。
-    // 改为 Neg + Add(rhs 标量广播, 已支持的路径), 语义不变。
+    // 1 - y²  →  (-y²) + 1(rhs 标量广播, §4.106 已验证的多节点路径形态)
+    size_t neg_sq = g.addNode(NegNode{same_desc}, {y_sq}, same_desc);
     TensorDesc one_desc = TensorDesc::fromShape({1});
     size_t one_node = g.addConstant(1.0, one_desc);
-    size_t neg_sq = g.addNode(NegNode{same_desc}, {tanh_sq}, same_desc);
     size_t one_minus = g.addNode(AddNode{same_desc, one_desc}, {neg_sq, one_node}, same_desc);
 
-    // (1 - tanh(x)²) * grad
+    // grad * (1 - y²)
     size_t result = g.addNode(MulNode{grad_desc, same_desc}, {grad_in, one_minus}, same_desc);
 
     g.markOutput(result);
-    // [Fix 2026-08-11 最小集 build] 图输入 [grad, x]，x 对应 forward_inputs[0]
+    // 图输入 [grad, y]，y 对应 forward 输出(执行侧喂 node->getResult())
     return {std::move(g), {0}};
 }
 
@@ -2330,7 +2315,14 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteUnifiedMIMOBackw
     if (mm_type.find("MatMulNode") == std::string::npos) return std::nullopt;
 
     // 获取相关张量
-    const Tensor& z = forward_inputs.empty() ? node->getInputs()[0] : forward_inputs[0];
+    // [Fix §4.108] Tanh/Sigmoid 反向图输入语义为 forward 输出 y(融合 forward 不物化
+    // pre-activation); legacy 执行段同样喂 getResult(), 空则回退原输入。
+    const std::string cur_act_tn = std::string(typeid(*node).name());
+    const bool act_need_y =
+        nodeTypeIs(cur_act_tn, "TanhNode") || nodeTypeIs(cur_act_tn, "SigmoidNode");
+    const Tensor& z = (act_need_y && node->getResult())
+        ? *node->getResult()
+        : (forward_inputs.empty() ? node->getInputs()[0] : forward_inputs[0]);
     const Tensor& X = matmul_node->getInputs()[0];
     const Tensor& W = matmul_node->getInputs()[1];
 
@@ -2956,13 +2948,26 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteGenericChainMIMO
             plan = it->second;
         }
         // 外部 forward 张量按计划顺序喂入(firing 节点优先用 forward_inputs, 与 legacy 一致)
+        // [Fix §4.108] Tanh/Sigmoid 反向图输入语义为 forward 输出 y(融合 forward 不物化
+        // pre-activation); 喂入用 node->getResult(), 空则回退原输入。
         std::vector<Tensor> fwd_tensors;
         fwd_tensors.reserve(plan.fwd_plan.size());
         for (const auto& [i, j] : plan.fwd_plan) {
-            if (i == 0 && !forward_inputs.empty() && j < forward_inputs.size()) {
+            const ::Node* n = nodes[i];
+            const std::string tn = std::string(typeid(*n).name());
+            const bool need_y = nodeTypeIs(tn, "TanhNode") || nodeTypeIs(tn, "SigmoidNode");
+            if (need_y && n->getResult()) {
+                fwd_tensors.push_back(*n->getResult());
+                if (std::getenv("C3_GEN_FEED_DUMP")) {
+                    const float* yv = n->getResult()->data_read<float>();
+                    const float* hv = n->getInputs()[j].data_read<float>();
+                    fprintf(stderr, "[GEN-FEED] node=%s feedY y0=%.4f h0=%.4f\n",
+                            tn.c_str(), yv[0], hv[0]);
+                }
+            } else if (i == 0 && !forward_inputs.empty() && j < forward_inputs.size()) {
                 fwd_tensors.push_back(forward_inputs[j]);
             } else {
-                fwd_tensors.push_back(nodes[i]->getInputs()[j]);
+                fwd_tensors.push_back(n->getInputs()[j]);
             }
         }
         auto result = registry.tryExecuteBackward(spec.key, grad, fwd_tensors);

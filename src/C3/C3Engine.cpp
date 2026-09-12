@@ -1287,11 +1287,18 @@ std::shared_ptr<CompiledKernel> C3Engine::compile(
 
     // 如果 profiling 启用，包装为 ProfiledCompiledKernel
     if (options.enable_profiling) {
-        auto pd_it = state.profile_data.find(cache_key);
-        if (pd_it == state.profile_data.end()) {
-            pd_it = state.profile_data.emplace(cache_key, std::make_shared<ProfileData>()).first;
+        // [Fix §4.108 P2] profile_data find/emplace 移入锁内: 此前锁外操作, 并发
+        // compile() 下 unordered_map 写 race(与同函数 cache 写入的修法同源 §4.94)。
+        std::shared_ptr<ProfileData> pd;
+        {
+            std::lock_guard<std::mutex> lock(state.mutex);
+            auto pd_it = state.profile_data.find(cache_key);
+            if (pd_it == state.profile_data.end()) {
+                pd_it = state.profile_data.emplace(cache_key, std::make_shared<ProfileData>()).first;
+            }
+            pd = pd_it->second;
         }
-        return std::make_shared<ProfiledCompiledKernel>(kernel, pd_it->second);
+        return std::make_shared<ProfiledCompiledKernel>(kernel, pd);
     }
 
     return kernel;
