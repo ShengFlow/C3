@@ -227,7 +227,8 @@ Graph Graph::canonicalize(const CanonicalizeRules& rules) const {
         // 检查每条规则
         for (size_t r = 0; r < rules.rules.size(); ++r) {
             // 规则 1: Add(x, 0) → x
-            if (rules.rule_names[r] == "Add(x,0)->x" &&
+            if (node.inputs.size() >= 2 &&
+                rules.rule_names[r] == "Add(x,0)->x" &&
                 std::holds_alternative<AddNode>(node.op)) {
                 for (size_t in_idx = 0; in_idx < node.inputs.size(); ++in_idx) {
                     size_t in_id = node_map[node.inputs[in_idx]];
@@ -244,7 +245,8 @@ Graph Graph::canonicalize(const CanonicalizeRules& rules) const {
             }
 
             // 规则 2: Mul(x, 1) → x
-            if (rules.rule_names[r] == "Mul(x,1)->x" &&
+            if (node.inputs.size() >= 2 &&
+                rules.rule_names[r] == "Mul(x,1)->x" &&
                 std::holds_alternative<MulNode>(node.op)) {
                 for (size_t in_idx = 0; in_idx < node.inputs.size(); ++in_idx) {
                     size_t in_id = node_map[node.inputs[in_idx]];
@@ -261,7 +263,8 @@ Graph Graph::canonicalize(const CanonicalizeRules& rules) const {
             }
 
             // 规则 3: Mul(x, 0) → 0
-            if (rules.rule_names[r] == "Mul(x,0)->0" &&
+            if (node.inputs.size() >= 2 &&
+                rules.rule_names[r] == "Mul(x,0)->0" &&
                 std::holds_alternative<MulNode>(node.op)) {
                 for (size_t in_idx = 0; in_idx < node.inputs.size(); ++in_idx) {
                     size_t in_id = node_map[node.inputs[in_idx]];

@@ -1331,7 +1331,9 @@ CompileFuture C3Engine::compileAsync(
             std::mutex mutex;
             std::condition_variable cv;
             bool done = false;       // compile 线程完成
-            bool timed_out = false;  // watchdog 判定超时
+            // [Fix §4.95 P2] timed_out 由 compile 线程无锁读、watchdog 持锁写 → data race;
+            // 改 atomic 消除(功能语义不变, 原由 promise try/catch 兜底)
+            std::atomic<bool> timed_out{false};  // watchdog 判定超时
             std::shared_ptr<CompiledKernel> kernel;
             std::string error;
         };
@@ -2077,9 +2079,11 @@ void C3Engine::shutdown() {
                 if (status == std::future_status::ready) {
                     try { f.get(); } catch (...) {} // 吸收异常
                 } else {
+                    // [Fix §4.95 P2] 注释与实现对齐: std::future 析构对 std::async 任务
+                    // 会阻塞等待其完成, 并非 abandon; 真实语义是"放弃限时等待, 由析构兜底阻塞"。
                     CtorchError::log(ErrorLevel::WARN, ErrorPlatform::kGENERAL, ErrorType::UNKNOWN,
                         "C3Engine::shutdown: background compile did not finish in 30s, "
-                        "future abandoned (may cause UAF if main exits before thread finishes)");
+                        "giving up bounded wait (future dtor will block until thread finishes)");
                 }
             }
         }

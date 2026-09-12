@@ -289,7 +289,14 @@ void buildLinalgFusedFunc(mlir::OpBuilder& builder, mlir::Location loc,
                     else if constexpr (std::is_same_v<T, DivNode>) {
                         auto lhs = val_map.at(node->inputs[0]);
                         auto rhs = val_map.at(node->inputs[1]);
-                        result = b.create<mlir::arith::DivFOp>(regionLoc, lhs, rhs);
+                        // [Fix §4.95 P2] 除零语义统一 NaN(与其它编译路径一致)
+                        auto zero_c = mlir::arith::ConstantFloatOp::create(b, regionLoc, f32Type, llvm::APFloat(0.0f));
+                        auto is_zero = b.create<mlir::arith::CmpFOp>(
+                            regionLoc, mlir::arith::CmpFPredicate::OEQ, rhs, zero_c);
+                        auto raw = b.create<mlir::arith::DivFOp>(regionLoc, lhs, rhs);
+                        auto nan_c = mlir::arith::ConstantFloatOp::create(
+                            b, regionLoc, f32Type, llvm::APFloat::getNaN(llvm::APFloat::IEEEsingle()));
+                        result = b.create<mlir::arith::SelectOp>(regionLoc, is_zero, nan_c, raw);
                     }
                     else if constexpr (std::is_same_v<T, GtNode>) {
                         auto lhs = val_map.at(node->inputs[0]);

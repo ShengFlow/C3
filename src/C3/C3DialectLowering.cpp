@@ -343,7 +343,21 @@ struct BinaryOpLowering : public mlir::OpRewritePattern<SrcOp> {
 
                     mlir::Value lv = bld.create<mlir::LLVM::LoadOp>(loc, vec_ty, l_ptr, 16);
                     mlir::Value rv = bld.create<mlir::LLVM::LoadOp>(loc, vec_ty, r_ptr, 16);
-                    mlir::Value res = bld.create<ArithOp>(loc, lv, rv);
+                    // [Fix §4.95 P2] Div 除零语义统一为 NaN(与 buildFused 守卫一致)
+                    mlir::Value res;
+                    if constexpr (std::is_same_v<ArithOp, mlir::arith::DivFOp>) {
+                        auto zero_vec = bld.create<mlir::arith::ConstantOp>(
+                            loc, vec_ty, mlir::SplatElementsAttr::get(vec_ty, llvm::APFloat(0.0f)));
+                        auto is_zero = bld.create<mlir::arith::CmpFOp>(
+                            loc, mlir::arith::CmpFPredicate::OEQ, rv, zero_vec);
+                        auto raw = bld.create<ArithOp>(loc, lv, rv);
+                        auto nan_vec = bld.create<mlir::arith::ConstantOp>(
+                            loc, vec_ty, mlir::SplatElementsAttr::get(
+                                vec_ty, llvm::APFloat::getNaN(llvm::APFloat::IEEEsingle())));
+                        res = bld.create<mlir::arith::SelectOp>(loc, is_zero, nan_vec, raw);
+                    } else {
+                        res = bld.create<ArithOp>(loc, lv, rv);
+                    }
                     bld.create<mlir::LLVM::StoreOp>(loc, res, o_ptr, 16);
                 },
                 [&](mlir::OpBuilder& bld, mlir::Location loc, mlir::Value idx) {
@@ -353,7 +367,19 @@ struct BinaryOpLowering : public mlir::OpRewritePattern<SrcOp> {
 
                     mlir::Value lv = bld.create<mlir::LLVM::LoadOp>(loc, f32, l_ptr);
                     mlir::Value rv = bld.create<mlir::LLVM::LoadOp>(loc, f32, r_ptr);
-                    mlir::Value res = bld.create<ArithOp>(loc, lv, rv);
+                    // [Fix §4.95 P2] Div 除零统一 NaN(与向量分支/buildFused 一致)
+                    mlir::Value res;
+                    if constexpr (std::is_same_v<ArithOp, mlir::arith::DivFOp>) {
+                        auto zero_v = bld.create<mlir::arith::ConstantFloatOp>(loc, f32, llvm::APFloat(0.0f));
+                        auto is_zero = bld.create<mlir::arith::CmpFOp>(
+                            loc, mlir::arith::CmpFPredicate::OEQ, rv, zero_v);
+                        auto raw = bld.create<ArithOp>(loc, lv, rv);
+                        auto nan_v = bld.create<mlir::arith::ConstantFloatOp>(
+                            loc, f32, llvm::APFloat::getNaN(llvm::APFloat::IEEEsingle()));
+                        res = bld.create<mlir::arith::SelectOp>(loc, is_zero, nan_v, raw);
+                    } else {
+                        res = bld.create<ArithOp>(loc, lv, rv);
+                    }
                     bld.create<mlir::LLVM::StoreOp>(loc, res, o_ptr, 16);
                 });
         } else {
@@ -374,7 +400,19 @@ struct BinaryOpLowering : public mlir::OpRewritePattern<SrcOp> {
 
                     mlir::Value lv = bld.create<mlir::LLVM::LoadOp>(loc, f32, l_ptr);
                     mlir::Value rv = bld.create<mlir::LLVM::LoadOp>(loc, f32, r_ptr);
-                    mlir::Value res = bld.create<ArithOp>(loc, lv, rv);
+                    // [Fix §4.95 P2] Div 除零统一 NaN(与向量分支/buildFused 一致)
+                    mlir::Value res;
+                    if constexpr (std::is_same_v<ArithOp, mlir::arith::DivFOp>) {
+                        auto zero_v = bld.create<mlir::arith::ConstantFloatOp>(loc, f32, llvm::APFloat(0.0f));
+                        auto is_zero = bld.create<mlir::arith::CmpFOp>(
+                            loc, mlir::arith::CmpFPredicate::OEQ, rv, zero_v);
+                        auto raw = bld.create<ArithOp>(loc, lv, rv);
+                        auto nan_v = bld.create<mlir::arith::ConstantFloatOp>(
+                            loc, f32, llvm::APFloat::getNaN(llvm::APFloat::IEEEsingle()));
+                        res = bld.create<mlir::arith::SelectOp>(loc, is_zero, nan_v, raw);
+                    } else {
+                        res = bld.create<ArithOp>(loc, lv, rv);
+                    }
                     bld.create<mlir::LLVM::StoreOp>(loc, res, o_ptr, 16);
                 });
         }
@@ -1006,8 +1044,9 @@ struct CrossEntropyOpLowering : public mlir::OpRewritePattern<mlir::c3::CrossEnt
         mlir::Value p1 = rewriter.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, logits,
             mlir::ValueRange{idx1});
         mlir::Value v1 = rewriter.create<mlir::LLVM::LoadOp>(loc, f32, p1);
-        // max(a, b) 用 arith.maximumf（与 0 比较 NaN-safe）
-        mlir::Value new_max = rewriter.create<mlir::arith::MaximumFOp>(loc, max_carry, v1);
+        // [Fix §4.95 P2] maximumf 为 NaN 传播语义, 与注释「NaN-safe」相反;
+        // 改 MaxNumFOp(非传播): 全 NaN 行也能得到行 max(而非 NaN 扩散)
+        mlir::Value new_max = rewriter.create<mlir::arith::MaxNumFOp>(loc, max_carry, v1);
         rewriter.create<mlir::scf::YieldOp>(loc, mlir::ValueRange{new_max});
 
         rewriter.setInsertionPointAfter(max_loop);

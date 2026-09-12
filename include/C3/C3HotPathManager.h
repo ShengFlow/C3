@@ -511,7 +511,11 @@ private:
             // [修复] 此前无此 case，落 default 会静默返回 SigmoidNode（把 silu 当 sigmoid 编译）。
             return SiLUNode{desc};
         default:
-            return SigmoidNode{desc}; // fallback
+            // [Fix §4.95 P2] 原静默返回 SigmoidNode(未知 op 被当 sigmoid 编译, 与已修
+            // SiLU 缺失同模式); 改抛异常 fail-fast —— 编译失败回退 eager, 绝不静默错编译
+            throw std::runtime_error(
+                "makeNodeVariant: unsupported op for C3 node variant (op not in "
+                "Add/Sub/Mul/Div/Neg/ReLU/Sigmoid/SiLU/Tanh whitelist)");
         }
     }
 
@@ -872,7 +876,13 @@ private:
                     // 查找剩余的外部输入
                     size_t ext_idx = 0;
                     for (size_t rj = 0; rj < ri; ++rj) {
-                        ext_idx += infos[rj].input_descs.size();
+                        // [Fix §4.95 P2] 每个中间节点(rj>0)的第 1 个输入是链内输入,
+                        // 不计入外部输入数; 原按 input_descs.size() 全计, 二元尾链时
+                        // 第二个外部输入索引错位(静默丢失)。当前 pattern 均为一元,
+                        // 此改动无行为差异(一元节点该循环体不执行)
+                        size_t n = infos[rj].input_descs.size();
+                        if (rj > 0 && n > 0) n -= 1;
+                        ext_idx += n;
                     }
                     // 跳过第一个节点已消费的
                     ext_idx += (ii - 1); // 因为当前节点的第一个输入是 chain 内部的

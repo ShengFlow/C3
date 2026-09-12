@@ -616,8 +616,7 @@ public:
      *          格式（watchdog L761 写入），找到匹配的 cache_key 即返回 true。
      *          注意：last_compile_error_ 是**全局最近一次**错误，可能被后续编译覆盖，**仅在
      *          future.get() 返回 nullptr 之后立即查询才可靠**。
-     */
-    [[nodiscard]] bool wasAsyncCompileTimedOut(const std::string& cache_key) const;
+
 
     /**
      * @brief 设置异步编译超时（毫秒），默认 30000ms (30s)

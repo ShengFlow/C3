@@ -224,7 +224,20 @@ struct BinaryTensorOpLowering : public OpRewritePattern<SrcOp> {
             indexingMaps,
             iterTypes,
             [&](OpBuilder& b, Location regionLoc, ValueRange args) {
-                Value res = b.create<ArithOp>(regionLoc, args[0], args[1]);
+                // [Fix §4.95 P2] Div 除零统一 NaN(与其它编译路径一致)
+                Value res;
+                if constexpr (std::is_same_v<ArithOp, mlir::arith::DivFOp>) {
+                    auto zero_c = b.create<mlir::arith::ConstantFloatOp>(
+                        regionLoc, b.getF32Type(), llvm::APFloat(0.0f));
+                    auto is_zero = b.create<mlir::arith::CmpFOp>(
+                        regionLoc, mlir::arith::CmpFPredicate::OEQ, args[1], zero_c);
+                    auto raw = b.create<ArithOp>(regionLoc, args[0], args[1]);
+                    auto nan_c = b.create<mlir::arith::ConstantFloatOp>(
+                        regionLoc, b.getF32Type(), llvm::APFloat::getNaN(llvm::APFloat::IEEEsingle()));
+                    res = b.create<mlir::arith::SelectOp>(regionLoc, is_zero, nan_c, raw);
+                } else {
+                    res = b.create<ArithOp>(regionLoc, args[0], args[1]);
+                }
                 b.create<linalg::YieldOp>(regionLoc, ValueRange{res});
             });
 

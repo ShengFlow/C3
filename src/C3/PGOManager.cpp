@@ -741,7 +741,9 @@ void PGOManager::clear() {
     std::lock_guard<std::mutex> lock(mutex_);
     entries_.clear();
     cache_.clear();
-    active_compilations_.store(0, std::memory_order_release);
+    // [Fix §4.95 P2] 不再重置 active_compilations_: 在途编译完成时的 fetch_sub(1)
+    // 与归零并发会令 uint64 下溢(0-1=极大值), canAcceptCompilation 永久 false。
+    // 让在途编译自然递减到 0 即可。
     total_queue_rejections_ = 0;
     {
         std::lock_guard<std::mutex> qlock(queue_mutex_);
@@ -753,11 +755,19 @@ void PGOManager::clear() {
 
 void PGOManager::promoteAll() {
     // 强制所有待编译 kernel 立即启动编译链
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (const auto& sp : entries_) {
-        if (sp) {
-            sp->promote();
+    // [Fix §4.95 P2] 先快照后锁外 promote: 原持 mutex_ 调 promote → compileO2/Ofast
+    // 再取 compile_mutex_/state.mutex, 与 clearCache(state.mutex → PGOManager::clear)
+    // 构成潜在 ABBA 锁序反转
+    std::vector<std::shared_ptr<PGOCompiledKernel>> snapshot;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        snapshot.reserve(entries_.size());
+        for (const auto& sp : entries_) {
+            if (sp) snapshot.push_back(sp);
         }
+    }
+    for (const auto& sp : snapshot) {
+        sp->promote();
     }
 }
 

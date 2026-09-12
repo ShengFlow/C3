@@ -386,8 +386,14 @@ std::string GraphMerger::mergedCacheKey(const std::vector<Graph>& sub_graphs,
     }
     for (const auto& link : spec.links) {
         out += '|';
+        // [Fix §4.95 P2] 序列化 from/to subgraph(此前只序列化 output/input 索引,
+        // 显式 4 参 MergeLink 的不同拓扑会碰撞同一 key)
+        out += std::to_string(link.from_subgraph);
+        out += ':';
         out += std::to_string(link.from_output);
         out += "->";
+        out += std::to_string(link.to_subgraph);
+        out += ':';
         if (link.to_input == SIZE_MAX) {
             out += "END";
         } else {

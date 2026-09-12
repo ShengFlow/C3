@@ -97,8 +97,11 @@ void RegionFusionRegistry::installWithCost(
     // DEBT-NEW-7 关键修复:把 first_input_shapes[0] 的 shape 信息混入 hash,
     // 避免不同 shape 的同 op_seq region 互相覆盖(MNIST 三层 W1/W2/W3 同 op_seq)
     uint64_t shape_hash = 0;
-    if (!first_input_shapes.empty()) {
-        for (auto s : first_input_shapes.front()) {
+    // [Fix §4.95 P2] 全部输入形状入 hash(此前仅第一个输入, 同 op_seq 首输入同形、
+    // 次输入异形时 hash 碰撞互相覆盖 —— DEBT-NEW-7 修复不完整)
+    for (const auto& shp : first_input_shapes) {
+        shape_hash = shape_hash * 31 + shp.size() + 1;
+        for (auto s : shp) {
             shape_hash = shape_hash * 31 + s + 1;
         }
     }
