@@ -181,6 +181,28 @@ public:
     };
 
     /**
+     * @brief 纯识别器产物: 值语义规格 + 本次调用内的只读拓扑视图(§4.110 FCIS 层次1)
+     * @details spec 可跨线程传给编译(零 Node* 引用); nodes 为 BFS 加入序的只读指针视图,
+     *          供执行段取 live tensor / 写 pending, 生命周期限于同一次 tryExecute 调用。
+     */
+    struct GenericChainMatch {
+        GenericChainSpec spec;                ///< 编译规格
+        std::vector<const ::Node*> nodes;     ///< index 0 = firing(BFS 加入序, 与 spec.types 对齐)
+    };
+
+    /**
+     * @brief 纯识别器: 由 Node 图拓扑 + grad 形状判定通用树匹配并生成编译规格
+     * @details **函数式内核**(FCIS 层次1): 只读 Node 图(getInputs/getUpStreamNodes/
+     *          getDownstreamCount)与 shape, 不触碰任何成员状态, 无副作用、确定性 ——
+     *          可脱离编译/执行单独测试(图 in → 判定/规格 out)。
+     *          入口守卫(白名单激活/MatMul)、走树(BFS + 单消费者 + 层边界)、
+     *          捕获条件(≥2 节点且含 MatMul)、key 构造全在此; 返回 nullopt 即
+     *          「不匹配/守卫拒绝」, 调用方透传给下一级识别器。
+     */
+    std::optional<GenericChainMatch> buildGenericChainMatch(
+        const ::Node* node, const Tensor& grad) const;
+
+    /**
      * @brief 通用线性链反向融合异步编译(值语义, 只依赖 spec)
      */
     void compileGenericChainMIMOAsync(GenericChainSpec spec);

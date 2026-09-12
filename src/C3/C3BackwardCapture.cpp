@@ -43,6 +43,12 @@
 
 namespace ct {
 namespace c3 {
+// [§4.110 FCIS 品味清理] 前置声明(定义在文件后部 nodeTypeIs 附近):
+// Tanh/Sigmoid 反向图输入语义为 forward 输出 y(§4.108), 三处执行喂入共用此取用。
+static Tensor fwdFeedTensorFor(const ::Node* n, size_t input_index,
+                               const std::vector<Tensor>& forward_inputs,
+                               bool prefer_forward_inputs);
+
 
 // ======================= 单例 =======================
 
@@ -243,14 +249,9 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteBackward(
     // 任一输入的 kernel 缺失 → 整体回退 eager（保证正确性），仅触发缺失输入编译。
     // [Fix §4.108] Tanh/Sigmoid 反向图输入语义为 forward 输出 y(融合 forward 不物化
     // pre-activation, 旧图重算读陈旧存储); 喂入用 node->getResult(), 空则回退原输入。
-    const std::string fwd_type_name = type_name;
-    const bool feed_result_y =
-        (fwd_type_name.find("TanhNode") != std::string::npos ||
-         fwd_type_name.find("SigmoidNode") != std::string::npos) &&
-        node->getResult() != nullptr;
     std::vector<Tensor> fwd_feed = forward_inputs;
-    if (feed_result_y && !fwd_feed.empty()) {
-        fwd_feed[0] = *node->getResult();
+    if (!fwd_feed.empty()) {
+        fwd_feed[0] = fwdFeedTensorFor(node, 0, forward_inputs, /*prefer_forward_inputs=*/true);
     }
     std::vector<Tensor> out;
     out.reserve(n_inputs);
@@ -792,6 +793,24 @@ static bool nodeTypeIs(const std::string& node_type, const char* cls) {
 // [ADR-012 ④ 阶段二] 通用树白名单(v2): ReLU/Add/MatMul/SiLU/Mul。
 // v1 线性链 {ReLU,Add,MatMul}(FC); v2 树拓扑加 SiLU/Mul(FFN SwiGLU)。
 // Tanh/Sigmoid 待 tanh 反向图执行层专项修复后纳入。
+// [§4.110 FCIS 品味清理] Tanh/Sigmoid 反向图输入语义为 forward 输出 y(融合 forward
+// 不物化 pre-activation, §4.108); 三处执行喂入(phase1 / 通用树 / legacy FC)共用此取用:
+// y 可用则喂 y, 否则回退节点输入(或调用方 forward_inputs)。此前三处各写一份判断,
+// 且「树内非 firing 的 Tanh/Sigmoid」分支漏判(y 语义图却喂 h) —— 统一后一并消除。
+static Tensor fwdFeedTensorFor(const ::Node* n, size_t input_index,
+                               const std::vector<Tensor>& forward_inputs,
+                               bool prefer_forward_inputs) {
+    const std::string tn = std::string(typeid(*n).name());
+    if ((nodeTypeIs(tn, "TanhNode") || nodeTypeIs(tn, "SigmoidNode")) && n->getResult()) {
+        return *n->getResult();   // y 语义优先(与调用点位置无关: 该节点的反向图就是吃 y 的)
+    }
+    // 仅 firing 节点(i==0)可用调用方的 forward_inputs —— 那是它的输入; 其余节点必须取自身输入
+    if (prefer_forward_inputs && input_index < forward_inputs.size()) {
+        return forward_inputs[input_index];
+    }
+    return n->getInputs()[input_index];
+}
+
 static bool isGenericChainNode(const std::string& node_type) {
     return nodeTypeIs(node_type, "ReLUNode") ||
            nodeTypeIs(node_type, "AddNode") ||
@@ -2323,12 +2342,8 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteUnifiedMIMOBackw
     // 获取相关张量
     // [Fix §4.108] Tanh/Sigmoid 反向图输入语义为 forward 输出 y(融合 forward 不物化
     // pre-activation); legacy 执行段同样喂 getResult(), 空则回退原输入。
-    const std::string cur_act_tn = std::string(typeid(*node).name());
-    const bool act_need_y =
-        nodeTypeIs(cur_act_tn, "TanhNode") || nodeTypeIs(cur_act_tn, "SigmoidNode");
-    const Tensor& z = (act_need_y && node->getResult())
-        ? *node->getResult()
-        : (forward_inputs.empty() ? node->getInputs()[0] : forward_inputs[0]);
+    Tensor z_holder = fwdFeedTensorFor(node, 0, forward_inputs, /*prefer_forward_inputs=*/true);
+    const Tensor& z = z_holder;
     const Tensor& X = matmul_node->getInputs()[0];
     const Tensor& W = matmul_node->getInputs()[1];
 
@@ -2865,10 +2880,12 @@ static std::shared_ptr<CompiledKernel> tryG3TakeoverKernel(
 //   - 编译线程只收值语义 spec(零 Node* 引用, 沿用 MIMO pending 生命周期模式)。
 //   - planner/G3 接管与 legacy 同口径(computeMimoPartition + tryG3TakeoverKernel)。
 
-std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteGenericChainMIMO(
-    const ::Node* node, const Tensor& grad,
-    const std::vector<Tensor>& forward_inputs)
-{
+// ======================= 纯识别器(§4.110 FCIS 层次1: 函数式内核) =======================
+// 只读 Node 图拓扑与 shape, 不触碰任何成员状态: 无副作用、确定性 —— 可脱离编译/执行
+// 单独测试(图 in → 判定/规格 out)。入口守卫(白名单激活/MatMul)、走树(BFS + 单消费者
+// + 层边界)、捕获条件、key 构造全在此; 执行段(registry/喂入/pending/统计)留在外壳。
+std::optional<C3BackwardCapture::GenericChainMatch>
+C3BackwardCapture::buildGenericChainMatch(const ::Node* node, const Tensor& grad) const {
     // ---- 入口守卫: (单输入 ReLU) 或 (双输入 MatMul) ----
     const std::string t0 = std::string(typeid(*node).name());
     const bool entry_act = node->getInputs().size() == 1 &&
@@ -2942,6 +2959,26 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteGenericChainMIMO
     spec.parent_edge = std::move(parent_edge);
     spec.key = ss.str();
 
+
+    // ---- 纯识别产物: 值语义规格 + 只读拓扑视图 ----
+    GenericChainMatch match;
+    match.spec = std::move(spec);
+    match.nodes = std::move(nodes);
+    return match;
+}
+
+std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteGenericChainMIMO(
+    const ::Node* node, const Tensor& grad,
+    const std::vector<Tensor>& forward_inputs)
+{
+    // ---- 函数式内核: 纯识别(可单独测试) ----
+    auto match_opt = buildGenericChainMatch(node, grad);
+    if (!match_opt.has_value()) return std::nullopt;   // 不匹配/守卫拒绝 → 透传
+    GenericChainMatch match = std::move(*match_opt);
+    const GenericChainSpec& spec = match.spec;
+    const std::vector<const ::Node*>& nodes = match.nodes;
+
+    // ---- 命令式外壳: registry 查询 / kernel 执行 / pending 记账 / 统计 / miss 编译 ----
     // ---- 执行段 ----
     auto& registry = C3KernelRegistry::getInstance();
     if (registry.hasBackwardKey(spec.key)) {
@@ -2959,22 +2996,10 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteGenericChainMIMO
         std::vector<Tensor> fwd_tensors;
         fwd_tensors.reserve(plan.fwd_plan.size());
         for (const auto& [i, j] : plan.fwd_plan) {
-            const ::Node* n = nodes[i];
-            const std::string tn = std::string(typeid(*n).name());
-            const bool need_y = nodeTypeIs(tn, "TanhNode") || nodeTypeIs(tn, "SigmoidNode");
-            if (need_y && n->getResult()) {
-                fwd_tensors.push_back(*n->getResult());
-                if (std::getenv("C3_GEN_FEED_DUMP")) {
-                    const float* yv = n->getResult()->data_read<float>();
-                    const float* hv = n->getInputs()[j].data_read<float>();
-                    fprintf(stderr, "[GEN-FEED] node=%s feedY y0=%.4f h0=%.4f\n",
-                            tn.c_str(), yv[0], hv[0]);
-                }
-            } else if (i == 0 && !forward_inputs.empty() && j < forward_inputs.size()) {
-                fwd_tensors.push_back(forward_inputs[j]);
-            } else {
-                fwd_tensors.push_back(n->getInputs()[j]);
-            }
+            // 仅 firing 节点(i==0)可取调用方 forward_inputs —— 那正是它的输入; 树内其余
+            // 节点必须取自身输入(helper 内按 forward_inputs.size() 兜底, 此处无需再判空)。
+            fwd_tensors.push_back(fwdFeedTensorFor(
+                nodes[i], j, forward_inputs, /*prefer_forward_inputs=*/i == 0));
         }
         auto result = registry.tryExecuteBackward(spec.key, grad, fwd_tensors);
         if (result.has_value() && result->size() == plan.total_outputs) {
@@ -3012,7 +3037,7 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteGenericChainMIMO
     }
 
     // ---- miss → 异步编译 ----
-    compileGenericChainMIMOAsync(std::move(spec));
+    compileGenericChainMIMOAsync(std::move(match.spec));
     {
         std::lock_guard<std::mutex> slock(stats_mutex_);
         mimo_miss_count_++;
@@ -3038,6 +3063,12 @@ void C3BackwardCapture::compileGenericChainMIMOAsync(GenericChainSpec spec) {
     try {
     std::thread([this, spec = std::move(spec)]() {
         struct TaskGuard { C3BackwardCapture* self; ~TaskGuard() { self->taskFinished(); } } guard{this};
+        // [§4.110 品味清理] 编译线程内所有「防御性放弃编译」路径统一走此后置清理,
+        // 避免 4 处各写一份 erase+return(漏一处即 pending 残留, 见 §4.97 批C)。
+        auto bail_compile = [this, &spec]() {
+            std::lock_guard<std::mutex> lock(pending_mutex_);
+            pending_compiles_.erase(spec.key);
+        };
         try {
             const size_t k = spec.types.size();
 
@@ -3061,8 +3092,7 @@ void C3BackwardCapture::compileGenericChainMIMOAsync(GenericChainSpec spec) {
                     const int p = spec.parent_idx[i];
                     const int pe = spec.parent_edge[i];
                     if (p < 0 || pe < 0) {   // 防御: 树结构损坏
-                        std::lock_guard<std::mutex> lock(pending_mutex_);
-                        pending_compiles_.erase(spec.key);
+                        bail_compile();
                         return;
                     }
                     const int sl = slot_map[p][static_cast<size_t>(pe)];
@@ -3079,8 +3109,7 @@ void C3BackwardCapture::compileGenericChainMIMOAsync(GenericChainSpec spec) {
                 if (i == 0 && m > 1) {
                     // firing 多输入: v2 仅支持 MatMul 双输入(单图双输出)
                     if (!nodeTypeIs(spec.types[i], "MatMulNode") || m != 2) {
-                        std::lock_guard<std::mutex> lock(pending_mutex_);
-                        pending_compiles_.erase(spec.key);
+                        bail_compile();
                         return;
                     }
                     const TensorDesc& gd = gdesc[0];
@@ -3119,16 +3148,14 @@ void C3BackwardCapture::compileGenericChainMIMOAsync(GenericChainSpec spec) {
                         // 恒等透传: grad(i,j) == 流入节点 i 的 grad 张量(父边槽)
                         if (i == 0) {
                             // firing 节点(ReLU)不可能命中; 防御性放弃整树
-                            std::lock_guard<std::mutex> lock(pending_mutex_);
-                            pending_compiles_.erase(spec.key);
+                            bail_compile();
                             return;
                         }
                         slot_map[i][j] =
                             slot_map[static_cast<size_t>(spec.parent_idx[i])]
                                     [static_cast<size_t>(spec.parent_edge[i])];
                         if (slot_map[i][j] < 0) {   // 父边也是别名且未解析(防御)
-                            std::lock_guard<std::mutex> lock(pending_mutex_);
-                            pending_compiles_.erase(spec.key);
+                            bail_compile();
                             return;
                         }
                         continue;
@@ -3137,8 +3164,7 @@ void C3BackwardCapture::compileGenericChainMIMOAsync(GenericChainSpec spec) {
                         spec.types[i], j, gdesc[i], spec.input_descs[i]);
                     if (!bg.has_value() || bg->first.outputs().empty()) {
                         // 结构不支持 → 放弃编译(执行侧回退 eager)
-                        std::lock_guard<std::mutex> lock(pending_mutex_);
-                        pending_compiles_.erase(spec.key);
+                        bail_compile();
                         return;
                     }
                     slot_map[i][j] = static_cast<int>(out_prefix);
@@ -3186,6 +3212,16 @@ void C3BackwardCapture::compileGenericChainMIMOAsync(GenericChainSpec spec) {
             for (size_t s = 0; s < subgraphs.size(); ++s) {
                 for (size_t f : fwd_map_of[s]) {
                     fwd_plan.push_back({sub_owner[s].first, f});
+                }
+            }
+            // [§4.110] 计划自校验: (链节点索引, 输入索引) 必须落在 spec 声明的形状内。
+            // 执行侧按此索引直接取节点输入, 越界即取错张量 —— 形状不符会使下游 GEMM 按
+            // 错误 extent 读, 表现为 SIGBUS/静默错值(本轮实测: 喂错张量 → 3/3 确定性崩)。
+            // 校验失败即放弃编译(不装 kernel): 执行侧「计划缺失即透传」保证安全回退。
+            for (const auto& [ni, ii] : fwd_plan) {
+                if (ni >= k || ii >= spec.input_descs[ni].size()) {
+                    bail_compile();
+                    return;
                 }
             }
 
