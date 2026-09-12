@@ -752,8 +752,10 @@ bool C3BackwardCapture::supportsNodeType(const std::string& node_type) {
     //   避免名义支持(返回 true)却编不出 kernel 的脱节。此前 GELU/LReLU/Sin/Cos/Abs/Min/Max
     //   被列在此却无对应 builder case(一律 nullopt), 只会进融合序列统计、永不产出 kernel。
     //   多输入单节点 kernel(Add/Sub/Mul/MatMul/Softmax 等)仍按注释回退 eager(正确性优先)。
+    // [Fix 2026-09-12] TanhNode 暂移出名单: 其 C3 反向多节点图执行有缺陷
+    // (测试实测 ga=[1,1,1], 恒等输出; 图内 exp/neg/sub 链执行产物全错),
+    // 回退 eager 保证正确性(与 CE 短路同哲学)。待反向图执行层专项修复后恢复。
     return nodeTypeIs(node_type, "ReLUNode") ||
-           nodeTypeIs(node_type, "TanhNode") ||
            nodeTypeIs(node_type, "NegNode") ||
            nodeTypeIs(node_type, "ExpNode") ||
            nodeTypeIs(node_type, "LogNode") ||
@@ -1159,10 +1161,14 @@ C3BackwardCapture::BackwardGraph C3BackwardCapture::buildTanhBackwardGraph(
     // tanh(x) * tanh(x)
     size_t tanh_sq = g.addNode(MulNode{same_desc, same_desc}, {tanh, tanh}, same_desc);
 
-    // 1 - tanh(x)²
+    // 1 - tanh(x)²  →  (-tanh²) + 1
+    // [Fix 2026-09-12] 原 Sub(1, tanh²) 的 lhs 是标量(lhs 标量广播), 多节点路径
+    // 对该形态的处理有缺陷(test_tanh_grad 梯度错位: ga[0] 得 ga[1] 的值 0.42)。
+    // 改为 Neg + Add(rhs 标量广播, 已支持的路径), 语义不变。
     TensorDesc one_desc = TensorDesc::fromShape({1});
     size_t one_node = g.addConstant(1.0, one_desc);
-    size_t one_minus = g.addNode(SubNode{same_desc, one_desc}, {one_node, tanh_sq}, same_desc);
+    size_t neg_sq = g.addNode(NegNode{same_desc}, {tanh_sq}, same_desc);
+    size_t one_minus = g.addNode(AddNode{same_desc, one_desc}, {neg_sq, one_node}, same_desc);
 
     // (1 - tanh(x)²) * grad
     size_t result = g.addNode(MulNode{grad_desc, same_desc}, {grad_in, one_minus}, same_desc);
