@@ -262,25 +262,48 @@ struct TransposeOpLowering : public mlir::OpRewritePattern<mlir::c3::TransposeOp
         auto ptr_type = mlir::LLVM::LLVMPointerType::get(rewriter.getContext());
 
         if ((dim0 == 0 && dim1 == 1) || (dim0 == 1 && dim1 == 0)) {
+            // [§4.109 A2] cache blocking: 原实现为 i 外 / j 内的裸双层循环 —— 内层 j
+            // 变化时 out[j*M+i] 地址步长为 M(列式写, 每次跨行 → cache line 反复失效)。
+            // 改为 32x32 tile: 外层 (tj, ti) 分块, 内层 i 连续 → out 行内连续写,
+            // in[i*N+j] 的列式读被限制在 tile 内(48x48 级工作集), 两侧 stride 访问
+            // 都收敛到 L1 —— 经典 tiled transpose。纯搬运, 数值逐位不变。
+            constexpr int64_t kTile = 32;
             mlir::Value M_v = rewriter.create<mlir::arith::ConstantIndexOp>(loc, M);
             mlir::Value N_v = rewriter.create<mlir::arith::ConstantIndexOp>(loc, N);
             mlir::Value c0 = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 0);
             mlir::Value c1 = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 1);
+            mlir::Value kTile_v = rewriter.create<mlir::arith::ConstantIndexOp>(loc, kTile);
 
-            auto loop_i = rewriter.create<mlir::scf::ForOp>(loc, c0, M_v, c1);
-            rewriter.setInsertionPointToStart(loop_i.getBody());
-            mlir::Value i_idx = loop_i.getInductionVar();
-            mlir::Value i_i64 = indexToI64(rewriter, loc, i_idx);
+            auto loop_tj = rewriter.create<mlir::scf::ForOp>(loc, c0, N_v, kTile_v);
+            rewriter.setInsertionPointToStart(loop_tj.getBody());
+            mlir::Value tj = loop_tj.getInductionVar();
 
-            auto loop_j = rewriter.create<mlir::scf::ForOp>(loc, c0, N_v, c1);
+            auto loop_ti = rewriter.create<mlir::scf::ForOp>(loc, c0, M_v, kTile_v);
+            rewriter.setInsertionPointToStart(loop_ti.getBody());
+            mlir::Value ti = loop_ti.getInductionVar();
+
+            // tile 边界 min(t + kTile, extent)
+            mlir::Value i_end = rewriter.create<mlir::arith::MinSIOp>(
+                loc, rewriter.create<mlir::arith::AddIOp>(loc, ti, kTile_v), M_v);
+            mlir::Value j_end = rewriter.create<mlir::arith::MinSIOp>(
+                loc, rewriter.create<mlir::arith::AddIOp>(loc, tj, kTile_v), N_v);
+
+            auto loop_j = rewriter.create<mlir::scf::ForOp>(loc, tj, j_end, c1);
             rewriter.setInsertionPointToStart(loop_j.getBody());
             mlir::Value j_idx = loop_j.getInductionVar();
             mlir::Value j_i64 = indexToI64(rewriter, loc, j_idx);
 
-            mlir::Value in_idx = rewriter.create<mlir::arith::MulIOp>(loc, i_i64, rewriter.create<mlir::arith::ConstantIntOp>(loc, N, 64));
+            auto loop_i = rewriter.create<mlir::scf::ForOp>(loc, ti, i_end, c1);
+            rewriter.setInsertionPointToStart(loop_i.getBody());
+            mlir::Value i_idx = loop_i.getInductionVar();
+            mlir::Value i_i64 = indexToI64(rewriter, loc, i_idx);
+
+            mlir::Value in_idx = rewriter.create<mlir::arith::MulIOp>(
+                loc, i_i64, rewriter.create<mlir::arith::ConstantIntOp>(loc, N, 64));
             in_idx = rewriter.create<mlir::arith::AddIOp>(loc, in_idx, j_i64);
 
-            mlir::Value out_idx = rewriter.create<mlir::arith::MulIOp>(loc, j_i64, rewriter.create<mlir::arith::ConstantIntOp>(loc, M, 64));
+            mlir::Value out_idx = rewriter.create<mlir::arith::MulIOp>(
+                loc, j_i64, rewriter.create<mlir::arith::ConstantIntOp>(loc, M, 64));
             out_idx = rewriter.create<mlir::arith::AddIOp>(loc, out_idx, i_i64);
 
             mlir::Value in_ptr = rewriter.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, input, mlir::ValueRange{in_idx});
@@ -289,8 +312,8 @@ struct TransposeOpLowering : public mlir::OpRewritePattern<mlir::c3::TransposeOp
             mlir::Value val = rewriter.create<mlir::LLVM::LoadOp>(loc, f32, in_ptr);
             rewriter.create<mlir::LLVM::StoreOp>(loc, val, out_ptr);
 
-            rewriter.setInsertionPointAfter(loop_j);
-            rewriter.setInsertionPointAfter(loop_i);
+            // 回到最外层循环之后(四层嵌套: tj → ti → j → i)
+            rewriter.setInsertionPointAfter(loop_tj);
         } else {
             int64_t total_ops = M * N;
             buildLoop(rewriter, loc, rewriter.create<mlir::arith::ConstantIntOp>(loc, total_ops, 64), total_ops,
@@ -331,18 +354,77 @@ struct BinaryOpLowering : public mlir::OpRewritePattern<SrcOp> {
         auto f32 = rewriter.getF32Type();
         auto ptr_type = mlir::LLVM::LLVMPointerType::get(rewriter.getContext());
 
-        if (bmod == 0) {
-            constexpr int64_t VL = ct::c3::kTargetVecLanes;
-            auto vec_ty = mlir::VectorType::get({VL}, f32);
+        // [§4.109 A1] 广播二元算子向量化: 此前 bmod!=0 全走标量循环(buildLoop),
+        // 且 remui 取模索引会阻碍 LLVM 自动向量化。三条走向量化:
+        //   bmod==0            同尺寸(原向量化路径)
+        //   |bmod|==1          标量广播 → 广播侧标量 load + splat(insertelement)
+        //   |bmod|>=VL 且整除  行内/逐列周期广播 → 向量块起点为 VL 倍数且周期为
+        //                      VL 倍数 ⇒ 块内不跨周期 ⇒ 连续向量 load(16B 对齐)
+        // 其余(非对齐周期/小于 VL)保持标量。三支共用一个向量 body, Div 除零守卫
+        // 只保留一份逻辑。数值语义: 逐元素独立运算, 向量化不改变任何元素的运算
+        // → 逐位等价(与 bmod==0 原路径同性质)。
+        constexpr int64_t VL = ct::c3::kTargetVecLanes;
+        auto vec_ty = mlir::VectorType::get({VL}, f32);
+        const int64_t abs_mod = bmod < 0 ? -bmod : bmod;
+        const bool vec_ok = (bmod == 0) || (abs_mod == 1) ||
+                            (abs_mod >= VL && abs_mod % VL == 0);
 
+        auto scalar_body = [&](mlir::OpBuilder& bld, mlir::Location loc, mlir::Value idx) {
+            mlir::Value l_idx = idx;
+            mlir::Value r_idx = idx;
+            if (bmod > 0) {
+                mlir::Value mod_val = bld.create<mlir::arith::ConstantIntOp>(loc, bmod, 64);
+                r_idx = bld.create<mlir::arith::RemUIOp>(loc, idx, mod_val);
+            } else if (bmod < 0) {
+                mlir::Value mod_val = bld.create<mlir::arith::ConstantIntOp>(loc, -bmod, 64);
+                l_idx = bld.create<mlir::arith::RemUIOp>(loc, idx, mod_val);
+            }
+            mlir::Value l_ptr = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, lhs, mlir::ValueRange{l_idx});
+            mlir::Value r_ptr = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, rhs, mlir::ValueRange{r_idx});
+            mlir::Value o_ptr = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, out, mlir::ValueRange{idx});
+
+            mlir::Value lv = bld.create<mlir::LLVM::LoadOp>(loc, f32, l_ptr);
+            mlir::Value rv = bld.create<mlir::LLVM::LoadOp>(loc, f32, r_ptr);
+            // [Fix §4.95 P2] Div 除零统一 NaN(与向量分支/buildFused 一致)
+            mlir::Value res;
+            if constexpr (std::is_same_v<ArithOp, mlir::arith::DivFOp>) {
+                auto zero_v = bld.create<mlir::arith::ConstantFloatOp>(loc, f32, llvm::APFloat(0.0f));
+                auto is_zero = bld.create<mlir::arith::CmpFOp>(
+                    loc, mlir::arith::CmpFPredicate::OEQ, rv, zero_v);
+                auto raw = bld.create<ArithOp>(loc, lv, rv);
+                auto nan_v = bld.create<mlir::arith::ConstantFloatOp>(
+                    loc, f32, llvm::APFloat::getNaN(llvm::APFloat::IEEEsingle()));
+                res = bld.create<mlir::arith::SelectOp>(loc, is_zero, nan_v, raw);
+            } else {
+                res = bld.create<ArithOp>(loc, lv, rv);
+            }
+            bld.create<mlir::LLVM::StoreOp>(loc, res, o_ptr, 16);
+        };
+
+        if (vec_ok) {
             buildVectorizedLoop(rewriter, loc, op.getNumel(), 0,
                 [&](mlir::OpBuilder& bld, mlir::Location loc, mlir::Value base) {
-                    mlir::Value l_ptr = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, lhs, mlir::ValueRange{base});
-                    mlir::Value r_ptr = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, rhs, mlir::ValueRange{base});
+                    auto loadVecOrSplat = [&](mlir::Value src, bool broadcast) -> mlir::Value {
+                        if (!broadcast) {
+                            mlir::Value p = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, src, mlir::ValueRange{base});
+                            return bld.create<mlir::LLVM::LoadOp>(loc, vec_ty, p, 16);
+                        }
+                        if (abs_mod == 1) {
+                            // 标量广播: 常量索引 0 的标量 load + splat
+                            mlir::Value z = bld.create<mlir::arith::ConstantIntOp>(loc, 0, 64);
+                            mlir::Value p = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, src, mlir::ValueRange{z});
+                            mlir::Value s = bld.create<mlir::LLVM::LoadOp>(loc, f32, p);
+                            return buildScalarSplatVec(bld, loc, s, vec_ty);
+                        }
+                        // 对齐周期广播: base 与 abs_mod 均为 VL 倍数 ⇒ 块内不跨周期
+                        mlir::Value m = bld.create<mlir::arith::ConstantIntOp>(loc, abs_mod, 64);
+                        mlir::Value bi = bld.create<mlir::arith::RemUIOp>(loc, base, m);
+                        mlir::Value p = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, src, mlir::ValueRange{bi});
+                        return bld.create<mlir::LLVM::LoadOp>(loc, vec_ty, p, 16);
+                    };
+                    mlir::Value lv = loadVecOrSplat(lhs, /*broadcast=*/bmod < 0);
+                    mlir::Value rv = loadVecOrSplat(rhs, /*broadcast=*/bmod > 0);
                     mlir::Value o_ptr = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, out, mlir::ValueRange{base});
-
-                    mlir::Value lv = bld.create<mlir::LLVM::LoadOp>(loc, vec_ty, l_ptr, 16);
-                    mlir::Value rv = bld.create<mlir::LLVM::LoadOp>(loc, vec_ty, r_ptr, 16);
                     // [Fix §4.95 P2] Div 除零语义统一为 NaN(与 buildFused 守卫一致)
                     mlir::Value res;
                     if constexpr (std::is_same_v<ArithOp, mlir::arith::DivFOp>) {
@@ -360,61 +442,9 @@ struct BinaryOpLowering : public mlir::OpRewritePattern<SrcOp> {
                     }
                     bld.create<mlir::LLVM::StoreOp>(loc, res, o_ptr, 16);
                 },
-                [&](mlir::OpBuilder& bld, mlir::Location loc, mlir::Value idx) {
-                    mlir::Value l_ptr = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, lhs, mlir::ValueRange{idx});
-                    mlir::Value r_ptr = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, rhs, mlir::ValueRange{idx});
-                    mlir::Value o_ptr = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, out, mlir::ValueRange{idx});
-
-                    mlir::Value lv = bld.create<mlir::LLVM::LoadOp>(loc, f32, l_ptr);
-                    mlir::Value rv = bld.create<mlir::LLVM::LoadOp>(loc, f32, r_ptr);
-                    // [Fix §4.95 P2] Div 除零统一 NaN(与向量分支/buildFused 一致)
-                    mlir::Value res;
-                    if constexpr (std::is_same_v<ArithOp, mlir::arith::DivFOp>) {
-                        auto zero_v = bld.create<mlir::arith::ConstantFloatOp>(loc, f32, llvm::APFloat(0.0f));
-                        auto is_zero = bld.create<mlir::arith::CmpFOp>(
-                            loc, mlir::arith::CmpFPredicate::OEQ, rv, zero_v);
-                        auto raw = bld.create<ArithOp>(loc, lv, rv);
-                        auto nan_v = bld.create<mlir::arith::ConstantFloatOp>(
-                            loc, f32, llvm::APFloat::getNaN(llvm::APFloat::IEEEsingle()));
-                        res = bld.create<mlir::arith::SelectOp>(loc, is_zero, nan_v, raw);
-                    } else {
-                        res = bld.create<ArithOp>(loc, lv, rv);
-                    }
-                    bld.create<mlir::LLVM::StoreOp>(loc, res, o_ptr, 16);
-                });
+                scalar_body);
         } else {
-            buildLoop(rewriter, loc, op.getNumel(), 0,
-                [&](mlir::OpBuilder& bld, mlir::Location loc, mlir::Value idx) {
-                    mlir::Value l_idx = idx;
-                    mlir::Value r_idx = idx;
-                    if (bmod > 0) {
-                        mlir::Value mod_val = bld.create<mlir::arith::ConstantIntOp>(loc, bmod, 64);
-                        r_idx = bld.create<mlir::arith::RemUIOp>(loc, idx, mod_val);
-                    } else if (bmod < 0) {
-                        mlir::Value mod_val = bld.create<mlir::arith::ConstantIntOp>(loc, -bmod, 64);
-                        l_idx = bld.create<mlir::arith::RemUIOp>(loc, idx, mod_val);
-                    }
-                    mlir::Value l_ptr = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, lhs, mlir::ValueRange{l_idx});
-                    mlir::Value r_ptr = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, rhs, mlir::ValueRange{r_idx});
-                    mlir::Value o_ptr = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, out, mlir::ValueRange{idx});
-
-                    mlir::Value lv = bld.create<mlir::LLVM::LoadOp>(loc, f32, l_ptr);
-                    mlir::Value rv = bld.create<mlir::LLVM::LoadOp>(loc, f32, r_ptr);
-                    // [Fix §4.95 P2] Div 除零统一 NaN(与向量分支/buildFused 一致)
-                    mlir::Value res;
-                    if constexpr (std::is_same_v<ArithOp, mlir::arith::DivFOp>) {
-                        auto zero_v = bld.create<mlir::arith::ConstantFloatOp>(loc, f32, llvm::APFloat(0.0f));
-                        auto is_zero = bld.create<mlir::arith::CmpFOp>(
-                            loc, mlir::arith::CmpFPredicate::OEQ, rv, zero_v);
-                        auto raw = bld.create<ArithOp>(loc, lv, rv);
-                        auto nan_v = bld.create<mlir::arith::ConstantFloatOp>(
-                            loc, f32, llvm::APFloat::getNaN(llvm::APFloat::IEEEsingle()));
-                        res = bld.create<mlir::arith::SelectOp>(loc, is_zero, nan_v, raw);
-                    } else {
-                        res = bld.create<ArithOp>(loc, lv, rv);
-                    }
-                    bld.create<mlir::LLVM::StoreOp>(loc, res, o_ptr, 16);
-                });
+            buildLoop(rewriter, loc, op.getNumel(), 0, scalar_body);
         }
 
         rewriter.eraseOp(op);
