@@ -14,6 +14,7 @@
  */
 
 #include "MLIRKernelGen.h"
+#include "C3/C3Error.h"
 #include "C3/C3Dialect.h"
 #include "C3/LinalgElementwiseGen.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
@@ -169,7 +170,7 @@ static mlir::LLVM::LLVMFuncOp getOrDeclareExpf(mlir::OpBuilder& builder, mlir::L
     auto* ctx = builder.getContext();
     auto module_op = builder.getBlock()->getParentOp()->getParentOfType<mlir::ModuleOp>();
     if (!module_op)
-        throw std::runtime_error("getOrDeclareExpf: not inside a module");
+        ct::c3::throwCompileError("getOrDeclareExpf: not inside a module");
     auto existing = module_op.lookupSymbol<mlir::LLVM::LLVMFuncOp>("expf");
     if (existing) return existing;
 
@@ -323,7 +324,7 @@ static void buildFused(mlir::OpBuilder& builder, mlir::Location loc,
                     val_map[node_id] = val;
                     return val;
                 }
-                throw std::runtime_error("buildFused: node_id " + std::to_string(node_id) + " not found in val_map or arg_node_ids");
+                ct::c3::throwCompileError("buildFused: node_id " + std::to_string(node_id) + " not found in val_map or arg_node_ids");
             };
 
             for (size_t op_idx = 0; op_idx < ops.size(); ++op_idx) {
@@ -461,7 +462,7 @@ static mlir::Value computeBroadcastSourceIdx(
             // 广播：贡献 0
         } else {
             // 不兼容：抛错（理论上前置 caller 已校验过兼容性）
-            throw std::runtime_error("MLIRKernelGen: incompatible broadcast shapes");
+            ct::c3::throwCompileError("MLIRKernelGen: incompatible broadcast shapes");
         }
         out_stride *= out_dim;
         in_stride *= in_dim;
@@ -1847,7 +1848,7 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
             int64_t N = ce.logits_desc.shape.size() > 1 ? ce.logits_desc.shape[1] : 1;
             // in_ptrs[0] = logits, in_ptrs[1] = target（要求 node->inputs 按 [logits, target] 顺序）
             if (node->inputs.size() < 2) {
-                throw std::runtime_error("MLIRKernelGen: CrossEntropyNode needs 2 inputs (logits, target)");
+                ct::c3::throwCompileError("MLIRKernelGen: CrossEntropyNode needs 2 inputs (logits, target)");
             }
             auto M_attr = builder.getI64IntegerAttr(M);
             auto N_attr = builder.getI64IntegerAttr(N);
@@ -1872,7 +1873,7 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
             const std::string op_name = std::visit(
                 [](const auto& n) -> std::string { return typeid(n).name(); },
                 op);
-            throw std::runtime_error(
+            ct::c3::throwCompileError(
                 "MLIRKernelGen: unsupported op in multi-node graph: " + op_name +
                 " (per MLIR backend 完整化路线图, M2 范畴 v0.5.3+ 实装)");
         }
@@ -2104,7 +2105,7 @@ mlir::OwningOpRef<mlir::ModuleOp> buildMLIRModule(
         if (mlir::failed(mlir::verify(*module))) {
             module->emitError();
             module->dump();
-            throw std::runtime_error("MLIRKernelGen: multi-node module verification failed");
+            ct::c3::throwCompileError("MLIRKernelGen: multi-node module verification failed");
         }
         if (std::getenv("C3_MN_MLIR_DUMP")) {
             fprintf(stderr, "===== MULTI-NODE MLIR (pre-lowering) =====\n");
@@ -2131,7 +2132,7 @@ mlir::OwningOpRef<mlir::ModuleOp> buildMLIRModule(
         }
         if (!is_input && !node.inputs.empty()) { compute_node = &node; break; }
     }
-    if (!compute_node) throw std::runtime_error("MLIRKernelGen: no compute node");
+    if (!compute_node) ct::c3::throwCompileError("MLIRKernelGen: no compute node");
 
     const NodeVariant& op = compute_node->op;
 
@@ -2264,7 +2265,7 @@ mlir::OwningOpRef<mlir::ModuleOp> buildMLIRModule(
             builder.create<mlir::c3::TransposeOp>(loc, a, out, M, N, tr.dim0, tr.dim1);
         }
         else
-            throw std::runtime_error("MLIRKernelGen: unsupported op " + std::to_string(op.index()));
+            ct::c3::throwCompileError("MLIRKernelGen: unsupported op " + std::to_string(op.index()));
 
         builder.create<mlir::func::ReturnOp>(loc);
     }
@@ -2272,7 +2273,7 @@ mlir::OwningOpRef<mlir::ModuleOp> buildMLIRModule(
     if (mlir::failed(mlir::verify(module))) {
         module.emitError();
         module->dump();
-        throw std::runtime_error("MLIRKernelGen: module verification failed");
+        ct::c3::throwCompileError("MLIRKernelGen: module verification failed");
     }
 
     return module;
@@ -2400,11 +2401,11 @@ GeneratedKernel generateFromGraphMLIR(const Graph& graph, int opt_level) {
 
     auto maybeEngine = mlir::ExecutionEngine::create(*module, engineOpts);
     if (!maybeEngine)
-        throw std::runtime_error("MLIRKernelGen: failed to create ExecutionEngine");
+        ct::c3::throwExecError("MLIRKernelGen: failed to create ExecutionEngine");
 
     auto expectedPtr = maybeEngine->get()->lookup("c3_kernel");
     if (!expectedPtr)
-        throw std::runtime_error("MLIRKernelGen: failed to lookup c3_kernel");
+        ct::c3::throwExecError("MLIRKernelGen: failed to lookup c3_kernel");
 
     GeneratedKernel result;
 

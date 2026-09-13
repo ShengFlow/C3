@@ -29,6 +29,7 @@
 #ifndef CTORCH_C3_C3_HOT_PATH_MANAGER_H
 #define CTORCH_C3_C3_HOT_PATH_MANAGER_H
 
+#include "C3/C3Error.h"
 #include "C3/C3KernelRegistry.h"
 #include "C3/C3Engine.h"
 #include "C3/Graph.h"
@@ -513,7 +514,7 @@ private:
         default:
             // [Fix §4.95 P2] 原静默返回 SigmoidNode(未知 op 被当 sigmoid 编译, 与已修
             // SiLU 缺失同模式); 改抛异常 fail-fast —— 编译失败回退 eager, 绝不静默错编译
-            throw std::runtime_error(
+            ct::c3::throwCompileError(
                 "makeNodeVariant: unsupported op for C3 node variant (op not in "
                 "Add/Sub/Mul/Div/Neg/ReLU/Sigmoid/SiLU/Tanh whitelist)");
         }

@@ -4,6 +4,7 @@
  * @date 2026/8/2
  */
 
+#include "C3/C3Error.h"
 #include "C3/GraphMerger.h"
 
 #include <sstream>
@@ -210,7 +211,7 @@ MergedGraphInfo GraphMerger::merge(const std::vector<Graph>& sub_graphs,
                     ss << "GraphMerger: subgraph " << i << " node " << src_node.id
                        << " has unresolved input " << src_in
                        << " (topology not yet replicated)";
-                    throw std::runtime_error(ss.str());
+                    ct::c3::throwCompileError(ss.str());
                 }
                 new_inputs.push_back(it->second);
             }

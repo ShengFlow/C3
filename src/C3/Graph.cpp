@@ -6,6 +6,7 @@
  * @date 2026/7/31
  */
 
+#include "C3/C3Error.h"
 #include "C3/Graph.h"
 
 #include <algorithm>
@@ -72,7 +73,7 @@ size_t Graph::addNode(NodeVariant op,
     // 验证所有输入节点 ID 有效
     for (size_t in_id : input_ids) {
         if (!validNodeId(in_id)) {
-            throw std::runtime_error(
+            ct::c3::throwCompileError(
                 "Graph::addNode: invalid input node id " + std::to_string(in_id));
         }
     }
@@ -95,7 +96,7 @@ size_t Graph::addNode(NodeVariant op,
 
 void Graph::markOutput(size_t node_id) {
     if (!validNodeId(node_id)) {
-        throw std::runtime_error(
+        ct::c3::throwCompileError(
             "Graph::markOutput: invalid node id " + std::to_string(node_id));
     }
     outputs_.push_back(node_id);
@@ -993,7 +994,7 @@ std::unordered_map<size_t, size_t> Graph::mergeGraph(
     for (const auto& kv : remap_input_ids) {
         // 健全性检查：remap 目标必须在本图中已存在
         if (kv.second >= nodes_.size()) {
-            throw std::runtime_error(
+            ct::c3::throwCompileError(
                 "Graph::mergeGraph: remap target id " + std::to_string(kv.second) +
                 " not yet allocated in this graph (have " +
                 std::to_string(nodes_.size()) + " nodes)");
@@ -1020,7 +1021,7 @@ std::unordered_map<size_t, size_t> Graph::mergeGraph(
         for (size_t old_in_id : src_node.inputs) {
             auto it = old_to_new.find(old_in_id);
             if (it == old_to_new.end()) {
-                throw std::runtime_error(
+                ct::c3::throwCompileError(
                     "Graph::mergeGraph: unresolved input id " +
                     std::to_string(old_in_id) + " (source node " +
                     std::to_string(src_node.id) +

@@ -5,6 +5,7 @@
  * @date 2026/08/02
  */
 
+#include "C3/C3Error.h"
 #include "C3/PGOManager.h"
 #include "C3/Graph.h"
 #include "CtorchError.h"
@@ -424,7 +425,7 @@ std::vector<Tensor> PGOCompiledKernel::executeInterpreted(const std::vector<Tens
     // 1. 将函数输入映射到图输入节点
     const auto& input_ids = graph_.inputs();
     if (inputs.size() < input_ids.size()) {
-        throw std::runtime_error(
+        ct::c3::throwCompileError(
             "PGOCompiledKernel: need " + std::to_string(input_ids.size()) +
             " inputs, got " + std::to_string(inputs.size()));
     }
@@ -465,7 +466,7 @@ std::vector<Tensor> PGOCompiledKernel::executeInterpreted(const std::vector<Tens
         // 获取算子类型
         auto op_type = nodeVariantToOp(node.op);
         if (!op_type.has_value()) {
-            throw std::runtime_error(
+            ct::c3::throwCompileError(
                 "PGOCompiledKernel: unsupported node type at node " +
                 std::to_string(node.id));
         }
@@ -473,14 +474,14 @@ std::vector<Tensor> PGOCompiledKernel::executeInterpreted(const std::vector<Tens
         // 解析输入张量并调度执行
         if (isBinaryOp(node.op)) {
             if (node.inputs.size() < 2) {
-                throw std::runtime_error(
+                ct::c3::throwCompileError(
                     "PGOCompiledKernel: binary op needs 2 inputs at node " +
                     std::to_string(node.id));
             }
             auto it_lhs = values.find(node.inputs[0]);
             auto it_rhs = values.find(node.inputs[1]);
             if (it_lhs == values.end() || it_rhs == values.end()) {
-                throw std::runtime_error(
+                ct::c3::throwCompileError(
                     "PGOCompiledKernel: input not found for node " +
                     std::to_string(node.id));
             }
@@ -488,13 +489,13 @@ std::vector<Tensor> PGOCompiledKernel::executeInterpreted(const std::vector<Tens
         } else {
             // 一元算子
             if (node.inputs.empty()) {
-                throw std::runtime_error(
+                ct::c3::throwCompileError(
                     "PGOCompiledKernel: unary op needs 1 input at node " +
                     std::to_string(node.id));
             }
             auto it = values.find(node.inputs[0]);
             if (it == values.end()) {
-                throw std::runtime_error(
+                ct::c3::throwCompileError(
                     "PGOCompiledKernel: input not found for node " +
                     std::to_string(node.id));
             }
@@ -509,7 +510,7 @@ std::vector<Tensor> PGOCompiledKernel::executeInterpreted(const std::vector<Tens
     for (size_t out_id : output_ids) {
         auto it = values.find(out_id);
         if (it == values.end()) {
-            throw std::runtime_error(
+            ct::c3::throwCompileError(
                 "PGOCompiledKernel: output node " + std::to_string(out_id) + " not found");
         }
         results.push_back(it->second);
@@ -533,7 +534,7 @@ Tensor PGOCompiledKernel::executeFusedNodeInterpreted(
         size_t arg_id = fnode.arg_node_ids[i];
         auto it = values.find(arg_id);
         if (it == values.end()) {
-            throw std::runtime_error(
+            ct::c3::throwCompileError(
                 "PGOCompiledKernel: FusedNode external input node " +
                 std::to_string(arg_id) + " not found");
         }
@@ -557,7 +558,7 @@ Tensor PGOCompiledKernel::executeFusedNodeInterpreted(
 
         auto op_type = nodeVariantToOp(op);
         if (!op_type.has_value()) {
-            throw std::runtime_error(
+            ct::c3::throwCompileError(
                 "PGOCompiledKernel: unsupported op in FusedNode at index " +
                 std::to_string(i));
         }
@@ -572,7 +573,7 @@ Tensor PGOCompiledKernel::executeFusedNodeInterpreted(
             // 外部输入：用 arg_id_to_idx 映射
             auto it = arg_id_to_idx.find(in_id);
             if (it == arg_id_to_idx.end()) {
-                throw std::runtime_error(
+                ct::c3::throwCompileError(
                     "PGOCompiledKernel: FusedNode input node " + std::to_string(in_id) +
                     " not found in arg_node_ids at op " + std::to_string(i) +
                     " pos " + std::to_string(pos));
@@ -583,7 +584,7 @@ Tensor PGOCompiledKernel::executeFusedNodeInterpreted(
         Tensor cur_output;
         if (isBinaryOp(op)) {
             if (input_ids.size() < 2) {
-                throw std::runtime_error(
+                ct::c3::throwCompileError(
                     "PGOCompiledKernel: FusedNode binary op needs 2 inputs at op " +
                     std::to_string(i));
             }
@@ -592,7 +593,7 @@ Tensor PGOCompiledKernel::executeFusedNodeInterpreted(
             cur_output = scheduler.dispatch(lhs, rhs, op_type.value());
         } else {
             if (input_ids.empty()) {
-                throw std::runtime_error(
+                ct::c3::throwCompileError(
                     "PGOCompiledKernel: FusedNode unary op needs 1 input at op " +
                     std::to_string(i));
             }
@@ -603,7 +604,7 @@ Tensor PGOCompiledKernel::executeFusedNodeInterpreted(
     }
 
     if (op_outputs.empty()) {
-        throw std::runtime_error("PGOCompiledKernel: empty FusedNode");
+        ct::c3::throwCompileError("PGOCompiledKernel: empty FusedNode");
     }
 
     // 返回最后一个 op 的输出（与原语义一致：FusedNode 链终点即整体输出）

@@ -9,6 +9,7 @@
  */
 
 #include "MLIRKernelGen.h"
+#include "C3/C3Error.h"
 #include "C3/C3Config.h"
 #include "C3/SIMDTarget.h"
 #include "C3/C3Dialect.h"
@@ -346,7 +347,7 @@ struct BinaryOpLowering : public mlir::OpRewritePattern<SrcOp> {
         static constexpr int64_t kBroadcastUnsupported =
             std::numeric_limits<int64_t>::min();
         if (bmod == kBroadcastUnsupported) {
-            throw std::runtime_error(
+            ct::c3::throwCompileError(
                 "BinaryOpLowering: unsupported partial broadcast shape (e.g. [M,1]→[M,N]); "
                 "refusing to lower to avoid out-of-bounds read");
         }
@@ -734,7 +735,7 @@ static mlir::LLVM::LLVMFuncOp getOrDeclareCblasSgemm(mlir::OpBuilder& builder, m
     auto* ctx = builder.getContext();
     auto module_op = builder.getBlock()->getParentOp()->getParentOfType<mlir::ModuleOp>();
     if (!module_op)
-        throw std::runtime_error("getOrDeclareCblasSgemm: not inside a module");
+        ct::c3::throwCompileError("getOrDeclareCblasSgemm: not inside a module");
     auto existing = module_op.lookupSymbol<mlir::LLVM::LLVMFuncOp>("cblas_sgemm");
     if (existing) return existing;
 
@@ -958,7 +959,7 @@ static void runC3Combine(mlir::ModuleOp module) {
     mlir::RewritePatternSet patterns(module.getContext());
     populateWithGenerated(patterns);
     if (mlir::failed(mlir::applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
-        throw std::runtime_error("C3DialectLowering: C3Combine pattern rewrite optimization failed");
+        ct::c3::throwCompileError("C3DialectLowering: C3Combine pattern rewrite optimization failed");
     }
 }
 
@@ -1161,7 +1162,7 @@ static void runC3Lowering(mlir::ModuleOp module) {
                  ExpOpLowering, LogOpLowering,
                  SoftmaxOpLowering, CrossEntropyOpLowering>(module.getContext());  // [P0.2] 加 Softmax + CrossEntropy lowering
     if (mlir::failed(mlir::applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
-        throw std::runtime_error("C3DialectLowering: C3ToLLVM lowering pass failed");
+        ct::c3::throwCompileError("C3DialectLowering: C3ToLLVM lowering pass failed");
     }
 }
 
@@ -1169,7 +1170,7 @@ static void runPass(mlir::ModuleOp module, std::unique_ptr<mlir::Pass> pass, con
     mlir::PassManager pm(module.getContext());
     pm.addPass(std::move(pass));
     if (mlir::failed(pm.run(module))) {
-        throw std::runtime_error(std::string("C3DialectLowering: ") + name + " failed");
+        ct::c3::throwCompileError(std::string("C3DialectLowering: ") + name + " failed");
     }
 }
 

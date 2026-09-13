@@ -8,6 +8,7 @@
  * @date 2026/7/31
  */
 
+#include "C3/C3Error.h"
 #include "C3/C3Engine.h"
 #include "C3/Graph.h"
 #include "C3/C3HotPathManager.h"
@@ -75,7 +76,7 @@ public:
 
     std::vector<Tensor> execute(const std::vector<Tensor>& inputs) override {
         if (inputs.size() < num_inputs_) {
-            throw std::runtime_error(
+            ct::c3::throwCompileError(
                 "FusedCompiledKernel::execute: need " + std::to_string(num_inputs_) +
                 " inputs, got " + std::to_string(inputs.size()));
         }
@@ -284,7 +285,7 @@ public:
 
     std::vector<Tensor> execute(const std::vector<Tensor>& inputs) override {
         if (inputs.size() < num_inputs_) {
-            throw std::runtime_error(
+            ct::c3::throwCompileError(
                 "MultiNodeCompiledKernel::execute: need " + std::to_string(num_inputs_) +
                 " inputs, got " + std::to_string(inputs.size()));
         }
@@ -540,7 +541,7 @@ public:
 
     std::vector<Tensor> execute(const std::vector<Tensor>& inputs) override {
         if (inputs.size() < num_inputs_) {
-            throw std::runtime_error(
+            ct::c3::throwCompileError(
                 "LinalgFusedCompiledKernel::execute: need " + std::to_string(num_inputs_) +
                 " inputs, got " + std::to_string(inputs.size()));
         }
@@ -621,7 +622,7 @@ public:
 
     std::vector<Tensor> execute(const std::vector<Tensor>& inputs) override {
         if (inputs.size() < num_inputs_) {
-            throw std::runtime_error(
+            ct::c3::throwCompileError(
                 "LinalgOneShotCompiledKernel::execute: need " + std::to_string(num_inputs_) +
                 " inputs, got " + std::to_string(inputs.size()));
         }
@@ -716,14 +717,14 @@ public:
         // [Fix 2026-08-09 用户审查 P0]: 反向多输入 kernel 数量校验
         // Mul|in:0 expects [grad, A, B]  (3 inputs), 不能 < 3
         if (inputs.empty()) {
-            throw std::runtime_error("ConcreteCompiledKernel::execute: need at least 1 input");
+            ct::c3::throwCompileError("ConcreteCompiledKernel::execute: need at least 1 input");
         }
         if (input_b_index_ >= inputs.size()) {
             // 一元 op (input_b_index=1 但 inputs 只有 1) → fallback 复用 a
             if (inputs.size() == 1) {
                 // OK, 一元 op 复用 a 当 b
             } else {
-                throw std::runtime_error(
+                ct::c3::throwCompileError(
                     "ConcreteCompiledKernel::execute: input_b_index=" +
                     std::to_string(input_b_index_) + " out of range, inputs.size=" +
                     std::to_string(inputs.size()) +
@@ -1008,13 +1009,13 @@ static std::shared_ptr<CompiledKernel> doCompile(
             ir_opts.verify_llvm_ir = true;
             auto ir_result = mlirToLLVMIRFromGraph(working_graph, ir_opts);
             if (!ir_result.success) {
-                throw std::runtime_error("C3Engine: MLIR -> LLVM IR translation failed for DCU: " + ir_result.error_message);
+                ct::c3::throwCompileError("C3Engine: MLIR -> LLVM IR translation failed for DCU: " + ir_result.error_message);
             }
 
             // Compile LLVM IR to Code Object using GCVM Bridge
             auto gcvm_result = compileLLVMToDCUObject(ir_result.text, "c3_kernel", options.opt_level);
             if (!gcvm_result.success) {
-                throw std::runtime_error("C3Engine: GCVM compilation failed for DCU: " + gcvm_result.error_message);
+                ct::c3::throwCompileError("C3Engine: GCVM compilation failed for DCU: " + gcvm_result.error_message);
             }
 
             // Return a new DCUCompiledKernel
@@ -1083,7 +1084,7 @@ static std::shared_ptr<CompiledKernel> doCompile(
         // 保证下游及测试用例在零感知、不改变原代码入参的情况下，获得百倍以上的冷启动性能提升与绝对的数值正确性。
         gen = generateFromGraphMLIR(working_graph, options.opt_level);
 #else
-        throw std::runtime_error("C3Engine: MLIR compile backend is disabled, and JIT 1.0 (Handwritten clang++ compiler) has been completely removed.");
+        ct::c3::throwCompileError("C3Engine: MLIR compile backend is disabled, and JIT 1.0 (Handwritten clang++ compiler) has been completely removed.");
 #endif
 
         std::shared_ptr<CompiledKernel> kernel;
@@ -1548,7 +1549,7 @@ std::vector<std::shared_ptr<CompiledKernel>> C3Engine::compileParallel(
     for (auto& f : futures) {
         auto kernel = f.get();
         if (!kernel) {
-            throw std::runtime_error("C3Engine::compileParallel: one or more subgraphs failed to compile");
+            ct::c3::throwCompileError("C3Engine::compileParallel: one or more subgraphs failed to compile");
         }
         results.push_back(std::move(kernel));
     }
@@ -1591,7 +1592,7 @@ std::shared_ptr<CompiledKernel> C3Engine::compileMerged(
         //    缓存条目与子图独立缓存的条目互不冲突。
         auto kernel = compile(merged.graph, options);
         if (!kernel) {
-            throw std::runtime_error(
+            ct::c3::throwCompileError(
                 "C3Engine::compileMerged: compilation of merged graph failed");
         }
 
@@ -1643,7 +1644,7 @@ std::shared_ptr<CompiledKernel> C3Engine::compileMergedPGO(
         //    缓存键基于 merged_graph 结构 + options（pgo_mode 不计入，因为 PGO 是运行时包装层）
         auto kernel = compile(merged.graph, pgo_opts);
         if (!kernel) {
-            throw std::runtime_error(
+            ct::c3::throwCompileError(
                 "C3Engine::compileMergedPGO: compilation of merged graph failed");
         }
 
@@ -1856,18 +1857,18 @@ std::shared_ptr<CompiledKernel> C3Engine::compileAndInject(
     // 1. 编译
     auto kernel = compile(graph, options);
     if (!kernel) {
-        throw std::runtime_error("C3Engine::compileAndInject: compilation failed");
+        ct::c3::throwCompileError("C3Engine::compileAndInject: compilation failed");
     }
 
     // 2. 推断 op_type
     if (graph.outputCount() == 0) {
-        throw std::runtime_error("C3Engine::compileAndInject: graph has no output");
+        ct::c3::throwCompileError("C3Engine::compileAndInject: graph has no output");
     }
 
     auto& out_node = graph.node(graph.outputs()[0]);
     auto op_type = nodeVariantToOp(out_node.op);
     if (!op_type.has_value()) {
-        throw std::runtime_error(
+        ct::c3::throwCompileError(
             "C3Engine::compileAndInject: cannot infer op_type from output node "
             "(FusedNode and multi-node graphs require manual installIntoRegistry)");
     }

@@ -15,6 +15,7 @@
 #ifndef CTORCH_C3_TRACER_H
 #define CTORCH_C3_TRACER_H
 
+#include "C3/C3Error.h"
 #include "Graph.h"
 
 #include <functional>
@@ -270,7 +271,7 @@ Derived ProxyTensorBase<Derived>::binaryOp(const Derived& other, const char* op_
     const Derived& self = derived();
     Tracer* t = self.tracer();
     if (!t) {
-        throw std::runtime_error(
+        ct::c3::throwCompileError(
             std::string("ProxyTensor::") + op_name + ": tracer is null");
     }
 
@@ -298,7 +299,7 @@ Derived ProxyTensorBase<Derived>::unaryOp(const char* op_name) const {
     const Derived& self = derived();
     Tracer* t = self.tracer();
     if (!t) {
-        throw std::runtime_error(
+        ct::c3::throwCompileError(
             std::string("ProxyTensor::") + op_name + ": tracer is null");
     }
 
@@ -314,7 +315,7 @@ Derived ProxyTensorBase<Derived>::scalarOp(float scalar, const char* op_name) co
     const Derived& self = derived();
     Tracer* t = self.tracer();
     if (!t) {
-        throw std::runtime_error(
+        ct::c3::throwCompileError(
             std::string("ProxyTensor::") + op_name + " scalar: tracer is null");
     }
 
@@ -340,7 +341,7 @@ inline ProxyTensor operator+(float lhs, const ProxyTensor& rhs) {
 
 inline ProxyTensor operator-(float lhs, const ProxyTensor& rhs) {
     Tracer* t = rhs.tracer();
-    if (!t) throw std::runtime_error("ProxyTensor: tracer is null");
+    if (!t) ct::c3::throwCompileError("ProxyTensor: tracer is null");
     // [Fix 2026-08-15] 按值拷贝 desc，避免 recordOp 引发 vector 扩容后引用悬垂
     TensorDesc desc = t->getDesc(rhs.handle());
     size_t lhs_handle = t->recordOp(
@@ -352,7 +353,7 @@ inline ProxyTensor operator-(float lhs, const ProxyTensor& rhs) {
 
 inline ProxyTensor operator/(float lhs, const ProxyTensor& rhs) {
     Tracer* t = rhs.tracer();
-    if (!t) throw std::runtime_error("ProxyTensor: tracer is null");
+    if (!t) ct::c3::throwCompileError("ProxyTensor: tracer is null");
     // [Fix 2026-08-15] 按值拷贝 desc，避免 recordOp 引发 vector 扩容后引用悬垂
     TensorDesc desc = t->getDesc(rhs.handle());
     size_t lhs_handle = t->recordOp(

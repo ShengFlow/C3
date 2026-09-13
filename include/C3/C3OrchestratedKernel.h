@@ -16,6 +16,7 @@
 #ifndef CTORCH_C3_C3_ORCHESTRATED_KERNEL_H
 #define CTORCH_C3_C3_ORCHESTRATED_KERNEL_H
 
+#include "C3/C3Error.h"
 #include "C3/C3Engine.h"
 #include "C3/FusionPlanner.h"
 #include "C3/Graph.h"
@@ -72,7 +73,7 @@ public:
             for (size_t oid : sk.input_orig_ids) {
                 auto it = tensorByOrig.find(oid);
                 if (it == tensorByOrig.end())
-                    throw std::runtime_error("OrchestratedKernel: 子图输入 orig=" +
+                    ct::c3::throwCompileError("OrchestratedKernel: 子图输入 orig=" +
                                              std::to_string(oid) + " 未物化(缺失上游依赖?)");
                 sub_inputs.push_back(it->second);
             }
@@ -88,7 +89,7 @@ public:
         for (size_t oid : graph_output_orig_ids_) {
             auto it = tensorByOrig.find(oid);
             if (it == tensorByOrig.end())
-                throw std::runtime_error("OrchestratedKernel: 整图输出 orig=" +
+                ct::c3::throwCompileError("OrchestratedKernel: 整图输出 orig=" +
                                          std::to_string(oid) + " 未覆盖");
             result.push_back(it->second);
         }

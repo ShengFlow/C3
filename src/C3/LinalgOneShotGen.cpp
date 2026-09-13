@@ -5,6 +5,7 @@
  * @date 2026/08/15
  */
 
+#include "C3/C3Error.h"
 #include "C3/LinalgOneShotGen.h"
 #include "C3/C3Dialect.h"
 #include "C3/JITCache.h"
@@ -920,7 +921,7 @@ static void applyUnifiedTransformPipeline(mlir::ModuleOp module, size_t num_inpu
                      ExpTensorOpLowering, LogTensorOpLowering, GtTensorOpLowering, ConstTensorOpLowering,
                      MatMulTensorOpLowering, TransposeTensorOpLowering, SumReduceTensorOpLowering>(module.getContext());
         if (mlir::failed(mlir::applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
-            throw std::runtime_error("C3 to Linalg lowering failed");
+            ct::c3::throwCompileError("C3 to Linalg lowering failed");
         }
         if (is_verbose) {
             dumpPhaseIR(module, "Phase 2.0", "C3-to-Linalg Lowering 后的 Tensor IR");
@@ -936,7 +937,7 @@ static void applyUnifiedTransformPipeline(mlir::ModuleOp module, size_t num_inpu
         mlir::populateMathAlgebraicSimplificationPatterns(fast_math_patterns);
         mlir::populateMathPolynomialApproximationPatterns(fast_math_patterns);
         if (mlir::failed(mlir::applyPatternsAndFoldGreedily(module, std::move(fast_math_patterns)))) {
-            throw std::runtime_error("Fast-Math polynomial approximation patterns failed");
+            ct::c3::throwCompileError("Fast-Math polynomial approximation patterns failed");
         }
         if (is_verbose) {
             dumpPhaseIR(module, "Phase 2.1", "Fast-Math 多项式逼近后的 Tensor IR");
@@ -956,7 +957,7 @@ static void applyUnifiedTransformPipeline(mlir::ModuleOp module, size_t num_inpu
         pm.addPass(mlir::createCanonicalizerPass());
         pm.addPass(mlir::createCSEPass());
         if (mlir::failed(pm.run(module))) {
-            throw std::runtime_error("Linalg fusion and folding optimizations failed");
+            ct::c3::throwCompileError("Linalg fusion and folding optimizations failed");
         }
         if (is_verbose) {
             dumpPhaseIR(module, "Phase 3.0", "Linalg Elementwise 自动算子融合后的 Tensor IR");
@@ -1004,7 +1005,7 @@ static void applyUnifiedTransformPipeline(mlir::ModuleOp module, size_t num_inpu
         options.bufferizeFunctionBoundaries = true;
         pm.addPass(mlir::bufferization::createOneShotBufferizePass(options));
         if (mlir::failed(pm.run(module))) {
-            throw std::runtime_error("One-Shot Bufferization failed");
+            ct::c3::throwCompileError("One-Shot Bufferization failed");
         }
         if (is_verbose) {
             dumpPhaseIR(module, "Phase 5.0", "One-Shot Bufferization (Tensor-to-MemRef) 转换后的 MemRef IR");
@@ -1024,7 +1025,7 @@ static void applyUnifiedTransformPipeline(mlir::ModuleOp module, size_t num_inpu
         pm.addPass(mlir::createCanonicalizerPass());
         pm.addPass(mlir::createCSEPass());
         if (mlir::failed(pm.run(module))) {
-            throw std::runtime_error("Buffer optimization passes (Hoisting / Stack Promotion) failed");
+            ct::c3::throwCompileError("Buffer optimization passes (Hoisting / Stack Promotion) failed");
         }
         if (is_verbose) {
             dumpPhaseIR(module, "Phase 5.5", "应用 PromoteBuffersToStack 与 BufferHoisting 等优化后的 MemRef IR");
@@ -1104,7 +1105,7 @@ static void applyUnifiedTransformPipeline(mlir::ModuleOp module, size_t num_inpu
 
         ct::c3::appendLLVMLoweringTail(pm);   // [§4.112] 公共尾段(原先内联副本)
         if (mlir::failed(pm.run(module))) {
-            throw std::runtime_error("MLIROneShotGen: lowering pipeline failed");
+            ct::c3::throwCompileError("MLIROneShotGen: lowering pipeline failed");
         }
         if (isDebugEnabled()) {
             dumpPhaseIR(module, "Phase 8.0 (最终)", "最终 Lowering 后的 LLVM Dialect IR 模块");
@@ -1201,7 +1202,7 @@ static std::unique_ptr<mlir::ExecutionEngine> createEngine(
 
     auto maybeEngine = mlir::ExecutionEngine::create(module, engineOpts);
     if (!maybeEngine) {
-        throw std::runtime_error("LinalgOneShotGen: failed to create ExecutionEngine");
+        ct::c3::throwExecError("LinalgOneShotGen: failed to create ExecutionEngine");
     }
     return std::move(*maybeEngine);
 }
@@ -1273,7 +1274,7 @@ LinalgOneShotKernel::LinalgOneShotKernel(const Graph& graph, int opt_level) {
     }
     impl_->engine = createEngine(module, opt_level, cache_graph, impl_->aotBuilder);
     if (!impl_->engine->lookup("c3_kernel")) {
-        throw std::runtime_error("LinalgOneShotGen: lookup c3_kernel failed");
+        ct::c3::throwExecError("LinalgOneShotGen: lookup c3_kernel failed");
     }
 }
 
@@ -1301,7 +1302,7 @@ void LinalgOneShotKernel::execute(const float* const* in_ptrs, float* const* out
 
     auto err = impl_->engine->invokePacked("c3_kernel", args);
     if (err) {
-        throw std::runtime_error("LinalgOneShotGen: invokePacked failed: " + llvm::toString(std::move(err)));
+        ct::c3::throwExecError("LinalgOneShotGen: invokePacked failed: " + llvm::toString(std::move(err)));
     }
 }
 

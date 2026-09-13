@@ -13,6 +13,7 @@
  * @date 2026/08/15
  */
 
+#include "C3/C3Error.h"
 #include "C3/LinalgElementwiseGen.h"
 #include "C3/JITCache.h"
 #include "MLIRKernelGen.h"
@@ -269,7 +270,7 @@ mlir::OwningOpRef<mlir::ModuleOp> buildLinalgModule(mlir::MLIRContext& context,
     if (mlir::failed(mlir::verify(module))) {
         module->emitError();
         module->dump();
-        throw std::runtime_error(std::string("LinalgElementwiseGen: module verification failed for ")
+        ct::c3::throwCompileError(std::string("LinalgElementwiseGen: module verification failed for ")
                                  + elementwiseOpName(op));
     }
     return module;
@@ -320,7 +321,7 @@ void applyLinalgLoweringPipeline(mlir::ModuleOp module) {
         pm.addPass(mlir::createCanonicalizerPass());
         pm.addPass(mlir::createCSEPass());
         if (mlir::failed(pm.run(module))) {
-            throw std::runtime_error("LinalgElementwiseGen: Linalg optimization failed");
+            ct::c3::throwCompileError("LinalgElementwiseGen: Linalg optimization failed");
         }
     }
     // 阶段 1：linalg.generic → loops（周期广播的 `d0 mod k` 在此产生 affine.apply）
@@ -328,7 +329,7 @@ void applyLinalgLoweringPipeline(mlir::ModuleOp module) {
         mlir::PassManager pm(module.getContext());
         pm.addPass(mlir::createConvertLinalgToLoopsPass());
         if (mlir::failed(pm.run(module))) {
-            throw std::runtime_error("LinalgElementwiseGen: linalg-to-loops failed");
+            ct::c3::throwCompileError("LinalgElementwiseGen: linalg-to-loops failed");
         }
     }
     // 阶段 2：手动把 affine.apply (d0/s0) -> (X mod k) 降成 arith.remsi
@@ -336,7 +337,7 @@ void applyLinalgLoweringPipeline(mlir::ModuleOp module) {
         mlir::RewritePatternSet patterns(module.getContext());
         patterns.add<AffineApplyToArithPattern>(module.getContext());
         if (mlir::failed(mlir::applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
-            throw std::runtime_error("LinalgElementwiseGen: affine.apply lowering failed");
+            ct::c3::throwCompileError("LinalgElementwiseGen: affine.apply lowering failed");
         }
     }
     // 阶段 3：scf → cf → LLVM
@@ -344,7 +345,7 @@ void applyLinalgLoweringPipeline(mlir::ModuleOp module) {
         mlir::PassManager pm(module.getContext());
         ct::c3::appendLLVMLoweringTail(pm);   // [§4.112] 公共尾段(原先内联副本)
         if (mlir::failed(pm.run(module))) {
-            throw std::runtime_error("LinalgElementwiseGen: lowering pipeline failed");
+            ct::c3::throwCompileError("LinalgElementwiseGen: lowering pipeline failed");
         }
     }
 }
@@ -450,7 +451,7 @@ std::unique_ptr<mlir::ExecutionEngine> createEngine(
         llvm::errs() << "[linalg-debug] createEngine failed for cache_graph="
                      << cache_graph << ": " << llvm::toString(maybeEngine.takeError())
                      << "\n";
-        throw std::runtime_error("LinalgElementwiseGen: failed to create ExecutionEngine");
+        ct::c3::throwExecError("LinalgElementwiseGen: failed to create ExecutionEngine");
     }
     return std::move(*maybeEngine);
 }
@@ -512,7 +513,7 @@ LinalgElementwiseKernel::LinalgElementwiseKernel(ElementwiseOp op, int opt_level
                               + "_rm" + std::to_string(rhs_mod_);
     impl_->engine = createEngine(module, opt_level, cache_graph, impl_->aotBuilder);
     if (!impl_->engine->lookup("c3_kernel")) {
-        throw std::runtime_error("LinalgElementwiseGen: lookup c3_kernel failed");
+        ct::c3::throwExecError("LinalgElementwiseGen: lookup c3_kernel failed");
     }
 }
 
@@ -544,7 +545,7 @@ void LinalgElementwiseKernel::execute(const float* const* in_ptrs, float* out_pt
     (void)num_memrefs;
     auto err = impl_->engine->invokePacked("c3_kernel", args);
     if (err) {
-        throw std::runtime_error("LinalgElementwiseGen: invokePacked failed: "
+        ct::c3::throwExecError("LinalgElementwiseGen: invokePacked failed: "
                                  + llvm::toString(std::move(err)));
     }
 }
@@ -818,7 +819,7 @@ LinalgBroadcastingKernel::LinalgBroadcastingKernel(ElementwiseOp op, int opt_lev
 
     impl_->engine = createEngine(module, opt_level, cache_graph, impl_->aotBuilder);
     if (!impl_->engine->lookup("c3_kernel")) {
-        throw std::runtime_error("LinalgBroadcastingKernel: lookup c3_kernel failed");
+        ct::c3::throwExecError("LinalgBroadcastingKernel: lookup c3_kernel failed");
     }
 }
 
@@ -860,7 +861,7 @@ void LinalgBroadcastingKernel::execute(const float* const* in_ptrs, float* out_p
 
     auto err = impl_->engine->invokePacked("c3_kernel", args);
     if (err) {
-        throw std::runtime_error("LinalgBroadcastingKernel: invokePacked failed: "
+        ct::c3::throwExecError("LinalgBroadcastingKernel: invokePacked failed: "
                                  + llvm::toString(std::move(err)));
     }
 }

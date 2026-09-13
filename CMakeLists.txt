@@ -103,6 +103,7 @@ endif()
 
 # ---- 源文件收集 ----
 set(C3-Core-Sources
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/C3/C3Error.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/C3/Graph.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/C3/C3Engine.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/C3/GraphMerger.cpp

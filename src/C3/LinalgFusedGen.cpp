@@ -5,6 +5,7 @@
  * @date 2026/08/15
  */
 
+#include "C3/C3Error.h"
 #include "C3/LinalgFusedGen.h"
 #include "C3/JITCache.h"
 #include "MLIRKernelGen.h"  // [§4.112] appendLLVMLoweringTail(公共 lowering 尾段)
@@ -444,7 +445,7 @@ void applyLinalgLoweringPipeline(mlir::ModuleOp module) {
         pm.addPass(mlir::createCanonicalizerPass());
         pm.addPass(mlir::createCSEPass());
         if (mlir::failed(pm.run(module))) {
-            throw std::runtime_error("LinalgFusedGen: Linalg optimization failed");
+            ct::c3::throwCompileError("LinalgFusedGen: Linalg optimization failed");
         }
     }
     // 阶段 1：linalg.generic → loops
@@ -452,7 +453,7 @@ void applyLinalgLoweringPipeline(mlir::ModuleOp module) {
         mlir::PassManager pm(module.getContext());
         pm.addPass(mlir::createConvertLinalgToLoopsPass());
         if (mlir::failed(pm.run(module))) {
-            throw std::runtime_error("LinalgFusedGen: linalg-to-loops failed");
+            ct::c3::throwCompileError("LinalgFusedGen: linalg-to-loops failed");
         }
     }
     // 阶段 2：scf → cf → LLVM
@@ -463,7 +464,7 @@ void applyLinalgLoweringPipeline(mlir::ModuleOp module) {
         pm.addPass(mlir::createLoopInvariantCodeMotionPass());
         ct::c3::appendLLVMLoweringTail(pm);   // [§4.112] 公共尾段(原先内联副本)
         if (mlir::failed(pm.run(module))) {
-            throw std::runtime_error("LinalgFusedGen: lowering pipeline failed");
+            ct::c3::throwCompileError("LinalgFusedGen: lowering pipeline failed");
         }
     }
 }
@@ -523,7 +524,7 @@ std::unique_ptr<mlir::ExecutionEngine> createEngine(
 
     auto maybeEngine = mlir::ExecutionEngine::create(module, engineOpts);
     if (!maybeEngine) {
-        throw std::runtime_error("LinalgFusedGen: failed to create ExecutionEngine");
+        ct::c3::throwExecError("LinalgFusedGen: failed to create ExecutionEngine");
     }
     return std::move(*maybeEngine);
 }
@@ -576,7 +577,7 @@ LinalgFusedKernel::LinalgFusedKernel(const Graph& graph, int opt_level)
                               + "_ol" + std::to_string(opt_level);
     impl_->engine = createEngine(module, opt_level, cache_graph, impl_->aotBuilder);
     if (!impl_->engine->lookup("c3_kernel")) {
-        throw std::runtime_error("LinalgFusedGen: lookup c3_kernel failed");
+        ct::c3::throwExecError("LinalgFusedGen: lookup c3_kernel failed");
     }
 }
 
@@ -606,7 +607,7 @@ void LinalgFusedKernel::execute(const float* const* in_ptrs, float* const* out_p
 
     auto err = impl_->engine->invokePacked("c3_kernel", args);
     if (err) {
-        throw std::runtime_error("LinalgFusedGen: invokePacked failed: "
+        ct::c3::throwExecError("LinalgFusedGen: invokePacked failed: "
                                  + llvm::toString(std::move(err)));
     }
 }
