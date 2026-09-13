@@ -2192,10 +2192,13 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteUnifiedMIMOBackw
     // 回退通道有效性: §4.114 实测 —— generic=0 + legacy=1 跑 MNIST 得
     //       0.0985 / 97.1421%, 与默认路径**逐位一致**(门槛 PASS)。
     //
-    // 删除判据(满足任一即可删除, 删除前需用户确认):
-    //   ① soak 期满: 退场后 ≥ 2 周无回退需求, 且期间跨机器(含 x86/DCU)验证过默认路径;
+    // 删除判据(满足任一即可删除):
+    //   ① soak 期满: 退场后 ≥ 2 周(即 2026-09-26 之后)无回退需求, 且期间跨机器
+    //      (含 x86/AVX-512 / DCU)验证过默认路径;
     //   ② 用户明确指示立即删除;
     //   ③ 通用树式识别器需改动其共享基础设施(喂入/slot/pending 语义), 留着会误导。
+    //   注: 删除方案已获用户确认(2026-09-13, 洛锦「我同意你的说法」) —— 按判据自行裁决即可,
+    //       不必回头确认判据; 但删除是**不可逆**操作, 执行前须一句话告知用户。
     //
     // 删除清单(勿漏): 本文件的手写执行段与 compileUnifiedMIMOBackwardAsync(7 参数)、
     //       compileFFNMIMOBackwardAsync(14 参数)及其配套 build*BackwardGraph;
