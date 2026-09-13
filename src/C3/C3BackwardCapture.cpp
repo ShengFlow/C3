@@ -791,8 +791,8 @@ static bool nodeTypeIs(const std::string& node_type, const char* cls) {
 }
 
 // [ADR-012 ④ 阶段二] 通用树白名单(v2): ReLU/Add/MatMul/SiLU/Mul。
-// v1 线性链 {ReLU,Add,MatMul}(FC); v2 树拓扑加 SiLU/Mul(FFN SwiGLU)。
-// Tanh/Sigmoid 待 tanh 反向图执行层专项修复后纳入。
+// v1 线性链 {ReLU,Add,MatMul}(FC); v2 树拓扑加 SiLU/Mul(FFN SwiGLU);
+// v3 加 Tanh/Sigmoid(§4.107; 其反向图执行层缺陷已由 §4.106 修复, 见下方白名单内注释)。
 // [§4.110 FCIS 品味清理] Tanh/Sigmoid 反向图输入语义为 forward 输出 y(融合 forward
 // 不物化 pre-activation, §4.108); 三处执行喂入(phase1 / 通用树 / legacy FC)共用此取用:
 // y 可用则喂 y, 否则回退节点输入(或调用方 forward_inputs)。此前三处各写一份判断,
