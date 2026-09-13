@@ -1102,15 +1102,7 @@ static void applyUnifiedTransformPipeline(mlir::ModuleOp module, size_t num_inpu
             pm.addPass(mlir::createConvertOpenMPToLLVMPass());  // omp → LLVM（__kmpc_* 调用）
         }
 
-        pm.addPass(mlir::createSCFToControlFlowPass());
-        pm.addPass(mlir::createArithToLLVMConversionPass());
-        pm.addPass(mlir::createConvertMathToLLVMPass());
-        pm.addPass(mlir::createConvertControlFlowToLLVMPass());
-        pm.addPass(mlir::createConvertFuncToLLVMPass());
-        pm.addPass(mlir::createFinalizeMemRefToLLVMConversionPass());
-        pm.addPass(mlir::createReconcileUnrealizedCastsPass());
-        pm.addPass(mlir::createCanonicalizerPass());
-        pm.addPass(mlir::createCSEPass());
+        ct::c3::appendLLVMLoweringTail(pm);   // [§4.112] 公共尾段(原先内联副本)
         if (mlir::failed(pm.run(module))) {
             throw std::runtime_error("MLIROneShotGen: lowering pipeline failed");
         }

@@ -7,6 +7,7 @@
 
 #include "C3/LinalgFusedGen.h"
 #include "C3/JITCache.h"
+#include "MLIRKernelGen.h"  // [§4.112] appendLLVMLoweringTail(公共 lowering 尾段)
 #include "Ctools.h"
 #include "AutoGrad/Nodes/SiLUNode.h"  // PEL25 Stage 5.2: SiLU region fusion
 
@@ -460,15 +461,7 @@ void applyLinalgLoweringPipeline(mlir::ModuleOp module) {
         pm.addPass(mlir::createControlFlowSinkPass());
         pm.addPass(mlir::createRemoveDeadValuesPass());
         pm.addPass(mlir::createLoopInvariantCodeMotionPass());
-        pm.addPass(mlir::createSCFToControlFlowPass());
-        pm.addPass(mlir::createArithToLLVMConversionPass());
-        pm.addPass(mlir::createConvertMathToLLVMPass());
-        pm.addPass(mlir::createConvertControlFlowToLLVMPass());
-        pm.addPass(mlir::createConvertFuncToLLVMPass());
-        pm.addPass(mlir::createFinalizeMemRefToLLVMConversionPass());
-        pm.addPass(mlir::createReconcileUnrealizedCastsPass());
-        pm.addPass(mlir::createCanonicalizerPass());
-        pm.addPass(mlir::createCSEPass());
+        ct::c3::appendLLVMLoweringTail(pm);   // [§4.112] 公共尾段(原先内联副本)
         if (mlir::failed(pm.run(module))) {
             throw std::runtime_error("LinalgFusedGen: lowering pipeline failed");
         }

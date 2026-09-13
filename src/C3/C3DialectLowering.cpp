@@ -1207,5 +1207,23 @@ void applyLoweringPipeline(mlir::ModuleOp module, int opt_level) {
     runPass(module, mlir::createCSEPass(), "CSEPost");
 }
 
+// [§4.112] linalg codegen 三条路径共用的 lowering 尾段。
+// 顺序**逐字复刻**抽取前三处内联副本的现有顺序(纯去重, 行为零变化):
+//   SCFToCF → ArithToLLVM → MathToLLVM → CFToLLVM → FuncToLLVM →
+//   MemRefToLLVM → ReconcileUnrealizedCasts → Canonicalizer → CSE
+// [待办] 本顺序与 applyLoweringPipeline(上方) 的 MathToLLVM → ArithToLLVM 相反,
+//        二者不一致属历史分歧; 是否对齐需以逐位数值实验裁定(见 STATUS §4.112)。
+void appendLLVMLoweringTail(mlir::PassManager& pm) {
+    pm.addPass(mlir::createSCFToControlFlowPass());
+    pm.addPass(mlir::createArithToLLVMConversionPass());
+    pm.addPass(mlir::createConvertMathToLLVMPass());
+    pm.addPass(mlir::createConvertControlFlowToLLVMPass());
+    pm.addPass(mlir::createConvertFuncToLLVMPass());
+    pm.addPass(mlir::createFinalizeMemRefToLLVMConversionPass());
+    pm.addPass(mlir::createReconcileUnrealizedCastsPass());
+    pm.addPass(mlir::createCanonicalizerPass());
+    pm.addPass(mlir::createCSEPass());
+}
+
 } // namespace c3
 } // namespace ct

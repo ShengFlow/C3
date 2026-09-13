@@ -342,15 +342,7 @@ void applyLinalgLoweringPipeline(mlir::ModuleOp module) {
     // 阶段 3：scf → cf → LLVM
     {
         mlir::PassManager pm(module.getContext());
-        pm.addPass(mlir::createSCFToControlFlowPass());
-        pm.addPass(mlir::createArithToLLVMConversionPass());
-        pm.addPass(mlir::createConvertMathToLLVMPass());
-        pm.addPass(mlir::createConvertControlFlowToLLVMPass());
-        pm.addPass(mlir::createConvertFuncToLLVMPass());
-        pm.addPass(mlir::createFinalizeMemRefToLLVMConversionPass());
-        pm.addPass(mlir::createReconcileUnrealizedCastsPass());
-        pm.addPass(mlir::createCanonicalizerPass());
-        pm.addPass(mlir::createCSEPass());
+        ct::c3::appendLLVMLoweringTail(pm);   // [§4.112] 公共尾段(原先内联副本)
         if (mlir::failed(pm.run(module))) {
             throw std::runtime_error("LinalgElementwiseGen: lowering pipeline failed");
         }

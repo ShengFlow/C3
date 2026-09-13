@@ -26,6 +26,7 @@
 namespace mlir {
     class MLIRContext;
     class ModuleOp;
+    class PassManager;
     template <typename T> class OwningOpRef;
 }
 
@@ -57,11 +58,31 @@ mlir::OwningOpRef<mlir::ModuleOp> buildMLIRModule(mlir::MLIRContext& context, co
 
 /**
  * @brief [v0.5.2 公开] 对 MLIR Module 跑标准 lowering pipeline
- * @details Pipeline 顺序: Canonicalizer → CSE → LICM → SCFToCF → ArithToLLVM →
- *          CFToLLVM → FuncToLLVM → MemRefToLLVM → ReconcileUnrealizedCasts
+ * @details 顺序(opt_level>=4 时在 SCFToCF 前追加 ControlFlowSink/RemoveDeadValues):
+ *          StripDebugInfo → Canonicalizer → runC3Combine(高层图优化) →
+ *          runC3Lowering(C3 算子 → 标量/向量循环) → CSE → SymbolDCE → LICM →
+ *          SCFForLoopCanonicalization → SCFToCF → MathToLLVM → ArithToLLVM →
+ *          CFToLLVM → FuncToLLVM → MemRefToLLVM → ReconcileUnrealizedCasts →
+ *          Canonicalizer → CSE
  *          跑完 module 在 LLVM dialect, 可直接喂 mlir::translateModuleToLLVMIR
+ * @note 原文档仅列 "Canonicalizer → CSE → LICM → SCFToCF → ArithToLLVM → ...",
+ *       漏记 MathToLLVM 与 runC3Combine/runC3Lowering 两个高层阶段(实现在
+ *       C3DialectLowering.cpp), 已于 §4.112 更正。
  */
 void applyLoweringPipeline(mlir::ModuleOp module, int opt_level = 3);
+
+/**
+ * @brief [§4.112] 追加「MLIR → LLVM」公共 lowering 尾段(linalg codegen 三条路径共用)
+ * @details 尾段固定为 9 个 pass:
+ *          SCFToCF → ArithToLLVM → MathToLLVM → CFToLLVM → FuncToLLVM →
+ *          MemRefToLLVM → ReconcileUnrealizedCasts → Canonicalizer → CSE
+ *          此前 LinalgElementwiseGen / LinalgFusedGen / LinalgOneShotGen 各内联一份,
+ *          三份逐字相同 —— 抽为单一入口, 避免只改一处即产生流水线分歧
+ *          (典型失效模式: 漏 ReconcileUnrealizedCasts 导致 unrealized_conversion_cast 残留)。
+ * @note 只做 addPass, **不创建也不运行** PassManager: 调用方保留自己的分阶段
+ *       PassManager 与「哪一段失败」的错误定位。
+ */
+void appendLLVMLoweringTail(mlir::PassManager& pm);
 
 } // namespace c3
 } // namespace ct
