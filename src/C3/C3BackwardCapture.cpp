@@ -2182,8 +2182,29 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteUnifiedMIMOBackw
         if (r.has_value()) return r;
     }
 
-    // [§4.97 ④ 影子对照] C3_MIMO_LEGACY=0 时短路手写执行段: 反向回退
-    // fused/phase1/eager(数值应逐位一致), 用于测量退场代价与数值等价性
+    // ================================================================================
+    // [§4.114] 手写 MIMO pattern —— **已退场, 待删除(retirement pending)**
+    //
+    // 状态: 自 §4.107(c3 4543e23, 2026-09-12)起默认关闭, 由通用树式识别器接管
+    //       (C3_MIMO_GENERIC 默认开)。以下代码是**保留的回退通道**, 不是死代码:
+    //       出问题时可用 `C3_MIMO_GENERIC=0 C3_MIMO_LEGACY=1` 恢复手写执行段。
+    //
+    // 回退通道有效性: §4.114 实测 —— generic=0 + legacy=1 跑 MNIST 得
+    //       0.0985 / 97.1421%, 与默认路径**逐位一致**(门槛 PASS)。
+    //
+    // 删除判据(满足任一即可删除, 删除前需用户确认):
+    //   ① soak 期满: 退场后 ≥ 2 周无回退需求, 且期间跨机器(含 x86/DCU)验证过默认路径;
+    //   ② 用户明确指示立即删除;
+    //   ③ 通用树式识别器需改动其共享基础设施(喂入/slot/pending 语义), 留着会误导。
+    //
+    // 删除清单(勿漏): 本文件的手写执行段与 compileUnifiedMIMOBackwardAsync(7 参数)、
+    //       compileFFNMIMOBackwardAsync(14 参数)及其配套 build*BackwardGraph;
+    //       `mimoLegacyEnabled()` 与本闸门; C3_MIMO_LEGACY 开关;
+    //       头文件里的对应声明; AGENTS.md 的 C3_MIMO_LEGACY 条目与退场纪事;
+    //       probe_fused_bw_debt2(DEBT-2 脚手架, 同批可清理)。
+    //
+    // 为什么现在不删: 退场仅 1 天, 尚不构成 soak; 而它当前是默认路径的**唯一**回退通道。
+    // ================================================================================
     if (!mimoLegacyEnabled()) return std::nullopt;
 
     // 检查是否为支持的激活节点

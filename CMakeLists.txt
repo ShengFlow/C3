@@ -11,6 +11,11 @@
 #       - 因此 C3 仓库本身不携带宿主头；独立构建 / 被宿主集成时，宿主 include
 #         路径通过 C3_HOST_INCLUDE_DIRS 传入（CTorch 通过 add_subdirectory(c3)
 #         集成时传入其 include/ 与 src/ 目录）。
+#         ⚠️ [§4.114 更正] 这句与现状不符: 主仓当前**没有** add_subdirectory(c3),
+#         而是在主仓 CMakeLists.txt 里另用 `set(CT-C3-Core ...)` 平行列出 c3 源文件。
+#         ⇒ **本文件的 C3-Core-Sources 与主仓的 CT-C3-Core 是两份需同步维护的源表**,
+#         新增/删除 c3 源文件必须同时改两处(本次 C3Error.cpp 即因此先出现
+#         「cmake 正常但链接 undefined」)。若将来改回 add_subdirectory, 请删除此提示。
 #   · MLIR/LLVM 通过 find_package(CONFIG) 获取，默认指向 Homebrew llvm。
 #
 # 生成：2026-08-17（由 CTorch 仓库 c3/CMakeLists.txt 物理拆分而来）

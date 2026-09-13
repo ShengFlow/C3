@@ -135,6 +135,10 @@ public:
 
     /**
      * @brief MIMO 统一反向融合异步编译
+     * @note **[§4.114 已退场, 待删除]** 手写 MIMO pattern 自 §4.107 起默认关闭
+     *       (C3_MIMO_GENERIC=0 + C3_MIMO_LEGACY=1 才可达)。删除判据与清单见
+     *       C3BackwardCapture.cpp 中 mimoLegacyEnabled() 闸门处的说明。
+     *       在此之前请勿重构其参数表(7 参数) —— 该代码的归宿是删除而非美化。
      */
     void compileUnifiedMIMOBackwardAsync(
         const ::Node* relu_node, const ::Node* add_node, const ::Node* matmul_node,
@@ -146,6 +150,9 @@ public:
      * @details out = h @ W_d, h = g*u, g = silu(gate_pre), gate_pre = x @ W_g, u = x @ W_u。
      *          一次 kernel 算 9 个梯度输出(grad_h/grad_W_d/grad_g/grad_u/grad_gate_pre/
      *          grad_x_gate/grad_W_g/grad_x_up/grad_W_u), pending 表回填 Mul/SiLU/两个 MatMul。
+     * @note **[§4.114 已退场, 待删除]** 同 compileUnifiedMIMOBackwardAsync: 默认不可达,
+     *       归宿是删除。其 14 参数签名属退场代码,**不应重构为参数对象** ——
+     *       为即将删除的代码做接口美化是纯浪费(审查报告 §7 已列为"不做"项)。
      */
     void compileFFNMIMOBackwardAsync(
         const ::Node* mm_out_node, const ::Node* mul_node, const ::Node* silu_node,
