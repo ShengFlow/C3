@@ -106,8 +106,19 @@ struct KernelShapeInfo {
 class C3KernelRegistry {
 public:
     static C3KernelRegistry& getInstance() {
-        static C3KernelRegistry instance;
-        return instance;
+        // 进程级生命周期：与 C3Engine / C3HotPathManager / RegionFusionRegistry /
+        // C3BackwardCapture / JITCache / PGOManager 保持一致，**故意不注册静态析构**。
+        //
+        // 这些单例持有 CompiledKernel 与 LLVM module 句柄。若写成 Meyers singleton
+        // （static C3KernelRegistry instance;），其析构时机与 LLVM/MLIR 的全局对象
+        // 析构顺序不确定：一旦 LLVM 侧先释放，本单例析构时触发的 kernel 卸载会访问
+        // 已销毁的内部 recursive_mutex，抛
+        //   "recursive_mutex lock failed: Invalid argument"
+        // 并在进程退出阶段终止程序。
+        //
+        // 正常资源回收由 ct::c3::shutdownAll() 显式完成（见 C3Cleanup.h）。
+        static C3KernelRegistry* instance = new C3KernelRegistry();
+        return *instance;
     }
 
     // ======================= 注册与卸载 =======================
