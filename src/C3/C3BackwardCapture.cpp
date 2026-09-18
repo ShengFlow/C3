@@ -157,6 +157,28 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteBackward(
         return std::nullopt;
     }
 
+    // [Fix 2026-09-18] 小张量短路。
+    //
+    // C3 反向融合的收益来自把一串 element-wise 反向折成更少的 kernel（省的是
+    // launch 与调度开销），成本是查表 + 可能的 JIT 编译。当梯度元素数很小时，
+    // 这笔账是亏的：可微仿真（六自由度动力学）的图每步展开数十个作用于标量/小
+    // 向量的算子，实测 C3 反向路径比 eager **慢约 9 倍**
+    //   （SixDofGradTest，10 轮打靶法：默认 9885 ms vs CTORCH_DISABLE_C3_BACKWARD=1 1096 ms）。
+    // 而本项目真正吃 C3 反向收益的场景（MNIST 的 FC、LLaMA 的 FFN）梯度规模都在
+    // 十万量级，不受此阈值影响。
+    //
+    // 阈值可用 C3_BACKWARD_MIN_NUMEL 覆盖；设为 0 即恢复旧行为（全尺寸都尝试融合）。
+    {
+        static const size_t min_numel = []() {
+            const char* e = std::getenv("C3_BACKWARD_MIN_NUMEL");
+            return e != nullptr ? static_cast<size_t>(std::strtoull(e, nullptr, 10))
+                                : static_cast<size_t>(64);
+        }();
+        if (min_numel > 0 && grad.numel() < min_numel) {
+            return std::nullopt;
+        }
+    }
+
     // [Fix 2026-09-12 leaky_relu 梯度断链] 非 supportsNodeType 名单的节点在**入口**短路:
     // 此前 LReLU 不在名单, 但 MIMO/phase1 的 registry 命中(历史编译/注入残留)仍会走 C3
     // 反向且产物数值错误(梯度静默错值, test_autograd_v2 5 项 FAIL 即此)。名单之外绝不
