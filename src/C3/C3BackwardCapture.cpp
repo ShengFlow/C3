@@ -157,15 +157,48 @@ std::optional<std::vector<Tensor>> C3BackwardCapture::tryExecuteBackward(
         return std::nullopt;
     }
 
-    // [Fix 2026-09-12 leaky_relu 梯度断链] 非 supportsNodeType 名单的单输入节点在**入口**短路:
+    // [Fix 2026-09-12 leaky_relu 梯度断链] 非 supportsNodeType 名单的节点在**入口**短路:
     // 此前 LReLU 不在名单, 但 MIMO/phase1 的 registry 命中(历史编译/注入残留)仍会走 C3
     // 反向且产物数值错误(梯度静默错值, test_autograd_v2 5 项 FAIL 即此)。名单之外绝不
     // 尝试任何 C3 backward 路径(MIMO/fused/phase1)。
+    //
+    // [Fix 2026-09-17 广播反向静默错值] 该短路原先带 `_n == 1` 条件, 只拦单输入节点。
+    //   而 supportsNodeType 的名单本就是「单输入 unary element-wise」类型集合, 其自身
+    //   注释写明「多输入单节点 kernel(Add/Sub/Mul/MatMul/Softmax 等)仍按注释回退 eager
+    //   (正确性优先)」—— 即**设计意图是多输入节点一律回退 eager**, 入口却放行了它们。
+    //   后果: 多输入节点照常进入 MIMO/fused/phase1 路径并命中 element-wise 反向 kernel,
+    //   而该 kernel 按「同形状」假设读写 —— 一旦发生广播就出错。实测 `{N} / 标量` 的
+    //   反向只累加被广播张量的**第一个元素**而非其和(前向完全正常, 仅梯度静默错值):
+    //     loss = Σ(c_j/Σc²) 的解析梯度 1/S − 2c_i·Σc_j/S², 实得 1/S − 2c_i/S²。
+    //   影响面: 任何「以归约结果为分母/分子」的写法(batch 归一化 loss、四元数归一化
+    //   q/‖q‖ 等)。验证方式: 在节点 backward 入口加无条件日志可确认 DivNode::backward
+    //   从未被调用(eager 实现本身是正确的)。
+    //   修法(**精准拦截, 非一刀切**): 只拦「element-wise 二元算子 + 存在**标量广播**」
+    //   这一实测出错的形态。之所以不把名单检查一刀切扩展到所有多输入节点 —— 那会
+    //   同时拦掉 MatMul/带 bias 的 Add, 与 MIMO 的链式处理冲突, 实测使 MNIST 端到端
+    //   acc 由 97.1421% 掉到 96.6263%(同构对照, 仅此一处差异)。融合 kernel 对本项目
+    //   既有的同形状/常规广播形态是正确的(否则 MNIST 基线早就崩了), 出错的是
+    //   **某一侧 numel()==1 的标量广播**: kernel 按同形状假设读写, 只累加第一个元素。
     {
         const size_t _n = forward_inputs.empty() ? node->getInputs().size() : forward_inputs.size();
         const std::string _tn = std::string(typeid(*node).name());
-        if (_n == 1 && !supportsNodeType(_tn)) {
-            return std::nullopt;
+
+        if (_n == 1) {
+            if (!supportsNodeType(_tn)) {
+                return std::nullopt;
+            }
+        } else {
+            // 判据只用形状, 不按节点类型名筛选 —— 任何多输入算子遇到「一侧
+            // numel()==1 且形状不同」都可能被融合 kernel 按同形状假设误算,
+            // 用形状判据既覆盖更全, 也不依赖 typeid 名字的稳定性。
+            const auto& ins = forward_inputs.empty() ? node->getInputs() : forward_inputs;
+            for (size_t i = 1; i < ins.size(); ++i) {
+                const bool shape_differs = (ins[i].sizes() != ins[0].sizes());
+                const bool scalar_side = (ins[i].numel() == 1) || (ins[0].numel() == 1);
+                if (shape_differs && scalar_side) {
+                    return std::nullopt;
+                }
+            }
         }
     }
 
