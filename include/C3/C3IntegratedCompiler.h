@@ -28,6 +28,8 @@
 #include <chrono>
 #include <algorithm>
 #include <atomic>
+#include <mutex>
+#include <stdexcept>
 #include <cstdint>
 #include <cstddef>
 #include <cstring>
@@ -162,6 +164,10 @@ class GenericCompiledKernel {
 public:
     virtual ~GenericCompiledKernel() = default;
     virtual std::vector<GenericTensor<T>> execute(const std::vector<GenericTensor<T>>& inputs) = 0;
+    virtual void execute_into(std::span<const T* const> in_ptrs, std::span<T*> out_ptrs) = 0;
+    void execute_into(std::span<const T*> in_ptrs, std::span<T*> out_ptrs) {
+        execute_into(std::span<const T* const>(in_ptrs.data(), in_ptrs.size()), out_ptrs);
+    }
     [[nodiscard]] virtual const std::string& cacheKey() const = 0;
     [[nodiscard]] virtual DeviceType targetDevice() const = 0;
     [[nodiscard]] virtual size_t workspaceBytes() const = 0;
@@ -192,8 +198,22 @@ public:
           fused_fn_(fused_fn),
           target_device_(dev) {}
 
+    void execute_into(std::span<const T* const> in_ptrs, std::span<T*> out_ptrs) override {
+        if (in_ptrs.size() != input_offsets_.size() || out_ptrs.size() != output_offsets_.size()) {
+            throw std::invalid_argument("Input/output pointer span size mismatch with kernel signature");
+        }
+        size_t total_elements = output_counts_.empty() ? 0 : output_counts_[0];
+        fused_fn_(in_ptrs.data(), out_ptrs.data(), total_elements);
+    }
+
+    void execute_into(std::span<const T*> in_ptrs, std::span<T*> out_ptrs) {
+        execute_into(std::span<const T* const>(in_ptrs.data(), in_ptrs.size()), out_ptrs);
+    }
+
     std::vector<GenericTensor<T>> execute(const std::vector<GenericTensor<T>>& inputs) override {
-        assert(inputs.size() == input_offsets_.size());
+        if (inputs.size() != input_offsets_.size()) {
+            throw std::invalid_argument("Input tensor count mismatch with kernel signature");
+        }
 
         // Fast-path: Copy external inputs directly into pre-planned 64-byte aligned static arena offsets
         std::vector<const T*> in_ptrs;
@@ -212,8 +232,8 @@ public:
         }
 
         // Execute RAM-AD in-register fused kernel (Zero DRAM intermediate round-trip)
-        size_t total_elements = output_counts_.empty() ? 0 : output_counts_[0];
-        fused_fn_(in_ptrs.data(), out_ptrs.data(), total_elements);
+        execute_into(std::span<const T* const>(in_ptrs.data(), in_ptrs.size()),
+                     std::span<T*>(out_ptrs.data(), out_ptrs.size()));
 
         // Package outputs into GenericTensor
         std::vector<GenericTensor<T>> results;
@@ -273,10 +293,16 @@ public:
     }
 
     [[nodiscard]] const GenericCompiledKernel<T>* lookup(uint64_t hash) const noexcept {
+        if (hash == 0) return nullptr;
         const size_t idx = hash & kMask;
         const auto& slot = slots_[idx];
-        if (slot.signature_hash.load(std::memory_order_acquire) == hash) {
-            return slot.kernel_ptr.load(std::memory_order_acquire);
+        uint64_t h1 = slot.signature_hash.load(std::memory_order_acquire);
+        if (h1 == hash) {
+            const auto* k = slot.kernel_ptr.load(std::memory_order_acquire);
+            uint64_t h2 = slot.signature_hash.load(std::memory_order_acquire);
+            if (h2 == hash) {
+                return k;
+            }
         }
         return nullptr;
     }
@@ -286,17 +312,21 @@ public:
     }
 
     void install(std::string_view key, const GenericCompiledKernel<T>* kernel) noexcept {
+        if (!kernel) return;
         const uint64_t h = hash_key(key);
         const size_t idx = h & kMask;
         auto& slot = slots_[idx];
 
-        // RCU atomic publication: write kernel pointer first, then hash with release
+        std::lock_guard<std::mutex> lock(write_mutex_);
+        // Invalidate slot first to prevent readers from reading an inconsistent pair during publication
+        slot.signature_hash.store(0, std::memory_order_release);
         slot.kernel_ptr.store(kernel, std::memory_order_release);
         slot.signature_hash.store(h, std::memory_order_release);
     }
 
 private:
     std::array<Slot, kTableSize> slots_;
+    mutable std::mutex write_mutex_;
 };
 
 // ==============================================================================

@@ -27,6 +27,7 @@
 #include <concepts>
 #include <cmath>
 #include <algorithm>
+#include <stdexcept>
 #include <cstdint>
 #include <cstddef>
 #include <cassert>
@@ -101,7 +102,7 @@ public:
         std::span<const float> Wd,
         std::span<const float> R,
         std::span<float> Y,
-        const DequantConfig& cfg) noexcept
+        const DequantConfig& cfg)
     {
         const size_t M = cfg.M;
         const size_t D = cfg.D;
@@ -109,19 +110,18 @@ public:
         const size_t packed_cols = D_ffn / 2;
 
         if (M == 0 || D == 0 || D_ffn == 0) return;
-        assert(X.size() >= M * D);
-        assert(Wg_packed.size() >= D * packed_cols);
-        assert(scale_g.size() >= D_ffn);
-        assert(zp_g.size() >= D_ffn);
-        assert(Wu_packed.size() >= D * packed_cols);
-        assert(scale_u.size() >= D_ffn);
-        assert(zp_u.size() >= D_ffn);
-        assert(Wd.size() >= D_ffn * D);
-        assert(R.size() >= M * D);
-        assert(Y.size() >= M * D);
+        if (D_ffn > 2048) {
+            throw std::invalid_argument("D_ffn exceeds static scratchpad limit of 2048");
+        }
+        if (X.size() < M * D || Wg_packed.size() < D * packed_cols ||
+            scale_g.size() < D_ffn || zp_g.size() < D_ffn ||
+            Wu_packed.size() < D * packed_cols || scale_u.size() < D_ffn ||
+            zp_u.size() < D_ffn || Wd.size() < D_ffn * D ||
+            R.size() < M * D || Y.size() < M * D) {
+            throw std::invalid_argument("Input/output buffer size smaller than expected dimensions");
+        }
 
         alignas(64) std::array<float, 2048> h_vec;
-        assert(D_ffn <= h_vec.size());
 
         for (size_t m = 0; m < M; ++m) {
             const float* __restrict__ x_ptr = X.data() + m * D;

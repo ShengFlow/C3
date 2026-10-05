@@ -52,7 +52,8 @@ public:
         std::span<T> out_A,          // [Din, Din]
         std::span<T> out_S,          // [Dout, Dout]
         std::span<T> out_FVP,        // [Din, Dout]
-        const CurvatureConfig& cfg
+        const CurvatureConfig& cfg,
+        std::span<T> workspace = {}  // [optional, >= Din * Dout]
     ) {
         const size_t B = cfg.B;
         const size_t Din = cfg.Din;
@@ -62,6 +63,16 @@ public:
         constexpr size_t kMaxDout = 512;
         if (Din > kMaxDin || Dout > kMaxDout || B == 0) {
             throw std::invalid_argument("Din/Dout exceeds static bounds or B is 0");
+        }
+
+        if (X.size() < B * Din || W.size() < Din * Dout || dY.size() < B * Dout ||
+            V.size() < Din * Dout || out_Y.size() < B * Dout || out_dW.size() < Din * Dout ||
+            out_A.size() < Din * Din || out_S.size() < Dout * Dout || out_FVP.size() < Din * Dout) {
+            throw std::invalid_argument("Input/output span size smaller than required dimensions");
+        }
+
+        if (!workspace.empty() && workspace.size() < Din * Dout) {
+            throw std::invalid_argument("Caller workspace buffer size smaller than Din * Dout");
         }
 
         // Initialize accumulators to zero
@@ -114,7 +125,26 @@ public:
 
         // 3. In-Register Fisher-Vector Product: FVP = A * V * S
         // Step 3a: T_tmp = A * V  [Din, Dout]
-        alignas(64) T T_tmp[kMaxDin * kMaxDout];
+        // Zero stack overflow risk (<64KB):
+        // Small tile fits on stack (64x64 = 4096 elements = 32KB for double).
+        // Larger tile without caller workspace uses thread-local scratchpad.
+        constexpr size_t kMaxTileElements = 64 * 64;
+        alignas(64) T stack_tile[kMaxTileElements];
+
+        struct alignas(64) Scratchpad {
+            std::array<T, kMaxDin * kMaxDout> buf;
+        };
+        static thread_local Scratchpad tls_scratchpad;
+
+        T* T_tmp = nullptr;
+        if (!workspace.empty()) {
+            T_tmp = workspace.data();
+        } else if (Din * Dout <= kMaxTileElements) {
+            T_tmp = stack_tile;
+        } else {
+            T_tmp = tls_scratchpad.buf.data();
+        }
+
         for (size_t i = 0; i < Din; ++i) {
             for (size_t j = 0; j < Dout; ++j) {
                 T sum = static_cast<T>(0);

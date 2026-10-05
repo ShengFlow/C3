@@ -74,6 +74,13 @@ public:
             throw std::invalid_argument("Dimensions exceed static bounds for in-register evaluation");
         }
 
+        if (X_packed.size() < T_total * Din || dY_packed.size() < T_total * Dout ||
+            W1.size() < Din * Dmid || W2.size() < Dmid * Dout ||
+            out_Y.size() < T_total * Dout || out_dX.size() < T_total * Din ||
+            out_dW1.size() < Din * Dmid || out_dW2.size() < Dmid * Dout) {
+            throw std::invalid_argument("Buffer sizes are smaller than required ragged dimensions");
+        }
+
         // Initialize weight gradient accumulators to zero
         std::fill(out_dW1.begin(), out_dW1.end(), static_cast<T>(0));
         std::fill(out_dW2.begin(), out_dW2.end(), static_cast<T>(0));

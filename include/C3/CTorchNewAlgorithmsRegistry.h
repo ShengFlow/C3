@@ -90,11 +90,12 @@ public:
         std::span<T> out_A,
         std::span<T> out_S,
         std::span<T> out_FVP,
-        const typename RamAdCurvatureEngine<T>::CurvatureConfig& cfg)
+        const typename RamAdCurvatureEngine<T>::CurvatureConfig& cfg,
+        std::span<T> workspace = {})
     {
         RamAdCurvatureEngine<T>::execute_curvature_kfac(
             X, W, dY, V,
-            out_Y, out_dW, out_A, out_S, out_FVP, cfg);
+            out_Y, out_dW, out_A, out_S, out_FVP, cfg, workspace);
     }
 
     static void execute_amx_flash_attention(
@@ -102,7 +103,7 @@ public:
         std::span<const float> K,
         std::span<const float> V,
         std::span<float> O,
-        const AmxFlashAttentionEngine::FlashAttentionConfig& cfg) noexcept
+        const AmxFlashAttentionEngine::FlashAttentionConfig& cfg)
     {
         AmxFlashAttentionEngine::execute_fused_sdpa(Q, K, V, O, cfg);
     }
@@ -130,7 +131,7 @@ public:
         std::span<const float> Wd,
         std::span<const float> R,
         std::span<float> Y,
-        const AmxDequantFusionEngine::DequantConfig& cfg) noexcept
+        const AmxDequantFusionEngine::DequantConfig& cfg)
     {
         AmxDequantFusionEngine::execute_amx_dequant_fused(
             X, Wg_packed, scale_g, zp_g, Wu_packed, scale_u, zp_u, Wd, R, Y, cfg);
@@ -141,7 +142,7 @@ public:
         std::span<const float> K,
         std::span<const float> V,
         std::span<float> O,
-        const FlashAttention3Config& cfg) noexcept
+        const FlashAttention3Config& cfg)
     {
         FlashAttention3Fp8Engine::execute_fused_sdpa_fp8(Q, K, V, O, cfg);
     }

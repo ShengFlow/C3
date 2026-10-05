@@ -261,7 +261,10 @@ private:
         bool c2_gemm = (cluster2.dominant_kind == OpKind::GEMM);
 
         if (c1_gemm && c2_gemm) {
-            // Sibling GEMMs allowed
+            // Sibling GEMMs allowed, but disallow sequential GEMMs (direct edge)
+            if (cluster_adj_.at(c1).contains(c2) || cluster_adj_.at(c2).contains(c1)) {
+                return false;
+            }
         } else if (c1_gemm) {
             if (cluster2.dominant_kind != OpKind::ELEMENTWISE) return false;
         } else if (c2_gemm) {

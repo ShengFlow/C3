@@ -94,6 +94,14 @@ public:
             throw std::invalid_argument("Din or Dmid exceeds maximum static bounds for in-register evaluation");
         }
 
+        if (x.size() < Din || W1.size() < Din * Dmid || W2.size() < Din * Dmid || W3.size() < Din * Dmid ||
+            target_Y.size() < Dmid || target_norm.size() < Din ||
+            out_Y.size() < Dmid || out_Y_norm.size() < Din ||
+            out_dx.size() < Din || out_dW1.size() < Din * Dmid ||
+            out_dW2.size() < Din * Dmid || out_dW3.size() < Din * Dmid) {
+            throw std::invalid_argument("Input/output span size smaller than required dimensions");
+        }
+
         alignas(64) T u1[kMaxDmid];
         alignas(64) T u2[kMaxDmid];
         alignas(64) T u3[kMaxDmid];

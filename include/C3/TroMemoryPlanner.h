@@ -255,7 +255,7 @@ public:
 
     template <typename T = uint8_t>
     [[nodiscard]] inline T* get_ptr(size_t offset) noexcept {
-        if (data_ == nullptr || offset >= capacity_) {
+        if (!data_ || offset > capacity_ || sizeof(T) > capacity_ - offset) {
             return nullptr;
         }
         return reinterpret_cast<T*>(static_cast<uint8_t*>(data_) + offset);
@@ -263,7 +263,7 @@ public:
 
     template <typename T = uint8_t>
     [[nodiscard]] inline const T* get_ptr(size_t offset) const noexcept {
-        if (data_ == nullptr || offset >= capacity_) {
+        if (!data_ || offset > capacity_ || sizeof(T) > capacity_ - offset) {
             return nullptr;
         }
         return reinterpret_cast<const T*>(static_cast<const uint8_t*>(data_) + offset);

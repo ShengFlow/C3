@@ -144,12 +144,12 @@ public:
     template <typename T = uint8_t>
     [[nodiscard]] inline T* get_ptr(int32_t node_id, size_t offset) noexcept {
         if (node_id >= 0 && static_cast<size_t>(node_id) < num_nodes_) {
-            if (node_ptrs_[node_id] == nullptr || offset >= node_capacities_[node_id]) {
+            if (!node_ptrs_[node_id] || offset > node_capacities_[node_id] || sizeof(T) > node_capacities_[node_id] - offset) {
                 return nullptr;
             }
             return reinterpret_cast<T*>(static_cast<uint8_t*>(node_ptrs_[node_id]) + offset);
         } else {
-            if (shared_ptr_ == nullptr || offset >= shared_capacity_) {
+            if (!shared_ptr_ || offset > shared_capacity_ || sizeof(T) > shared_capacity_ - offset) {
                 return nullptr;
             }
             return reinterpret_cast<T*>(static_cast<uint8_t*>(shared_ptr_) + offset);
@@ -159,12 +159,12 @@ public:
     template <typename T = uint8_t>
     [[nodiscard]] inline const T* get_ptr(int32_t node_id, size_t offset) const noexcept {
         if (node_id >= 0 && static_cast<size_t>(node_id) < num_nodes_) {
-            if (node_ptrs_[node_id] == nullptr || offset >= node_capacities_[node_id]) {
+            if (!node_ptrs_[node_id] || offset > node_capacities_[node_id] || sizeof(T) > node_capacities_[node_id] - offset) {
                 return nullptr;
             }
             return reinterpret_cast<const T*>(static_cast<const uint8_t*>(node_ptrs_[node_id]) + offset);
         } else {
-            if (shared_ptr_ == nullptr || offset >= shared_capacity_) {
+            if (!shared_ptr_ || offset > shared_capacity_ || sizeof(T) > shared_capacity_ - offset) {
                 return nullptr;
             }
             return reinterpret_cast<const T*>(static_cast<const uint8_t*>(shared_ptr_) + offset);

@@ -33,6 +33,7 @@
 #include <concepts>
 #include <cmath>
 #include <algorithm>
+#include <stdexcept>
 #include <cstdint>
 #include <cstddef>
 #include <cassert>
@@ -125,7 +126,7 @@ public:
         std::span<const float> K,
         std::span<const float> V,
         std::span<float> O,
-        const FlashAttentionConfig& cfg) noexcept
+        const FlashAttentionConfig& cfg)
     {
         const size_t N = cfg.seq_len;
         const size_t d = cfg.head_dim;
@@ -135,11 +136,12 @@ public:
         const bool is_causal = cfg.is_causal;
 
         if (N == 0 || d == 0) return;
-        assert(Q.size() >= N * d);
-        assert(K.size() >= N * d);
-        assert(V.size() >= N * d);
-        assert(O.size() >= N * d);
-        assert(Br <= 64 && Bc <= 64 && d <= 128);
+        if (Br > 64 || Bc > 64 || d > 128) {
+            throw std::invalid_argument("Tile or head dimension exceeds static register scratchpad limit");
+        }
+        if (Q.size() < N * d || K.size() < N * d || V.size() < N * d || O.size() < N * d) {
+            throw std::invalid_argument("Input/output buffer size smaller than sequence dimension");
+        }
 
         // Hardware-aligned stack buffers for tile computation (Strictly Zero-Heap)
         alignas(64) std::array<float, 64 * 64> S_tile;

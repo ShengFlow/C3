@@ -106,7 +106,7 @@ public:
         size_t D_ffn) noexcept
     {
         alignas(64) std::array<float, 8192> h_local;
-        assert(D_ffn <= h_local.size());
+        if (D_ffn > h_local.size()) return;
 
         for (size_t m = m_start; m < m_end; ++m) {
             const float* __restrict__ x_ptr = X.data() + m * D;
@@ -171,13 +171,11 @@ public:
         const size_t D_ffn = cfg.D_ffn;
         const size_t P = cfg.num_threads > 0 ? cfg.num_threads : 1;
 
-        if (M == 0 || D == 0 || D_ffn == 0) return;
-        assert(X.size() >= M * D);
-        assert(Wg.size() >= D * D_ffn);
-        assert(Wu.size() >= D * D_ffn);
-        assert(Wd.size() >= D_ffn * D);
-        assert(R.size() >= M * D);
-        assert(Y.size() >= M * D);
+        if (M == 0 || D == 0 || D_ffn == 0 || D_ffn > 8192) return;
+        if (X.size() < M * D || Wg.size() < D * D_ffn || Wu.size() < D * D_ffn ||
+            Wd.size() < D_ffn * D || R.size() < M * D || Y.size() < M * D) {
+            return;
+        }
 
         if (P <= 1) {
             compute_row_slice(X, Wg, Wu, Wd, R, Y, 0, M, D, D_ffn);
@@ -186,43 +184,13 @@ public:
 
         const size_t chunk_size = (M + P - 1) / P;
 
-        // Zero-heap execution: use stack array for standard core counts (P <= 16)
-        if (P <= 16) {
-            std::array<std::thread, 16> workers;
-            size_t spawned = 0;
-            for (size_t tid = 0; tid < P; ++tid) {
-                const size_t m_start = tid * chunk_size;
-                const size_t m_end = std::min(m_start + chunk_size, M);
-                if (m_start >= m_end) continue;
-
-                workers[spawned++] = std::thread([=, &X, &Wg, &Wu, &Wd, &R, &Y]() {
-                    compute_row_slice(X, Wg, Wu, Wd, R, Y, m_start, m_end, D, D_ffn);
-                });
-            }
-
-            for (size_t i = 0; i < spawned; ++i) {
-                if (workers[i].joinable()) {
-                    workers[i].join();
-                }
-            }
-        } else {
-            std::vector<std::thread> workers;
-            workers.reserve(P);
-
-            for (size_t tid = 0; tid < P; ++tid) {
-                const size_t m_start = tid * chunk_size;
-                const size_t m_end = std::min(m_start + chunk_size, M);
-                if (m_start >= m_end) continue;
-
-                workers.emplace_back([=, &X, &Wg, &Wu, &Wd, &R, &Y]() {
-                    compute_row_slice(X, Wg, Wu, Wd, R, Y, m_start, m_end, D, D_ffn);
-                });
-            }
-
-            for (auto& w : workers) {
-                if (w.joinable()) {
-                    w.join();
-                }
+        // Zero-heap execution: OpenMP parallel loop eliminates dynamic thread creation overhead
+        #pragma omp parallel for num_threads(P) schedule(static)
+        for (size_t tid = 0; tid < P; ++tid) {
+            const size_t m_start = tid * chunk_size;
+            const size_t m_end = std::min(m_start + chunk_size, M);
+            if (m_start < m_end) {
+                compute_row_slice(X, Wg, Wu, Wd, R, Y, m_start, m_end, D, D_ffn);
             }
         }
     }

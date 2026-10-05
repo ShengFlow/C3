@@ -35,6 +35,7 @@
 #include <cstddef>
 #include <cassert>
 #include <cstring>
+#include <stdexcept>
 
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -88,7 +89,7 @@ struct alignas(1) Fp8E4M3 {
     }
 
     [[nodiscard]] float to_float(float scale) const noexcept {
-        if (bits == 0) return 0.0f;
+        if ((bits & 0x7F) == 0) return 0.0f;
         uint8_t sign = (bits & 0x80) ? 1 : 0;
         uint8_t exp_bits = (bits >> 3) & 0x0F;
         uint8_t mant_bits = bits & 0x07;
@@ -181,7 +182,7 @@ public:
         std::span<const float> V,
         std::span<float> O,
         const FlashAttention3Config& cfg
-    ) noexcept {
+    ) {
         const size_t N = cfg.seq_len;
         const size_t d = cfg.head_dim;
         const size_t Br = cfg.tile_br;
@@ -189,8 +190,12 @@ public:
         const float scale_factor = cfg.scale_factor;
 
         if (N == 0 || d == 0) return;
-        assert(Q.size() >= N * d && K.size() >= N * d && V.size() >= N * d && O.size() >= N * d);
-        assert(Br <= 64 && Bc <= 64 && d <= 128);
+        if (Br > 64 || Bc > 64 || d > 128) {
+            throw std::invalid_argument("Tile or head dimension exceeds static register scratchpad limit");
+        }
+        if (Q.size() < N * d || K.size() < N * d || V.size() < N * d || O.size() < N * d) {
+            throw std::invalid_argument("Input/output buffer size smaller than sequence dimension");
+        }
 
         const size_t num_tr = (N + Br - 1) / Br;
         const size_t num_tc = (N + Bc - 1) / Bc;
