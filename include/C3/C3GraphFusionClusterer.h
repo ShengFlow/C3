@@ -30,12 +30,15 @@
 
 namespace ct::c3 {
 
+#ifndef C3_OPKIND_DEFINED
+#define C3_OPKIND_DEFINED
 enum class OpKind : uint8_t {
     ELEMENTWISE = 0,
     GEMM = 1,
     REDUCTION = 2,
     BARRIER = 3
 };
+#endif
 
 struct GraphNode {
     uint32_t id{0};

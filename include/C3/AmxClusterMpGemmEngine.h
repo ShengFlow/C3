@@ -105,7 +105,7 @@ public:
         size_t D,
         size_t D_ffn) noexcept
     {
-        alignas(64) std::array<float, 2048> h_local;
+        alignas(64) std::array<float, 8192> h_local;
         assert(D_ffn <= h_local.size());
 
         for (size_t m = m_start; m < m_end; ++m) {

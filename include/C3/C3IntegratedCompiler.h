@@ -146,12 +146,15 @@ enum class DeviceType : uint8_t {
 #endif
 #endif
 
+#ifndef C3_OPKIND_DEFINED
+#define C3_OPKIND_DEFINED
 enum class OpKind : uint8_t {
     ELEMENTWISE = 0,
     GEMM = 1,
     REDUCTION = 2,
     BARRIER = 3
 };
+#endif
 
 template <typename T>
     requires std::floating_point<T>

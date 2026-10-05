@@ -1,0 +1,65 @@
+name: C3 Compiler CI
+
+on:
+  push:
+    branches: [ main, master, feature-dcu-optimize, develop ]
+  pull_request:
+    branches: [ main, master, feature-dcu-optimize, develop ]
+
+jobs:
+  build:
+    name: Build & Verify C3 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            compiler: gcc-13
+          - os: macos-14
+            compiler: apple-clang
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python & CMake
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install modern CMake & Ninja
+        run: |
+          pip install --upgrade pip cmake ninja
+
+      - name: Install Linux Dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-13 gcc-13
+          echo "CC=gcc-13" >> $GITHUB_ENV
+          echo "CXX=g++-13" >> $GITHUB_ENV
+
+      - name: Verify C++20 Header Syntactic Integrity
+        run: |
+          echo "=== Verifying C3 C++20 Headers Syntactic Integrity ==="
+          mkdir -p build_check
+          cat << 'EOF' > build_check/test_headers.cpp
+          #include "C3/C3Pipeline.h"
+          #include "C3/TroMemoryPlanner.h"
+          #include "C3/NumaStaticMemoryPlanner.h"
+          #include "C3/C3GraphFusionClusterer.h"
+          #include "C3/RamAdMultiOutputEngine.h"
+          #include "C3/RamAdCurvatureEngine.h"
+          #include "C3/RamAdDynamicRaggedEngine.h"
+          #include "C3/AmxFlashAttentionEngine.h"
+          #include "C3/FlashAttention3Fp8Engine.h"
+          #include "C3/AmxClusterMpGemmEngine.h"
+          #include "C3/AmxDequantFusionEngine.h"
+          #include "C3/C3IntegratedCompiler.h"
+          #include "C3/C3MNISTReplacementEngine.h"
+          #include "C3/CTorchNewAlgorithmsRegistry.h"
+          int main() { return 0; }
+          EOF
+          ${CXX:-g++} -std=c++20 -Iinclude -c build_check/test_headers.cpp -o build_check/test_headers.o
+          echo "All C3 core and micro-kernel headers syntactically verified!"

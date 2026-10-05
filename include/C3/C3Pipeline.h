@@ -117,7 +117,7 @@ private:
 // 2. Lock-Free Fast-Path Dispatch Table (Sub-10ns Latency)
 // ==============================================================================
 
-class CompiledKernel; // Forward declaration
+class PipelineCompiledKernel; // Forward declaration
 
 /**
  * @class LockFreeFastDispatchTable
@@ -131,7 +131,7 @@ public:
 
     struct alignas(64) Slot {
         std::atomic<uint64_t> signature_hash{0};
-        std::atomic<const CompiledKernel*> kernel_ptr{nullptr};
+        std::atomic<const PipelineCompiledKernel*> kernel_ptr{nullptr};
     };
 
     LockFreeFastDispatchTable() {
@@ -150,7 +150,7 @@ public:
         return (h == 0) ? 1 : h; // Reserve 0 for empty slot
     }
 
-    [[nodiscard]] inline const CompiledKernel* lookup(uint64_t sig_hash) const noexcept {
+    [[nodiscard]] inline const PipelineCompiledKernel* lookup(uint64_t sig_hash) const noexcept {
         if (sig_hash == 0) return nullptr;
         const size_t idx = sig_hash & kMask;
         const auto& slot = slots_[idx];
@@ -166,9 +166,9 @@ public:
         return nullptr;
     }
 
-    [[nodiscard]] inline const CompiledKernel* lookup(std::string_view key) const noexcept;
+    [[nodiscard]] inline const PipelineCompiledKernel* lookup(std::string_view key) const noexcept;
 
-    void install(std::string_view key, const CompiledKernel* kernel) noexcept {
+    void install(std::string_view key, const PipelineCompiledKernel* kernel) noexcept {
         const uint64_t h = hash_signature(key);
         const size_t idx = h & kMask;
         auto& slot = slots_[idx];
@@ -308,9 +308,9 @@ private:
 // 4. Unified Compiled Pipeline Kernel Interface
 // ==============================================================================
 
-class CompiledKernel {
+class PipelineCompiledKernel {
 public:
-    virtual ~CompiledKernel() = default;
+    virtual ~PipelineCompiledKernel() = default;
 
     /**
      * @brief Zero-Allocation execute: inputs and outputs directly mapped to preallocated spans.
@@ -326,7 +326,7 @@ public:
     [[nodiscard]] virtual DeviceType target_device() const noexcept = 0;
 };
 
-inline const CompiledKernel* LockFreeFastDispatchTable::lookup(std::string_view key) const noexcept {
+inline const PipelineCompiledKernel* LockFreeFastDispatchTable::lookup(std::string_view key) const noexcept {
     const uint64_t sig_hash = hash_signature(key);
     const auto* k = lookup(sig_hash);
     if (k != nullptr && k->signature() == key) {
@@ -335,14 +335,12 @@ inline const CompiledKernel* LockFreeFastDispatchTable::lookup(std::string_view 
     return nullptr;
 }
 
-using PipelineCompiledKernel = CompiledKernel;
-
 /**
  * @class FusedSwigluResidualKernel
- * @brief High-performance fused SwiGLU + Residual block implementing CompiledKernel.
+ * @brief High-performance fused SwiGLU + Residual block implementing PipelineCompiledKernel.
  * @details Evaluates (SiLU(x * W_g) * (x * W_u) + Residual) in-register using SIMD.
  */
-class FusedSwigluResidualKernel : public CompiledKernel {
+class FusedSwigluResidualKernel : public PipelineCompiledKernel {
 public:
     FusedSwigluResidualKernel(std::string signature_name, size_t workspace_bytes, DeviceType dev = DeviceType::kCPU)
         : signature_(std::move(signature_name)), workspace_bytes_(workspace_bytes), device_(dev) {}
@@ -411,7 +409,7 @@ public:
         return dispatch_table_;
     }
 
-    std::shared_ptr<CompiledKernel> get_or_compile(
+    std::shared_ptr<PipelineCompiledKernel> get_or_compile(
         std::string_view signature,
         size_t num_elements,
         const PipelineConfig& config = {})
@@ -461,13 +459,13 @@ private:
     C3PipelineManager() = default;
     LockFreeFastDispatchTable dispatch_table_;
     mutable std::shared_mutex cache_mutex_;
-    std::unordered_map<std::string, std::shared_ptr<CompiledKernel>> compiled_kernels_;
+    std::unordered_map<std::string, std::shared_ptr<PipelineCompiledKernel>> compiled_kernels_;
 };
 
 /**
  * @brief Top-Level Functional compile() API for CTorch
  */
-inline std::shared_ptr<CompiledKernel> compile(
+inline std::shared_ptr<PipelineCompiledKernel> compile(
     std::string_view signature,
     size_t num_elements,
     const PipelineConfig& config = {})
