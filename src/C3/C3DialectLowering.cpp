@@ -612,7 +612,7 @@ struct MatMulOpLowering : public mlir::OpRewritePattern<mlir::c3::MatMulOp> {
 static void runC3Combine(mlir::ModuleOp module) {
     mlir::RewritePatternSet patterns(module.getContext());
     populateWithGenerated(patterns);
-    if (mlir::failed(mlir::applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
+    if (mlir::failed(mlir::applyPatternsGreedily(module, std::move(patterns)))) {
         throw std::runtime_error("C3DialectLowering: C3Combine pattern rewrite optimization failed");
     }
 }
@@ -623,7 +623,7 @@ static void runC3Lowering(mlir::ModuleOp module) {
                  AddOpLowering, SubOpLowering, MulOpLowering, DivOpLowering,
                  NegOpLowering, ReLUOpLowering, SigmoidOpLowering, TanhOpLowering,
                  ExpOpLowering, LogOpLowering>(module.getContext());
-    if (mlir::failed(mlir::applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
+    if (mlir::failed(mlir::applyPatternsGreedily(module, std::move(patterns)))) {
         throw std::runtime_error("C3DialectLowering: C3ToLLVM lowering pass failed");
     }
 }
