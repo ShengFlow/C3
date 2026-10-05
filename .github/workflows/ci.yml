@@ -1,0 +1,59 @@
+name: C3 CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build-and-verify:
+    name: Build & Verify C3 (LLVM/MLIR 18)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout C3 repository
+        uses: actions/checkout@v4
+        with:
+          path: c3
+
+      - name: Checkout CTorch (host headers)
+        uses: actions/checkout@v4
+        with:
+          repository: ShengFlow/CTorch
+          path: ctorch
+          submodules: recursive
+
+      - name: Set up Python & CMake 3.31+
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Ninja & CMake
+        run: |
+          pip install --upgrade pip cmake ninja
+
+      - name: Install LLVM & MLIR 18
+        run: |
+          wget https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 18
+          sudo apt-get install -y libmlir-18-dev mlir-18-tools
+
+      - name: Configure CMake
+        run: |
+          cmake -B build -S c3 -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DC3_ENABLE_LTO=OFF \
+            -DCT_ENABLE_MLIR=ON \
+            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
+            -DMLIR_DIR=/usr/lib/llvm-18/lib/cmake/mlir \
+            -DC3_HOST_INCLUDE_DIRS="$GITHUB_WORKSPACE/ctorch/include;$GITHUB_WORKSPACE/ctorch/src;$GITHUB_WORKSPACE/ctorch/c3/include"
+
+      - name: Run TableGen Dialect Code Generation (C3Gen)
+        run: |
+          cmake --build build --target C3Gen
+
+      - name: Build C3Core Library
+        run: |
+          cmake --build build --target C3Core -j$(nproc 2>/dev/null || echo 2)
