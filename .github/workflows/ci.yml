@@ -23,7 +23,6 @@ jobs:
           repository: ShengFlow/CTorch
           ref: feature-DCU
           path: ctorch
-          submodules: recursive
 
       - name: Set up Python & CMake 3.31+
         uses: actions/setup-python@v5
@@ -49,7 +48,7 @@ jobs:
             -DCT_ENABLE_MLIR=ON \
             -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
             -DMLIR_DIR=/usr/lib/llvm-18/lib/cmake/mlir \
-            -DC3_HOST_INCLUDE_DIRS="$GITHUB_WORKSPACE/ctorch/include;$GITHUB_WORKSPACE/ctorch/src;$GITHUB_WORKSPACE/ctorch/c3/include"
+            -DC3_HOST_INCLUDE_DIRS="$GITHUB_WORKSPACE/ctorch/include;$GITHUB_WORKSPACE/ctorch/src"
 
       - name: Run TableGen Dialect Code Generation (C3Gen)
         run: |

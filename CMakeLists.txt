@@ -121,9 +121,9 @@ add_library(C3Core OBJECT
 
 target_include_directories(C3Core
         PUBLIC
-        ${C3_HOST_INCLUDE_DIRS}
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_CURRENT_SOURCE_DIR}/src
-        ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        ${C3_HOST_INCLUDE_DIRS})
 
 if(CT_ENABLE_MLIR)
     target_include_directories(C3Core SYSTEM PUBLIC
