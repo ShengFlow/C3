@@ -8,8 +8,8 @@ on:
 
 jobs:
   build-and-verify:
-    name: Build & Verify C3 (LLVM/MLIR 18)
-    runs-on: ubuntu-latest
+    name: Build & Verify C3 (LLVM/MLIR Homebrew)
+    runs-on: macos-14
 
     steps:
       - name: Checkout C3 repository
@@ -24,30 +24,21 @@ jobs:
           ref: feature-DCU
           path: ctorch
 
-      - name: Set up Python & CMake 3.31+
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install Ninja & CMake
+      - name: Install LLVM & Ninja via Homebrew
         run: |
-          pip install --upgrade pip cmake ninja
-
-      - name: Install LLVM & MLIR 18
-        run: |
-          wget https://apt.llvm.org/llvm.sh
-          chmod +x llvm.sh
-          sudo ./llvm.sh 18
-          sudo apt-get install -y libmlir-18-dev mlir-18-tools
+          brew install llvm ninja
 
       - name: Configure CMake
         run: |
+          LLVM_PREFIX=$(brew --prefix llvm)
           cmake -B build -S c3 -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DC3_ENABLE_LTO=OFF \
             -DCT_ENABLE_MLIR=ON \
-            -DLLVM_DIR=/usr/lib/llvm-18/lib/cmake/llvm \
-            -DMLIR_DIR=/usr/lib/llvm-18/lib/cmake/mlir \
+            -DLLVM_DIR="${LLVM_PREFIX}/lib/cmake/llvm" \
+            -DMLIR_DIR="${LLVM_PREFIX}/lib/cmake/mlir" \
+            -DCMAKE_C_COMPILER_LAUNCHER="" \
+            -DCMAKE_CXX_COMPILER_LAUNCHER="" \
             -DC3_HOST_INCLUDE_DIRS="$GITHUB_WORKSPACE/ctorch/include;$GITHUB_WORKSPACE/ctorch/src"
 
       - name: Run TableGen Dialect Code Generation (C3Gen)
@@ -56,4 +47,4 @@ jobs:
 
       - name: Build C3Core Library
         run: |
-          cmake --build build --target C3Core -j$(nproc 2>/dev/null || echo 2)
+          cmake --build build --target C3Core -j$(sysctl -n hw.ncpu 2>/dev/null || echo 2)
