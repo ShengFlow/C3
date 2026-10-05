@@ -212,19 +212,20 @@ public:
     }
 };
 
+template <size_t Alignment = kDefaultHardwareAlignment>
 class AlignedStaticArena {
 public:
     explicit AlignedStaticArena(size_t capacity_bytes)
-        : capacity_(TroMemoryPlanner::align_up(capacity_bytes, kDefaultHardwareAlignment))
+        : capacity_(TroMemoryPlanner::align_up(capacity_bytes, Alignment))
     {
         if (capacity_ > 0) {
-            data_ = ::operator new(capacity_, std::align_val_t{kDefaultHardwareAlignment});
+            data_ = ::operator new(capacity_, std::align_val_t{Alignment});
         }
     }
 
     ~AlignedStaticArena() noexcept {
         if (data_) {
-            ::operator delete(data_, std::align_val_t{kDefaultHardwareAlignment});
+            ::operator delete(data_, std::align_val_t{Alignment});
             data_ = nullptr;
         }
     }
@@ -242,7 +243,7 @@ public:
     AlignedStaticArena& operator=(AlignedStaticArena&& o) noexcept {
         if (this != &o) {
             if (data_) {
-                ::operator delete(data_, std::align_val_t{kDefaultHardwareAlignment});
+                ::operator delete(data_, std::align_val_t{Alignment});
             }
             data_ = o.data_;
             capacity_ = o.capacity_;
@@ -276,5 +277,7 @@ private:
     void* data_{nullptr};
     size_t capacity_{0};
 };
+
+AlignedStaticArena(size_t) -> AlignedStaticArena<kDefaultHardwareAlignment>;
 
 } // namespace ct::c3

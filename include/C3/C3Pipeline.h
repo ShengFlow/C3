@@ -44,6 +44,8 @@ namespace ct::c3 {
 template <typename T>
 concept NumericType = std::floating_point<T> || std::integral<T>;
 
+#ifndef C3_DEVICE_TYPE_DEFINED
+#define C3_DEVICE_TYPE_DEFINED
 #if defined(CTOOLS_H)
 using DeviceType = ::DeviceType;
 #else
@@ -53,6 +55,7 @@ enum class DeviceType : uint8_t {
     kCUDA,
     kDCU
 };
+#endif
 #endif
 
 // ==============================================================================
