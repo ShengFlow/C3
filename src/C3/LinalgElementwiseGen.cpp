@@ -17,6 +17,7 @@
 #include "C3/LinalgElementwiseGen.h"
 #include "C3/JITCache.h"
 #include "MLIRKernelGen.h"
+#include <llvm/Config/llvm-config.h>
 
 #include <cmath>
 #include <cstdlib>
@@ -317,7 +318,9 @@ void applyLinalgLoweringPipeline(mlir::ModuleOp module) {
     {
         mlir::PassManager pm(module.getContext());
         pm.addPass(mlir::createLinalgInlineScalarOperandsPass());
+#if LLVM_VERSION_MAJOR >= 20
         pm.addPass(mlir::createLinalgSpecializeGenericOpsPass());
+#endif
         pm.addPass(mlir::createCanonicalizerPass());
         pm.addPass(mlir::createCSEPass());
         if (mlir::failed(pm.run(module))) {

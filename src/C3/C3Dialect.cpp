@@ -38,7 +38,7 @@ void TransposeOp::build(::mlir::OpBuilder &odsBuilder, ::mlir::OperationState &o
 
 void SumReduceOp::build(::mlir::OpBuilder &odsBuilder, ::mlir::OperationState &odsState,
                         ::mlir::Value input, ::mlir::Value out,
-                        int64_t M, int64_t N, int axis, int keepdim) {
+                        long long M, long long N, int axis, int keepdim) {
   odsState.addOperands(input);
   odsState.addOperands(out);
   auto i64 = odsBuilder.getI64Type();
@@ -54,7 +54,7 @@ void SumReduceOp::build(::mlir::OpBuilder &odsBuilder, ::mlir::OperationState &o
 // 解决 TableGen 生成的 build 用 IntegerAttr 包装，与 mlir::c3::CrossEntropyOp::build 期望不一致
 void CrossEntropyOp::build(::mlir::OpBuilder &odsBuilder, ::mlir::OperationState &odsState,
                            ::mlir::Value logits, ::mlir::Value target, ::mlir::Value out,
-                           int64_t M, int64_t N) {
+                           long long M, long long N) {
   odsState.addOperands(logits);
   odsState.addOperands(target);
   odsState.addOperands(out);

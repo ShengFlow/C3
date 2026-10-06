@@ -13,6 +13,7 @@
 #include "Ctools.h"
 #include "CtorchError.h"
 
+#include <llvm/Config/llvm-config.h>
 #include <mlir/IR/Builders.h>
 #include <mlir/IR/BuiltinOps.h>
 #include <mlir/IR/BuiltinTypes.h>
@@ -951,7 +952,9 @@ static void applyUnifiedTransformPipeline(mlir::ModuleOp module, size_t num_inpu
         pm.addPass(mlir::createLinalgFoldIntoElementwisePass());
         pm.addPass(mlir::createLinalgFoldUnitExtentDimsPass());
         pm.addPass(mlir::createLinalgInlineScalarOperandsPass());
+#if LLVM_VERSION_MAJOR >= 20
         pm.addPass(mlir::createLinalgSpecializeGenericOpsPass());
+#endif
         pm.addPass(mlir::createInlinerPass());
         pm.addPass(mlir::createSCCPPass());
         pm.addPass(mlir::createCanonicalizerPass());

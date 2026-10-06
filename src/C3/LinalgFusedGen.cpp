@@ -12,6 +12,7 @@
 #include "Ctools.h"
 #include "AutoGrad/Nodes/SiLUNode.h"  // PEL25 Stage 5.2: SiLU region fusion
 
+#include <llvm/Config/llvm-config.h>
 #include <mlir/IR/MLIRContext.h>
 #include <mlir/IR/Verifier.h>
 #include <mlir/Dialect/Arith/IR/Arith.h>
@@ -441,7 +442,9 @@ void applyLinalgLoweringPipeline(mlir::ModuleOp module) {
     {
         mlir::PassManager pm(module.getContext());
         pm.addPass(mlir::createLinalgInlineScalarOperandsPass());
+#if LLVM_VERSION_MAJOR >= 20
         pm.addPass(mlir::createLinalgSpecializeGenericOpsPass());
+#endif
         pm.addPass(mlir::createCanonicalizerPass());
         pm.addPass(mlir::createCSEPass());
         if (mlir::failed(pm.run(module))) {

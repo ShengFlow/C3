@@ -15,6 +15,7 @@
 #include "C3/C3Dialect.h"
 #include "C3/TuningState.h"
 
+#include <llvm/Config/llvm-config.h>
 #include <mlir/Transforms/GreedyPatternRewriteDriver.h>
 #include <mlir/Pass/PassManager.h>
 #include <mlir/Transforms/Passes.h>
@@ -1192,7 +1193,11 @@ void applyLoweringPipeline(mlir::ModuleOp module, int opt_level) {
 
     // [优化 2026-08-16] 移除 ParallelLoopFusionPass。因为 C3DialectLowering 仅生成顺序 scf.for 循环，
     // 无 scf.parallel 循环，此 pass 为 100% no-op，移除它以减少编译期 pass 遍历开销。
+#if LLVM_VERSION_MAJOR >= 20
     runPass(module, mlir::createSCFToControlFlowPass(), "SCFToCF");
+#else
+    runPass(module, mlir::createConvertSCFToCFPass(), "SCFToCF");
+#endif
 
     runPass(module, mlir::createConvertMathToLLVMPass(), "MathToLLVM");
     runPass(module, mlir::createArithToLLVMConversionPass(), "ArithToLLVM");
@@ -1214,7 +1219,11 @@ void applyLoweringPipeline(mlir::ModuleOp module, int opt_level) {
 // (典型残留即 unrealized_conversion_cast)。抽取前三条路径内联的是反序版本,
 // 对齐后经逐位数值 + lowering 后 IR 比对确认中性(见 STATUS §4.112)。
 void appendLLVMLoweringTail(mlir::PassManager& pm) {
+#if LLVM_VERSION_MAJOR >= 20
     pm.addPass(mlir::createSCFToControlFlowPass());
+#else
+    pm.addPass(mlir::createConvertSCFToCFPass());
+#endif
     pm.addPass(mlir::createConvertMathToLLVMPass());
     pm.addPass(mlir::createArithToLLVMConversionPass());
     pm.addPass(mlir::createConvertControlFlowToLLVMPass());
