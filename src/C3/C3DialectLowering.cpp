@@ -360,7 +360,8 @@ struct BinaryOpLowering : public mlir::OpRewritePattern<SrcOp> {
         static constexpr int64_t kBroadcastUnsupported =
             std::numeric_limits<int64_t>::min();
         if (bmod == kBroadcastUnsupported) {
-            ct::c3::throwCompileError(
+            return rewriter.notifyMatchFailure(
+                op,
                 "BinaryOpLowering: unsupported partial broadcast shape (e.g. [M,1]→[M,N]); "
                 "refusing to lower to avoid out-of-bounds read");
         }

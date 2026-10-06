@@ -2330,19 +2330,16 @@ GeneratedKernel generateFromGraphMLIR(const Graph& graph, int opt_level) {
     mlir::registerBuiltinDialectTranslation(reg);
     mlir::registerLLVMDialectTranslation(reg);
 
-    std::shared_ptr<mlir::MLIRContext> context;
-    {
-        std::lock_guard<std::mutex> lock(ct::c3::c3_global_mlir_mutex);
-        context = std::make_shared<mlir::MLIRContext>(reg);
-        context->getOrLoadDialect<mlir::arith::ArithDialect>();
-        context->getOrLoadDialect<mlir::math::MathDialect>();
-        context->getOrLoadDialect<mlir::scf::SCFDialect>();
-        context->getOrLoadDialect<mlir::vector::VectorDialect>();
-        context->getOrLoadDialect<mlir::func::FuncDialect>();
-        context->getOrLoadDialect<mlir::memref::MemRefDialect>();
-        context->getOrLoadDialect<mlir::LLVM::LLVMDialect>();
-        context->getOrLoadDialect<mlir::c3::C3Dialect>();
-    }
+    std::lock_guard<std::mutex> mlir_lock(ct::c3::c3_global_mlir_mutex);
+    auto context = std::make_shared<mlir::MLIRContext>(reg);
+    context->getOrLoadDialect<mlir::arith::ArithDialect>();
+    context->getOrLoadDialect<mlir::math::MathDialect>();
+    context->getOrLoadDialect<mlir::scf::SCFDialect>();
+    context->getOrLoadDialect<mlir::vector::VectorDialect>();
+    context->getOrLoadDialect<mlir::func::FuncDialect>();
+    context->getOrLoadDialect<mlir::memref::MemRefDialect>();
+    context->getOrLoadDialect<mlir::LLVM::LLVMDialect>();
+    context->getOrLoadDialect<mlir::c3::C3Dialect>();
 
     size_t pool_buf_count = 0;
     auto module = buildMLIRModule(*context, graph, &pool_buf_count);

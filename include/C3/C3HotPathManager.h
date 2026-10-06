@@ -1166,44 +1166,58 @@ private:
 
         // 后台辅助 lambda，处理单个编译 future 的解析和注册
         auto run_install_task = [this, op_type, shape, lhs_shape, rhs_shape](CompileFuture compile_future, std::string pipeline_name) {
-            auto kernel = compile_future.get();
-            if (kernel) {
-                // 安装到 C3KernelRegistry
-                KernelShapeInfo info;
-                if (op_type == op::MatMul && shape.size() >= 4) {
-                    // MatMul: shape={M, K, K, N}
-                    size_t M = shape[0], K = shape[1], N = shape[3];
-                    info.is_matmul = true;
-                    info.M = M; info.K = K; info.N = N;
-                    info.lhs_shape = {M, K};
-                    info.rhs_shape = {K, N};
-                    info.out_shape = {M, N};
-                } else {
-                    // 单算子统一使用真实输入形状，保证注册 key 与执行期 key 一致
-                    info.lhs_shape = lhs_shape;
-                    info.rhs_shape = rhs_shape;
-                    info.out_shape = lhs_shape;
-                }
-                C3KernelRegistry::getInstance().install(op_type, DeviceType::kCPU, kernel, info);
+            try {
+                auto kernel = compile_future.get();
+                if (kernel) {
+                    // 安装到 C3KernelRegistry
+                    KernelShapeInfo info;
+                    if (op_type == op::MatMul && shape.size() >= 4) {
+                        // MatMul: shape={M, K, K, N}
+                        size_t M = shape[0], K = shape[1], N = shape[3];
+                        info.is_matmul = true;
+                        info.M = M; info.K = K; info.N = N;
+                        info.lhs_shape = {M, K};
+                        info.rhs_shape = {K, N};
+                        info.out_shape = {M, N};
+                    } else {
+                        // 单算子统一使用真实输入形状，保证注册 key 与执行期 key 一致
+                        info.lhs_shape = lhs_shape;
+                        info.rhs_shape = rhs_shape;
+                        info.out_shape = lhs_shape;
+                    }
+                    C3KernelRegistry::getInstance().install(op_type, DeviceType::kCPU, kernel, info);
 
-                if (getConfig().verbose) {
-                    CtorchError::log(ErrorLevel::INFO, ErrorPlatform::kGENERAL,
-                        ErrorType::UNKNOWN,
-                        "C3HotPathManager: [" + pipeline_name + "] 编译完成并注册: op=" +
-                        std::to_string(static_cast<int>(op_type)) +
-                        " opt_level=" + std::to_string(kernel->optLevel()) +
-                        " shape=[" + shapeToString(shape) + "]");
+                    if (getConfig().verbose) {
+                        CtorchError::log(ErrorLevel::INFO, ErrorPlatform::kGENERAL,
+                            ErrorType::UNKNOWN,
+                            "C3HotPathManager: [" + pipeline_name + "] 编译完成并注册: op=" +
+                            std::to_string(static_cast<int>(op_type)) +
+                            " opt_level=" + std::to_string(kernel->optLevel()) +
+                            " shape=[" + shapeToString(shape) + "]");
+                    }
                 }
+            } catch (const std::exception& e) {
+                if (getConfig().verbose) {
+                    CtorchError::log(ErrorLevel::WARN, ErrorPlatform::kGENERAL,
+                        ErrorType::UNKNOWN,
+                        "C3HotPathManager: [" + pipeline_name + "] 编译任务异常: " + e.what());
+                }
+            } catch (...) {
+                // 静默安全保护，防止后台编译异常逃逸导致 std::terminate
             }
         };
 
         // 启动两个并发等待线程
         auto future_fast = std::async(std::launch::async, [run_install_task, compile_future_fast = std::move(compile_future_fast)]() mutable {
-            run_install_task(std::move(compile_future_fast), "Tier 1 JIT (Fast)");
+            try {
+                run_install_task(std::move(compile_future_fast), "Tier 1 JIT (Fast)");
+            } catch (...) {}
         });
 
         auto future_extreme = std::async(std::launch::async, [this, run_install_task, compile_future_extreme = std::move(compile_future_extreme), key]() mutable {
-            run_install_task(std::move(compile_future_extreme), "Tier 2 JIT (Extreme)");
+            try {
+                run_install_task(std::move(compile_future_extreme), "Tier 2 JIT (Extreme)");
+            } catch (...) {}
             
             // 极限管线作为生命周期的收尾，负责释放全局 pending 计数和设置 compiling 状态
             pending_compiles_.fetch_sub(1, std::memory_order_relaxed);
