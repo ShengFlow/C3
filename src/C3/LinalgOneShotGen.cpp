@@ -949,7 +949,9 @@ static void applyUnifiedTransformPipeline(mlir::ModuleOp module, size_t num_inpu
     {
         mlir::PassManager pm(module.getContext());
         pm.addPass(mlir::createLinalgElementwiseOpFusionPass());
+#if LLVM_VERSION_MAJOR >= 20
         pm.addPass(mlir::createLinalgFoldIntoElementwisePass());
+#endif
         pm.addPass(mlir::createLinalgFoldUnitExtentDimsPass());
         pm.addPass(mlir::createLinalgInlineScalarOperandsPass());
 #if LLVM_VERSION_MAJOR >= 20
@@ -1004,9 +1006,15 @@ static void applyUnifiedTransformPipeline(mlir::ModuleOp module, size_t num_inpu
         mlir::PassManager pm(module.getContext());
         pm.addPass(mlir::createCanonicalizerPass());
         pm.addPass(mlir::createCSEPass());
+#if LLVM_VERSION_MAJOR >= 20
         mlir::bufferization::OneShotBufferizePassOptions options;
         options.bufferizeFunctionBoundaries = true;
         pm.addPass(mlir::bufferization::createOneShotBufferizePass(options));
+#else
+        mlir::bufferization::OneShotBufferizeOptions options;
+        options.bufferizeFunctionBoundaries = true;
+        pm.addPass(mlir::bufferization::createOneShotBufferizePass(options));
+#endif
         if (mlir::failed(pm.run(module))) {
             ct::c3::throwCompileError("One-Shot Bufferization failed");
         }
@@ -1022,7 +1030,9 @@ static void applyUnifiedTransformPipeline(mlir::ModuleOp module, size_t num_inpu
         func_pm.addPass(mlir::bufferization::createBufferHoistingPass());
         func_pm.addPass(mlir::bufferization::createBufferLoopHoistingPass());
         func_pm.addPass(mlir::bufferization::createPromoteBuffersToStackPass());
+#if LLVM_VERSION_MAJOR >= 20
         func_pm.addPass(mlir::bufferization::createOptimizeAllocationLivenessPass());
+#endif
         func_pm.addPass(mlir::bufferization::createOwnershipBasedBufferDeallocationPass());
         func_pm.addPass(mlir::bufferization::createBufferDeallocationSimplificationPass());
         pm.addPass(mlir::createCanonicalizerPass());
