@@ -205,8 +205,8 @@ void buildLinalgElementwiseFunc(mlir::OpBuilder& builder, mlir::Location loc,
             switch (op) {
             case ElementwiseOp::ReLU: {
                 mlir::Value in_val = args[0];
-                mlir::Value zero = b.create<mlir::arith::ConstantFloatOp>(
-                    regionLoc, f32Type, llvm::APFloat(0.0f));
+                mlir::Value zero = b.create<mlir::arith::ConstantOp>(
+                    regionLoc, b.getF32FloatAttr(0.0f));
                 result = b.create<mlir::arith::MaxNumFOp>(regionLoc, in_val, zero);
                 break;
             }
@@ -214,8 +214,8 @@ void buildLinalgElementwiseFunc(mlir::OpBuilder& builder, mlir::Location loc,
                 mlir::Value x = args[0];
                 mlir::Value neg_x = b.create<mlir::arith::NegFOp>(regionLoc, x);
                 mlir::Value exp_neg_x = b.create<mlir::math::ExpOp>(regionLoc, neg_x);
-                mlir::Value one = b.create<mlir::arith::ConstantFloatOp>(
-                    regionLoc, f32Type, llvm::APFloat(1.0f));
+                mlir::Value one = b.create<mlir::arith::ConstantOp>(
+                    regionLoc, b.getF32FloatAttr(1.0f));
                 mlir::Value denom = b.create<mlir::arith::AddFOp>(regionLoc, one, exp_neg_x);
                 result = b.create<mlir::arith::DivFOp>(regionLoc, one, denom);
                 break;
@@ -227,8 +227,8 @@ void buildLinalgElementwiseFunc(mlir::OpBuilder& builder, mlir::Location loc,
                 mlir::Value x = args[0];
                 mlir::Value neg_x = b.create<mlir::arith::NegFOp>(regionLoc, x);
                 mlir::Value exp_neg_x = b.create<mlir::math::ExpOp>(regionLoc, neg_x);
-                mlir::Value one = b.create<mlir::arith::ConstantFloatOp>(
-                    regionLoc, f32Type, llvm::APFloat(1.0f));
+                mlir::Value one = b.create<mlir::arith::ConstantOp>(
+                    regionLoc, b.getF32FloatAttr(1.0f));
                 mlir::Value denom = b.create<mlir::arith::AddFOp>(regionLoc, one, exp_neg_x);
                 mlir::Value sigmoid = b.create<mlir::arith::DivFOp>(regionLoc, one, denom);
                 result = b.create<mlir::arith::MulFOp>(regionLoc, x, sigmoid);
@@ -336,7 +336,7 @@ void applyLinalgLoweringPipeline(mlir::ModuleOp module) {
     {
         mlir::RewritePatternSet patterns(module.getContext());
         patterns.add<AffineApplyToArithPattern>(module.getContext());
-        if (mlir::failed(mlir::applyPatternsGreedily(module, std::move(patterns)))) {
+        if (mlir::failed(mlir::applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
             ct::c3::throwCompileError("LinalgElementwiseGen: affine.apply lowering failed");
         }
     }
@@ -679,8 +679,8 @@ mlir::ModuleOp buildLinalgBroadcastingModule(mlir::MLIRContext& context, Element
             switch (op) {
             case ElementwiseOp::ReLU: {
                 mlir::Value in_val = args[0];
-                mlir::Value zero = b.create<mlir::arith::ConstantFloatOp>(
-                    regionLoc, f32Type, llvm::APFloat(0.0f));
+                mlir::Value zero = b.create<mlir::arith::ConstantOp>(
+                    regionLoc, b.getF32FloatAttr(0.0f));
                 result = b.create<mlir::arith::MaxNumFOp>(regionLoc, in_val, zero);
                 break;
             }
@@ -688,8 +688,8 @@ mlir::ModuleOp buildLinalgBroadcastingModule(mlir::MLIRContext& context, Element
                 mlir::Value x = args[0];
                 mlir::Value neg_x = b.create<mlir::arith::NegFOp>(regionLoc, x);
                 mlir::Value exp_neg_x = b.create<mlir::math::ExpOp>(regionLoc, neg_x);
-                mlir::Value one = b.create<mlir::arith::ConstantFloatOp>(
-                    regionLoc, f32Type, llvm::APFloat(1.0f));
+                mlir::Value one = b.create<mlir::arith::ConstantOp>(
+                    regionLoc, b.getF32FloatAttr(1.0f));
                 mlir::Value denom = b.create<mlir::arith::AddFOp>(regionLoc, one, exp_neg_x);
                 result = b.create<mlir::arith::DivFOp>(regionLoc, one, denom);
                 break;
@@ -701,8 +701,8 @@ mlir::ModuleOp buildLinalgBroadcastingModule(mlir::MLIRContext& context, Element
                 mlir::Value x = args[0];
                 mlir::Value neg_x = b.create<mlir::arith::NegFOp>(regionLoc, x);
                 mlir::Value exp_neg_x = b.create<mlir::math::ExpOp>(regionLoc, neg_x);
-                mlir::Value one = b.create<mlir::arith::ConstantFloatOp>(
-                    regionLoc, f32Type, llvm::APFloat(1.0f));
+                mlir::Value one = b.create<mlir::arith::ConstantOp>(
+                    regionLoc, b.getF32FloatAttr(1.0f));
                 mlir::Value denom = b.create<mlir::arith::AddFOp>(regionLoc, one, exp_neg_x);
                 mlir::Value sigmoid = b.create<mlir::arith::DivFOp>(regionLoc, one, denom);
                 result = b.create<mlir::arith::MulFOp>(regionLoc, x, sigmoid);

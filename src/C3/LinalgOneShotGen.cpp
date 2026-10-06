@@ -228,13 +228,13 @@ struct BinaryTensorOpLowering : public OpRewritePattern<SrcOp> {
                 // [Fix §4.95 P2] Div 除零统一 NaN(与其它编译路径一致)
                 Value res;
                 if constexpr (std::is_same_v<ArithOp, mlir::arith::DivFOp>) {
-                    auto zero_c = b.create<mlir::arith::ConstantFloatOp>(
-                        regionLoc, b.getF32Type(), llvm::APFloat(0.0f));
+                    auto zero_c = b.create<mlir::arith::ConstantOp>(
+                        regionLoc, b.getF32FloatAttr(0.0f));
                     auto is_zero = b.create<mlir::arith::CmpFOp>(
                         regionLoc, mlir::arith::CmpFPredicate::OEQ, args[1], zero_c);
                     auto raw = b.create<ArithOp>(regionLoc, args[0], args[1]);
-                    auto nan_c = b.create<mlir::arith::ConstantFloatOp>(
-                        regionLoc, b.getF32Type(), llvm::APFloat::getNaN(llvm::APFloat::IEEEsingle()));
+                    auto nan_c = b.create<mlir::arith::ConstantOp>(
+                        regionLoc, b.getFloatAttr(b.getF32Type(), llvm::APFloat::getNaN(llvm::APFloat::IEEEsingle())));
                     res = b.create<mlir::arith::SelectOp>(regionLoc, is_zero, nan_c, raw);
                 } else {
                     res = b.create<ArithOp>(regionLoc, args[0], args[1]);
@@ -320,7 +320,7 @@ struct ReLUTensorOpLowering : public OpRewritePattern<mlir::c3::ReLUTensorOp> {
             indexingMaps,
             iterTypes,
             [&](OpBuilder& b, Location regionLoc, ValueRange args) {
-                Value zero = b.create<arith::ConstantFloatOp>(regionLoc, f32, llvm::APFloat(0.0f));
+                Value zero = b.create<arith::ConstantOp>(regionLoc, b.getF32FloatAttr(0.0f));
                 Value res = b.create<arith::MaxNumFOp>(regionLoc, args[0], zero);
                 b.create<linalg::YieldOp>(regionLoc, ValueRange{res});
             });
@@ -360,7 +360,7 @@ struct SigmoidTensorOpLowering : public OpRewritePattern<mlir::c3::SigmoidTensor
                 Value x = args[0];
                 Value neg_x = b.create<arith::NegFOp>(regionLoc, x);
                 Value exp_neg_x = b.create<math::ExpOp>(regionLoc, neg_x);
-                Value one = b.create<arith::ConstantFloatOp>(regionLoc, f32, llvm::APFloat(1.0f));
+                Value one = b.create<arith::ConstantOp>(regionLoc, b.getF32FloatAttr(1.0f));
                 Value denom = b.create<arith::AddFOp>(regionLoc, one, exp_neg_x);
                 Value res = b.create<arith::DivFOp>(regionLoc, one, denom);
                 b.create<linalg::YieldOp>(regionLoc, ValueRange{res});
@@ -433,8 +433,8 @@ struct GtTensorOpLowering : public OpRewritePattern<mlir::c3::GtTensorOp> {
             iterTypes,
             [&](OpBuilder& b, Location regionLoc, ValueRange args) {
                 Value cmp = b.create<arith::CmpFOp>(regionLoc, arith::CmpFPredicate::OGT, args[0], args[1]);
-                Value zero = b.create<arith::ConstantFloatOp>(regionLoc, f32, llvm::APFloat(0.0f));
-                Value one = b.create<arith::ConstantFloatOp>(regionLoc, f32, llvm::APFloat(1.0f));
+                Value zero = b.create<arith::ConstantOp>(regionLoc, b.getF32FloatAttr(0.0f));
+                Value one = b.create<arith::ConstantOp>(regionLoc, b.getF32FloatAttr(1.0f));
                 Value res = b.create<arith::SelectOp>(regionLoc, cmp, one, zero);
                 b.create<linalg::YieldOp>(regionLoc, ValueRange{res});
             });
@@ -470,7 +470,7 @@ struct ConstTensorOpLowering : public OpRewritePattern<mlir::c3::ConstTensorOp> 
             indexingMaps,
             iterTypes,
             [&](OpBuilder& b, Location regionLoc, ValueRange /*args*/) {
-                Value res = b.create<arith::ConstantFloatOp>(regionLoc, f32, llvm::APFloat(value));
+                Value res = b.create<arith::ConstantOp>(regionLoc, b.getF32FloatAttr(value));
                 b.create<linalg::YieldOp>(regionLoc, ValueRange{res});
             });
 
@@ -920,7 +920,7 @@ static void applyUnifiedTransformPipeline(mlir::ModuleOp module, size_t num_inpu
                      NegTensorOpLowering, ReLUTensorOpLowering, SigmoidTensorOpLowering, TanhTensorOpLowering,
                      ExpTensorOpLowering, LogTensorOpLowering, GtTensorOpLowering, ConstTensorOpLowering,
                      MatMulTensorOpLowering, TransposeTensorOpLowering, SumReduceTensorOpLowering>(module.getContext());
-        if (mlir::failed(mlir::applyPatternsGreedily(module, std::move(patterns)))) {
+        if (mlir::failed(mlir::applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
             ct::c3::throwCompileError("C3 to Linalg lowering failed");
         }
         if (is_verbose) {
@@ -936,7 +936,7 @@ static void applyUnifiedTransformPipeline(mlir::ModuleOp module, size_t num_inpu
         mlir::RewritePatternSet fast_math_patterns(module.getContext());
         mlir::populateMathAlgebraicSimplificationPatterns(fast_math_patterns);
         mlir::populateMathPolynomialApproximationPatterns(fast_math_patterns);
-        if (mlir::failed(mlir::applyPatternsGreedily(module, std::move(fast_math_patterns)))) {
+        if (mlir::failed(mlir::applyPatternsAndFoldGreedily(module, std::move(fast_math_patterns)))) {
             ct::c3::throwCompileError("Fast-Math polynomial approximation patterns failed");
         }
         if (is_verbose) {
