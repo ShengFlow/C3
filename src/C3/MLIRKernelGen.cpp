@@ -652,7 +652,9 @@ static void buildFusedMultiNodeVectorized(mlir::OpBuilder& builder, mlir::Locati
             return vec;
         }
         mlir::Value addr = builder.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, ptr, mlir::ValueRange{offset});
-        return builder.create<mlir::LLVM::LoadOp>(loc, vec_ty, addr);
+        auto load_op = builder.create<mlir::LLVM::LoadOp>(loc, vec_ty, addr);
+        load_op.setAlignment(4);
+        return load_op;
     };
 
     mlir::Value prev_val_v;
@@ -725,7 +727,8 @@ static void buildFusedMultiNodeVectorized(mlir::OpBuilder& builder, mlir::Locati
 
         if (is_last) {
             mlir::Value out_addr = builder.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, out, mlir::ValueRange{base});
-            builder.create<mlir::LLVM::StoreOp>(loc, result_v, out_addr);
+            auto store_op = builder.create<mlir::LLVM::StoreOp>(loc, result_v, out_addr);
+            store_op.setAlignment(4);
         } else {
             prev_val_v = result_v;
         }

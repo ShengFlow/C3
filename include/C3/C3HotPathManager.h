@@ -39,6 +39,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <deque>
 #include <functional>
 #include <future>
@@ -78,9 +79,13 @@ struct HotPathConfig {
 class C3HotPathManager {
 public:
     static C3HotPathManager& instance() {
-        // 生命周期由 shutdown() 显式管理；故意不注册静态析构，避免
-        // LLVM/MLIR 全局资源销毁后再次触发 mutex/future 清理。
-        static C3HotPathManager* mgr = new C3HotPathManager();
+        // 生命周期通过 std::atexit 自动调用 shutdown() 管理，
+        // 保证在 main 退出时及时 join 后台编译任务，避免悬空线程踩中 LLVM/MLIR 单例。
+        static C3HotPathManager* mgr = []() {
+            auto* p = new C3HotPathManager();
+            std::atexit([] { C3HotPathManager::instance().shutdown(); });
+            return p;
+        }();
         return *mgr;
     }
 

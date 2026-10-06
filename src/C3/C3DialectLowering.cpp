@@ -63,6 +63,18 @@ static mlir::Value i64ToIndex(mlir::OpBuilder& builder, mlir::Location loc, mlir
     return builder.create<mlir::arith::IndexCastOp>(loc, builder.getIndexType(), val);
 }
 
+static mlir::LLVM::LoadOp createVectorLoad(mlir::OpBuilder& builder, mlir::Location loc, mlir::Type vec_ty, mlir::Value ptr) {
+    auto op = builder.create<mlir::LLVM::LoadOp>(loc, vec_ty, ptr);
+    op.setAlignment(4);
+    return op;
+}
+
+static mlir::LLVM::StoreOp createVectorStore(mlir::OpBuilder& builder, mlir::Location loc, mlir::Value val, mlir::Value ptr) {
+    auto op = builder.create<mlir::LLVM::StoreOp>(loc, val, ptr);
+    op.setAlignment(4);
+    return op;
+}
+
 static void buildLoop(mlir::OpBuilder& builder, mlir::Location loc,
                       mlir::Value n, int64_t known_numel,
                       const std::function<void(mlir::OpBuilder&, mlir::Location, mlir::Value)>& body_fn) {
@@ -409,7 +421,7 @@ struct BinaryOpLowering : public mlir::OpRewritePattern<SrcOp> {
                     auto loadVecOrSplat = [&](mlir::Value src, bool broadcast) -> mlir::Value {
                         if (!broadcast) {
                             mlir::Value p = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, src, mlir::ValueRange{base});
-                            return bld.create<mlir::LLVM::LoadOp>(loc, vec_ty, p);
+                            return createVectorLoad(bld, loc, vec_ty, p);
                         }
                         if (abs_mod == 1) {
                             // 标量广播: 常量索引 0 的标量 load + splat
@@ -422,7 +434,7 @@ struct BinaryOpLowering : public mlir::OpRewritePattern<SrcOp> {
                         mlir::Value m = bld.create<mlir::arith::ConstantIntOp>(loc, abs_mod, 64);
                         mlir::Value bi = bld.create<mlir::arith::RemUIOp>(loc, base, m);
                         mlir::Value p = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, src, mlir::ValueRange{bi});
-                        return bld.create<mlir::LLVM::LoadOp>(loc, vec_ty, p);
+                        return createVectorLoad(bld, loc, vec_ty, p);
                     };
                     mlir::Value lv = loadVecOrSplat(lhs, /*broadcast=*/bmod < 0);
                     mlir::Value rv = loadVecOrSplat(rhs, /*broadcast=*/bmod > 0);
@@ -442,7 +454,7 @@ struct BinaryOpLowering : public mlir::OpRewritePattern<SrcOp> {
                     } else {
                         res = bld.create<ArithOp>(loc, lv, rv);
                     }
-                    bld.create<mlir::LLVM::StoreOp>(loc, res, o_ptr);
+                    createVectorStore(bld, loc, res, o_ptr);
                 },
                 scalar_body);
         } else {
@@ -479,9 +491,9 @@ struct UnaryOpLowering : public mlir::OpRewritePattern<SrcOp> {
                 mlir::Value in_ptr = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, input, mlir::ValueRange{base});
                 mlir::Value o_ptr = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, out, mlir::ValueRange{base});
 
-                mlir::Value val = bld.create<mlir::LLVM::LoadOp>(loc, vec_ty, in_ptr);
+                mlir::Value val = createVectorLoad(bld, loc, vec_ty, in_ptr);
                 mlir::Value res = bld.create<ArithOp>(loc, val);
-                bld.create<mlir::LLVM::StoreOp>(loc, res, o_ptr);
+                createVectorStore(bld, loc, res, o_ptr);
             },
             [&](mlir::OpBuilder& bld, mlir::Location loc, mlir::Value idx) {
                 mlir::Value in_ptr = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, input, mlir::ValueRange{idx});
@@ -521,11 +533,11 @@ struct ReLUOpLowering : public mlir::OpRewritePattern<mlir::c3::ReLUOp> {
                 mlir::Value in_ptr = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, input, mlir::ValueRange{base});
                 mlir::Value o_ptr = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, out, mlir::ValueRange{base});
 
-                mlir::Value val = bld.create<mlir::LLVM::LoadOp>(loc, vec_ty, in_ptr);
+                mlir::Value val = createVectorLoad(bld, loc, vec_ty, in_ptr);
                 mlir::Value zero = bld.create<mlir::arith::ConstantOp>(
                     loc, mlir::DenseElementsAttr::get(vec_ty, 0.0f));
                 mlir::Value res = bld.create<mlir::arith::MaxNumFOp>(loc, val, zero);
-                bld.create<mlir::LLVM::StoreOp>(loc, res, o_ptr);
+                createVectorStore(bld, loc, res, o_ptr);
             },
             [&](mlir::OpBuilder& bld, mlir::Location loc, mlir::Value idx) {
                 mlir::Value in_ptr = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, input, mlir::ValueRange{idx});
@@ -561,14 +573,14 @@ struct SigmoidOpLowering : public mlir::OpRewritePattern<mlir::c3::SigmoidOp> {
                 mlir::Value in_ptr = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, input, mlir::ValueRange{base});
                 mlir::Value o_ptr = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, out, mlir::ValueRange{base});
 
-                mlir::Value val = bld.create<mlir::LLVM::LoadOp>(loc, vec_ty, in_ptr);
+                mlir::Value val = createVectorLoad(bld, loc, vec_ty, in_ptr);
                 mlir::Value neg_x = bld.create<mlir::arith::NegFOp>(loc, val);
                 mlir::Value exp_val = bld.create<mlir::math::ExpOp>(loc, neg_x);
                 mlir::Value one = bld.create<mlir::arith::ConstantOp>(
                     loc, mlir::DenseElementsAttr::get(vec_ty, 1.0f));
                 mlir::Value denom = bld.create<mlir::arith::AddFOp>(loc, one, exp_val);
                 mlir::Value res = bld.create<mlir::arith::DivFOp>(loc, one, denom);
-                bld.create<mlir::LLVM::StoreOp>(loc, res, o_ptr);
+                createVectorStore(bld, loc, res, o_ptr);
             },
             [&](mlir::OpBuilder& bld, mlir::Location loc, mlir::Value idx) {
                 mlir::Value in_ptr = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, input, mlir::ValueRange{idx});
@@ -609,14 +621,14 @@ struct SiLUOpLowering : public mlir::OpRewritePattern<mlir::c3::SiLUOp> {
                 mlir::Value in_ptr = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, input, mlir::ValueRange{base});
                 mlir::Value o_ptr = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, out, mlir::ValueRange{base});
 
-                mlir::Value val = bld.create<mlir::LLVM::LoadOp>(loc, vec_ty, in_ptr);
+                mlir::Value val = createVectorLoad(bld, loc, vec_ty, in_ptr);
                 mlir::Value neg_x = bld.create<mlir::arith::NegFOp>(loc, val);
                 mlir::Value exp_val = bld.create<mlir::math::ExpOp>(loc, neg_x);
                 mlir::Value one = bld.create<mlir::arith::ConstantOp>(
                     loc, mlir::DenseElementsAttr::get(vec_ty, 1.0f));
                 mlir::Value denom = bld.create<mlir::arith::AddFOp>(loc, one, exp_val);
                 mlir::Value res = bld.create<mlir::arith::DivFOp>(loc, val, denom);
-                bld.create<mlir::LLVM::StoreOp>(loc, res, o_ptr);
+                createVectorStore(bld, loc, res, o_ptr);
             },
             [&](mlir::OpBuilder& bld, mlir::Location loc, mlir::Value idx) {
                 mlir::Value in_ptr = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, input, mlir::ValueRange{idx});
@@ -840,7 +852,7 @@ struct MatMulOpLowering : public mlir::OpRewritePattern<mlir::c3::MatMulOp> {
                 auto vec_body = [&](mlir::OpBuilder& vb, mlir::Location vloc, mlir::Value col_base_i64) {
                     mlir::Value out_row_off = vb.create<mlir::arith::AddIOp>(vloc, row_base, col_base_i64);
                     mlir::Value out_ptr = vb.create<mlir::LLVM::GEPOp>(vloc, ptr_type, f32, out, mlir::ValueRange{out_row_off});
-                    mlir::Value val_vec = vb.create<mlir::LLVM::LoadOp>(vloc, vec_ty, out_ptr);
+                    mlir::Value val_vec = createVectorLoad(vb, vloc, vec_ty, out_ptr);
 
                     if (bias) {
                         mlir::Value b_vec;
@@ -857,7 +869,7 @@ struct MatMulOpLowering : public mlir::OpRewritePattern<mlir::c3::MatMulOp> {
                         } else {
                             // bias_numel == N (按列广播，最常见): bias[col..col+VL-1] 连续 VL 个 LD
                             mlir::Value bias_ptr = vb.create<mlir::LLVM::GEPOp>(vloc, ptr_type, f32, bias, mlir::ValueRange{col_base_i64});
-                            b_vec = vb.create<mlir::LLVM::LoadOp>(vloc, vec_ty, bias_ptr);
+                            b_vec = createVectorLoad(vb, vloc, vec_ty, bias_ptr);
                         }
                         val_vec = vb.create<mlir::arith::AddFOp>(vloc, val_vec, b_vec);
                     }
@@ -865,7 +877,7 @@ struct MatMulOpLowering : public mlir::OpRewritePattern<mlir::c3::MatMulOp> {
                     // [Prewalk A] 需要时把 pre-activation 值同时写一份到 preAct（backward 复用中间值）
                     if (preAct) {
                         mlir::Value preAct_ptr = vb.create<mlir::LLVM::GEPOp>(vloc, ptr_type, f32, preAct, mlir::ValueRange{out_row_off});
-                        vb.create<mlir::LLVM::StoreOp>(vloc, val_vec, preAct_ptr);
+                        createVectorStore(vb, vloc, val_vec, preAct_ptr);
                     }
 
                     mlir::Value act_vec = val_vec;
@@ -893,7 +905,7 @@ struct MatMulOpLowering : public mlir::OpRewritePattern<mlir::c3::MatMulOp> {
                         act_vec = vb.create<mlir::arith::DivFOp>(vloc, val_vec, d);
                     }
 
-                    vb.create<mlir::LLVM::StoreOp>(vloc, act_vec, out_ptr);
+                    createVectorStore(vb, vloc, act_vec, out_ptr);
                 };
 
                 auto scalar_body = [&](mlir::OpBuilder& sb, mlir::Location sloc, mlir::Value j_i64) {
