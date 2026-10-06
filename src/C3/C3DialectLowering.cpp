@@ -238,8 +238,15 @@ static void buildSmallMatMul(mlir::OpBuilder& builder, mlir::Location loc,
         mlir::Value one = builder.create<mlir::arith::ConstantOp>(loc, builder.getF32FloatAttr(1.0f));
         mlir::Value denom = builder.create<mlir::arith::AddFOp>(loc, one, exp_val);
         activated = builder.create<mlir::arith::DivFOp>(loc, one, denom);
-    } else if (act == 3) { // Tanh
-        activated = builder.create<mlir::math::TanhOp>(loc, final_sum);
+    } else if (act == 3) { // Tanh: 2 * sigmoid(2x) - 1
+        mlir::Value two = builder.create<mlir::arith::ConstantOp>(loc, builder.getF32FloatAttr(2.0f));
+        mlir::Value one = builder.create<mlir::arith::ConstantOp>(loc, builder.getF32FloatAttr(1.0f));
+        mlir::Value two_x = builder.create<mlir::arith::MulFOp>(loc, final_sum, two);
+        mlir::Value neg_two_x = builder.create<mlir::arith::NegFOp>(loc, two_x);
+        mlir::Value exp_val = builder.create<mlir::math::ExpOp>(loc, neg_two_x);
+        mlir::Value denom = builder.create<mlir::arith::AddFOp>(loc, one, exp_val);
+        mlir::Value two_sig = builder.create<mlir::arith::DivFOp>(loc, two, denom);
+        activated = builder.create<mlir::arith::SubFOp>(loc, two_sig, one);
     } else if (act == 4) { // SiLU: x / (1 + exp(-x))
         mlir::Value neg_sum = builder.create<mlir::arith::NegFOp>(loc, final_sum);
         mlir::Value exp_val = builder.create<mlir::math::ExpOp>(loc, neg_sum);
@@ -511,7 +518,58 @@ struct UnaryOpLowering : public mlir::OpRewritePattern<SrcOp> {
 };
 
 using NegOpLowering     = UnaryOpLowering<mlir::c3::NegOp, mlir::arith::NegFOp>;
-using TanhOpLowering    = UnaryOpLowering<mlir::c3::TanhOp, mlir::math::TanhOp>;
+struct TanhOpLowering : public mlir::OpRewritePattern<mlir::c3::TanhOp> {
+    using OpRewritePattern<mlir::c3::TanhOp>::OpRewritePattern;
+
+    mlir::LogicalResult matchAndRewrite(mlir::c3::TanhOp op, mlir::PatternRewriter& rewriter) const override {
+        auto loc = op.getLoc();
+        mlir::Value input = op.getInput();
+        mlir::Value out = op.getOut();
+
+        auto f32 = rewriter.getF32Type();
+        auto ptr_type = mlir::LLVM::LLVMPointerType::get(rewriter.getContext());
+
+        constexpr int64_t VL = ct::c3::kTargetVecLanes;
+        auto vec_ty = mlir::VectorType::get({VL}, f32);
+
+        buildVectorizedLoop(rewriter, loc, op.getNumel(), 0,
+            [&](mlir::OpBuilder& bld, mlir::Location loc, mlir::Value base) {
+                mlir::Value in_ptr = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, input, mlir::ValueRange{base});
+                mlir::Value o_ptr = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, out, mlir::ValueRange{base});
+
+                mlir::Value val = createVectorLoad(bld, loc, vec_ty, in_ptr);
+                mlir::Value two_v = bld.create<mlir::arith::ConstantOp>(
+                    loc, mlir::DenseElementsAttr::get(vec_ty, 2.0f));
+                mlir::Value one_v = bld.create<mlir::arith::ConstantOp>(
+                    loc, mlir::DenseElementsAttr::get(vec_ty, 1.0f));
+                mlir::Value two_x = bld.create<mlir::arith::MulFOp>(loc, val, two_v);
+                mlir::Value neg_two_x = bld.create<mlir::arith::NegFOp>(loc, two_x);
+                mlir::Value exp_val = bld.create<mlir::math::ExpOp>(loc, neg_two_x);
+                mlir::Value denom = bld.create<mlir::arith::AddFOp>(loc, one_v, exp_val);
+                mlir::Value two_sig = bld.create<mlir::arith::DivFOp>(loc, two_v, denom);
+                mlir::Value res = bld.create<mlir::arith::SubFOp>(loc, two_sig, one_v);
+                createVectorStore(bld, loc, res, o_ptr);
+            },
+            [&](mlir::OpBuilder& bld, mlir::Location loc, mlir::Value idx) {
+                mlir::Value in_ptr = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, input, mlir::ValueRange{idx});
+                mlir::Value o_ptr = bld.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, out, mlir::ValueRange{idx});
+
+                mlir::Value val = bld.create<mlir::LLVM::LoadOp>(loc, f32, in_ptr);
+                mlir::Value two_s = bld.create<mlir::arith::ConstantOp>(loc, bld.getF32FloatAttr(2.0f));
+                mlir::Value one_s = bld.create<mlir::arith::ConstantOp>(loc, bld.getF32FloatAttr(1.0f));
+                mlir::Value two_x = bld.create<mlir::arith::MulFOp>(loc, val, two_s);
+                mlir::Value neg_two_x = bld.create<mlir::arith::NegFOp>(loc, two_x);
+                mlir::Value exp_val = bld.create<mlir::math::ExpOp>(loc, neg_two_x);
+                mlir::Value denom = bld.create<mlir::arith::AddFOp>(loc, one_s, exp_val);
+                mlir::Value two_sig = bld.create<mlir::arith::DivFOp>(loc, two_s, denom);
+                mlir::Value res = bld.create<mlir::arith::SubFOp>(loc, two_sig, one_s);
+                bld.create<mlir::LLVM::StoreOp>(loc, res, o_ptr);
+            });
+
+        rewriter.eraseOp(op);
+        return mlir::success();
+    }
+};
 using ExpOpLowering     = UnaryOpLowering<mlir::c3::ExpOp, mlir::math::ExpOp>;
 using LogOpLowering     = UnaryOpLowering<mlir::c3::LogOp, mlir::math::LogOp>;
 
@@ -895,8 +953,17 @@ struct MatMulOpLowering : public mlir::OpRewritePattern<mlir::c3::MatMulOp> {
                             vloc, mlir::DenseElementsAttr::get(vec_ty, 1.0f));
                         mlir::Value d = vb.create<mlir::arith::AddFOp>(vloc, one_v, e);
                         act_vec = vb.create<mlir::arith::DivFOp>(vloc, one_v, d);
-                    } else if (act == 3) { // Tanh
-                        act_vec = vb.create<mlir::math::TanhOp>(vloc, val_vec);
+                    } else if (act == 3) { // Tanh: 2 * sigmoid(2x) - 1
+                        mlir::Value two_v = vb.create<mlir::arith::ConstantOp>(
+                            vloc, mlir::DenseElementsAttr::get(vec_ty, 2.0f));
+                        mlir::Value one_v = vb.create<mlir::arith::ConstantOp>(
+                            vloc, mlir::DenseElementsAttr::get(vec_ty, 1.0f));
+                        mlir::Value two_x = vb.create<mlir::arith::MulFOp>(vloc, val_vec, two_v);
+                        mlir::Value neg_two_x = vb.create<mlir::arith::NegFOp>(vloc, two_x);
+                        mlir::Value exp_val = vb.create<mlir::math::ExpOp>(vloc, neg_two_x);
+                        mlir::Value denom = vb.create<mlir::arith::AddFOp>(vloc, one_v, exp_val);
+                        mlir::Value two_sig = vb.create<mlir::arith::DivFOp>(vloc, two_v, denom);
+                        act_vec = vb.create<mlir::arith::SubFOp>(vloc, two_sig, one_v);
                     } else if (act == 4) { // SiLU: x / (1 + exp(-x))
                         mlir::Value neg = vb.create<mlir::arith::NegFOp>(vloc, val_vec);
                         mlir::Value e = vb.create<mlir::math::ExpOp>(vloc, neg);
@@ -935,8 +1002,15 @@ struct MatMulOpLowering : public mlir::OpRewritePattern<mlir::c3::MatMulOp> {
                         mlir::Value one = sb.create<mlir::arith::ConstantOp>(sloc, sb.getF32FloatAttr(1.0f));
                         mlir::Value denom = sb.create<mlir::arith::AddFOp>(sloc, one, exp_val);
                         activated = sb.create<mlir::arith::DivFOp>(sloc, one, denom);
-                    } else if (act == 3) {
-                        activated = sb.create<mlir::math::TanhOp>(sloc, val);
+                    } else if (act == 3) { // Tanh: 2 * sigmoid(2x) - 1
+                        mlir::Value two = sb.create<mlir::arith::ConstantOp>(sloc, sb.getF32FloatAttr(2.0f));
+                        mlir::Value one = sb.create<mlir::arith::ConstantOp>(sloc, sb.getF32FloatAttr(1.0f));
+                        mlir::Value two_x = sb.create<mlir::arith::MulFOp>(sloc, val, two);
+                        mlir::Value neg_two_x = sb.create<mlir::arith::NegFOp>(sloc, two_x);
+                        mlir::Value exp_val = sb.create<mlir::math::ExpOp>(sloc, neg_two_x);
+                        mlir::Value denom = sb.create<mlir::arith::AddFOp>(sloc, one, exp_val);
+                        mlir::Value two_sig = sb.create<mlir::arith::DivFOp>(sloc, two, denom);
+                        activated = sb.create<mlir::arith::SubFOp>(sloc, two_sig, one);
                     } else if (act == 4) { // SiLU: x / (1 + exp(-x))
                         mlir::Value neg_sum = sb.create<mlir::arith::NegFOp>(sloc, val);
                         mlir::Value exp_val = sb.create<mlir::math::ExpOp>(sloc, neg_sum);
@@ -1175,6 +1249,7 @@ static void runC3Lowering(mlir::ModuleOp module) {
                  SiLUOpLowering,
                  ExpOpLowering, LogOpLowering,
                  SoftmaxOpLowering, CrossEntropyOpLowering>(module.getContext());  // [P0.2] 加 Softmax + CrossEntropy lowering
+    mlir::populatePolynomialApproximateTanhPattern(patterns);
     if (mlir::failed(mlir::applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
         ct::c3::throwCompileError("C3DialectLowering: C3ToLLVM lowering pass failed");
     }
@@ -1220,6 +1295,12 @@ void applyLoweringPipeline(mlir::ModuleOp module, int opt_level) {
 #else
     runPass(module, mlir::createConvertSCFToCFPass(), "SCFToCF");
 #endif
+
+    {
+        mlir::RewritePatternSet patterns(module.getContext());
+        mlir::populatePolynomialApproximateTanhPattern(patterns);
+        (void)mlir::applyPatternsAndFoldGreedily(module, std::move(patterns));
+    }
 
     runPass(module, mlir::createConvertMathToLLVMPass(), "MathToLLVM");
     runPass(module, mlir::createArithToLLVMConversionPass(), "ArithToLLVM");

@@ -264,7 +264,14 @@ void buildLinalgFusedFunc(mlir::OpBuilder& builder, mlir::Location loc,
                     }
                     else if constexpr (std::is_same_v<T, TanhNode>) {
                         auto in = val_map.at(node->inputs[0]);
-                        result = b.create<mlir::math::TanhOp>(regionLoc, in);
+                        mlir::Value two_f = b.create<mlir::arith::ConstantOp>(regionLoc, b.getF32FloatAttr(2.0f));
+                        mlir::Value one_f = b.create<mlir::arith::ConstantOp>(regionLoc, b.getF32FloatAttr(1.0f));
+                        mlir::Value two_x = b.create<mlir::arith::MulFOp>(regionLoc, in, two_f);
+                        mlir::Value neg_two_x = b.create<mlir::arith::NegFOp>(regionLoc, two_x);
+                        mlir::Value exp_x = b.create<mlir::math::ExpOp>(regionLoc, neg_two_x);
+                        mlir::Value denom = b.create<mlir::arith::AddFOp>(regionLoc, one_f, exp_x);
+                        mlir::Value two_sig = b.create<mlir::arith::DivFOp>(regionLoc, two_f, denom);
+                        result = b.create<mlir::arith::SubFOp>(regionLoc, two_sig, one_f);
                     }
                     else if constexpr (std::is_same_v<T, ExpNode>) {
                         auto in = val_map.at(node->inputs[0]);
@@ -361,7 +368,14 @@ void buildLinalgFusedFunc(mlir::OpBuilder& builder, mlir::Location loc,
                                 }
                                 else if constexpr (std::is_same_v<FT, TanhNode>) {
                                     mlir::Value f_in = (f_idx > 0) ? f_prev_val : loadExt(ext_inputs[0]);
-                                    f_res = b.create<mlir::math::TanhOp>(regionLoc, f_in);
+                                    mlir::Value two_f = b.create<mlir::arith::ConstantOp>(regionLoc, b.getF32FloatAttr(2.0f));
+                                    mlir::Value one_f = b.create<mlir::arith::ConstantOp>(regionLoc, b.getF32FloatAttr(1.0f));
+                                    mlir::Value two_x = b.create<mlir::arith::MulFOp>(regionLoc, f_in, two_f);
+                                    mlir::Value neg_two_x = b.create<mlir::arith::NegFOp>(regionLoc, two_x);
+                                    mlir::Value exp_x = b.create<mlir::math::ExpOp>(regionLoc, neg_two_x);
+                                    mlir::Value denom = b.create<mlir::arith::AddFOp>(regionLoc, one_f, exp_x);
+                                    mlir::Value two_sig = b.create<mlir::arith::DivFOp>(regionLoc, two_f, denom);
+                                    f_res = b.create<mlir::arith::SubFOp>(regionLoc, two_sig, one_f);
                                 }
                                 else if constexpr (std::is_same_v<FT, ExpNode>) {
                                     mlir::Value f_in = (f_idx > 0) ? f_prev_val : loadExt(ext_inputs[0]);

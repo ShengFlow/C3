@@ -706,7 +706,17 @@ static void buildFusedMultiNodeVectorized(mlir::OpBuilder& builder, mlir::Locati
                 result_v = builder.create<mlir::arith::DivFOp>(loc, one_vec, denom);
             } else if constexpr (std::is_same_v<T, TanhNode>) {
                 lhs = (op_idx > 0) ? prev_val_v : loadExternalVector(ext_inputs[0]);
-                result_v = builder.create<mlir::math::TanhOp>(loc, lhs);
+                auto vec_ty = lhs.getType();
+                mlir::Value two_vec = builder.create<mlir::arith::ConstantOp>(
+                    loc, mlir::DenseElementsAttr::get(mlir::cast<mlir::ShapedType>(vec_ty), 2.0f));
+                mlir::Value one_vec = builder.create<mlir::arith::ConstantOp>(
+                    loc, mlir::DenseElementsAttr::get(mlir::cast<mlir::ShapedType>(vec_ty), 1.0f));
+                mlir::Value two_x = builder.create<mlir::arith::MulFOp>(loc, lhs, two_vec);
+                mlir::Value neg_two_x = builder.create<mlir::arith::NegFOp>(loc, two_x);
+                mlir::Value exp_val = builder.create<mlir::math::ExpOp>(loc, neg_two_x);
+                mlir::Value denom = builder.create<mlir::arith::AddFOp>(loc, one_vec, exp_val);
+                mlir::Value two_sig = builder.create<mlir::arith::DivFOp>(loc, two_vec, denom);
+                result_v = builder.create<mlir::arith::SubFOp>(loc, two_sig, one_vec);
             } else if constexpr (std::is_same_v<T, ExpNode>) {
                 lhs = (op_idx > 0) ? prev_val_v : loadExternalVector(ext_inputs[0]);
                 result_v = builder.create<mlir::math::ExpOp>(loc, lhs);
@@ -807,7 +817,14 @@ static void buildFusedMultiNodeVectorized(mlir::OpBuilder& builder, mlir::Locati
                 result_s = builder.create<mlir::arith::DivFOp>(loc, one, denom);
             } else if constexpr (std::is_same_v<T, TanhNode>) {
                 lhs = (op_idx > 0) ? prev_val_s : loadExternalScalar(ext_inputs[0]);
-                result_s = builder.create<mlir::math::TanhOp>(loc, lhs);
+                mlir::Value two = builder.create<mlir::arith::ConstantOp>(loc, builder.getF32FloatAttr(2.0f));
+                mlir::Value one = builder.create<mlir::arith::ConstantOp>(loc, builder.getF32FloatAttr(1.0f));
+                mlir::Value two_x = builder.create<mlir::arith::MulFOp>(loc, lhs, two);
+                mlir::Value neg_two_x = builder.create<mlir::arith::NegFOp>(loc, two_x);
+                mlir::Value exp_val = builder.create<mlir::math::ExpOp>(loc, neg_two_x);
+                mlir::Value denom = builder.create<mlir::arith::AddFOp>(loc, one, exp_val);
+                mlir::Value two_sig = builder.create<mlir::arith::DivFOp>(loc, two, denom);
+                result_s = builder.create<mlir::arith::SubFOp>(loc, two_sig, one);
             } else if constexpr (std::is_same_v<T, ExpNode>) {
                 lhs = (op_idx > 0) ? prev_val_s : loadExternalScalar(ext_inputs[0]);
                 result_s = builder.create<mlir::math::ExpOp>(loc, lhs);
