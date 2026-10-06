@@ -920,7 +920,7 @@ static void applyUnifiedTransformPipeline(mlir::ModuleOp module, size_t num_inpu
                      NegTensorOpLowering, ReLUTensorOpLowering, SigmoidTensorOpLowering, TanhTensorOpLowering,
                      ExpTensorOpLowering, LogTensorOpLowering, GtTensorOpLowering, ConstTensorOpLowering,
                      MatMulTensorOpLowering, TransposeTensorOpLowering, SumReduceTensorOpLowering>(module.getContext());
-        if (mlir::failed(mlir::applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
+        if (mlir::failed(mlir::applyPatternsGreedily(module, std::move(patterns)))) {
             ct::c3::throwCompileError("C3 to Linalg lowering failed");
         }
         if (is_verbose) {
@@ -936,7 +936,7 @@ static void applyUnifiedTransformPipeline(mlir::ModuleOp module, size_t num_inpu
         mlir::RewritePatternSet fast_math_patterns(module.getContext());
         mlir::populateMathAlgebraicSimplificationPatterns(fast_math_patterns);
         mlir::populateMathPolynomialApproximationPatterns(fast_math_patterns);
-        if (mlir::failed(mlir::applyPatternsAndFoldGreedily(module, std::move(fast_math_patterns)))) {
+        if (mlir::failed(mlir::applyPatternsGreedily(module, std::move(fast_math_patterns)))) {
             ct::c3::throwCompileError("Fast-Math polynomial approximation patterns failed");
         }
         if (is_verbose) {

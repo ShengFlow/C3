@@ -336,7 +336,7 @@ void applyLinalgLoweringPipeline(mlir::ModuleOp module) {
     {
         mlir::RewritePatternSet patterns(module.getContext());
         patterns.add<AffineApplyToArithPattern>(module.getContext());
-        if (mlir::failed(mlir::applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
+        if (mlir::failed(mlir::applyPatternsGreedily(module, std::move(patterns)))) {
             ct::c3::throwCompileError("LinalgElementwiseGen: affine.apply lowering failed");
         }
     }

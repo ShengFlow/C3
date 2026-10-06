@@ -70,7 +70,6 @@ extern "C" {
 #include <mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h>
 #include <mlir/Conversion/Passes.h>
 #include <mlir/Dialect/SCF/Transforms/Passes.h>
-#include <mlir/Dialect/Affine/Transforms/Passes.h>
 #include <mlir/ExecutionEngine/ExecutionEngine.h>
 #include <mlir/ExecutionEngine/OptUtils.h>
 #include <mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h>
