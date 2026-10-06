@@ -12,6 +12,7 @@
 #include "C3/C3Engine.h"
 #include "C3/Graph.h"
 #include "C3/C3HotPathManager.h"
+#include "C3/C3Cleanup.h"
 #include "C3/PGOManager.h"
 #include "C3/AutoTuner.h"
 #include "C3/TuningState.h"
@@ -820,8 +821,16 @@ private:
 
 C3Engine& C3Engine::getInstance() {
     // 进程级生命周期：避免 Meyers singleton 在 LLVM/MLIR 全局析构后
-    // 访问已销毁的 mutex。正常资源回收由 shutdownAll() 显式完成。
-    static C3Engine* instance = new C3Engine();
+    // 访问已销毁的 mutex。正常资源回收通过 std::atexit 自动调用 shutdownAll() 保证在静态析构前完成。
+    static C3Engine* instance = []() {
+        auto* inst = new C3Engine();
+        std::atexit([] {
+            try {
+                shutdownAll();
+            } catch (...) {}
+        });
+        return inst;
+    }();
     return *instance;
 }
 

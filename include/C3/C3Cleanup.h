@@ -34,17 +34,30 @@ namespace c3 {
  *          确保所有 CompiledKernel / LLVM module 在静态析构前释放。
  */
 inline void shutdownAll() {
-    C3HotPathManager::instance().shutdown();
-    // 反向捕获器仍可能有 detached 编译任务；必须在 Engine/LLVM 资源释放前等待。
-    C3BackwardCapture::getInstance().shutdown();
-    C3Engine::getInstance().shutdown();
-    C3Engine::getInstance().clearCache();
-    RegionFusionRegistry::getInstance().clear();
-    C3KernelRegistry::getInstance().uninstallAll();
-    // 6. [§4.93 A1] 释放 MIMO flat 输出缓冲池中已归还的 buffer(进程级常驻占用)。
-    //    放在最后: 前面各步释放 kernel/注册表时可能触发 Tensor 析构将 buffer 归还入池,
-    //    须在其后再 drain 才能清干净。池结构本身不析构, 故此后若有 Tensor 析构仍安全。
-    C3Engine::drainFlatOutPool();
+    static std::atomic<bool> already_shutdown{false};
+    if (already_shutdown.exchange(true)) return;
+
+    try {
+        C3HotPathManager::instance().shutdown();
+    } catch (...) {}
+    try {
+        C3BackwardCapture::getInstance().shutdown();
+    } catch (...) {}
+    try {
+        C3Engine::getInstance().shutdown();
+    } catch (...) {}
+    try {
+        C3Engine::getInstance().clearCache();
+    } catch (...) {}
+    try {
+        RegionFusionRegistry::getInstance().clear();
+    } catch (...) {}
+    try {
+        C3KernelRegistry::getInstance().uninstallAll();
+    } catch (...) {}
+    try {
+        C3Engine::drainFlatOutPool();
+    } catch (...) {}
 }
 
 } // namespace c3

@@ -1178,6 +1178,15 @@ static void runC3Lowering(mlir::ModuleOp module) {
     if (mlir::failed(mlir::applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
         ct::c3::throwCompileError("C3DialectLowering: C3ToLLVM lowering pass failed");
     }
+    bool has_c3_ops = false;
+    module.walk([&](mlir::Operation* op) {
+        if (op->getName().getDialectNamespace() == "c3") {
+            has_c3_ops = true;
+        }
+    });
+    if (has_c3_ops) {
+        ct::c3::throwCompileError("C3DialectLowering: unlowered c3 dialect operations remain in module");
+    }
 }
 
 static void runPass(mlir::ModuleOp module, std::unique_ptr<mlir::Pass> pass, const char* name) {

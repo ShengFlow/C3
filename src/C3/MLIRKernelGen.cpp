@@ -1802,15 +1802,27 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
             ci += fused_skip;
         } else if (std::holds_alternative<AddNode>(op)) {
             int64_t bmod = getBroadcastMod(node);
+            if (bmod == kBroadcastUnsupported) {
+                ct::c3::throwCompileError("MLIRKernelGen: unsupported partial broadcast shape");
+            }
             builder.create<mlir::c3::AddOp>(loc, in_ptrs[0], in_ptrs[1], out_buf, node_n, bmod);
         } else if (std::holds_alternative<SubNode>(op)) {
             int64_t bmod = getBroadcastMod(node);
+            if (bmod == kBroadcastUnsupported) {
+                ct::c3::throwCompileError("MLIRKernelGen: unsupported partial broadcast shape");
+            }
             builder.create<mlir::c3::SubOp>(loc, in_ptrs[0], in_ptrs[1], out_buf, node_n, bmod);
         } else if (std::holds_alternative<MulNode>(op)) {
             int64_t bmod = getBroadcastMod(node);
+            if (bmod == kBroadcastUnsupported) {
+                ct::c3::throwCompileError("MLIRKernelGen: unsupported partial broadcast shape");
+            }
             builder.create<mlir::c3::MulOp>(loc, in_ptrs[0], in_ptrs[1], out_buf, node_n, bmod);
         } else if (std::holds_alternative<DivNode>(op)) {
             int64_t bmod = getBroadcastMod(node);
+            if (bmod == kBroadcastUnsupported) {
+                ct::c3::throwCompileError("MLIRKernelGen: unsupported partial broadcast shape");
+            }
             builder.create<mlir::c3::DivOp>(loc, in_ptrs[0], in_ptrs[1], out_buf, node_n, bmod);
         } else if (std::holds_alternative<NegNode>(op)) {
             builder.create<mlir::c3::NegOp>(loc, in_ptrs[0], out_buf, node_n);
