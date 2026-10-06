@@ -763,17 +763,35 @@ public:
                 n, 0, 0, 0
             );
         } else if (is_matmul_) {
+            if (!func_) {
+                ct::c3::throwCompileError("ConcreteCompiledKernel::execute: func_ is null for MatMul");
+            }
+            const float* a_ptr = a.data_read<float>();
+            const float* b_ptr = b.data_read<float>();
+            float* out_ptr = out.data_write<float>();
+            if (!a_ptr || !b_ptr || !out_ptr) {
+                ct::c3::throwCompileError("ConcreteCompiledKernel::execute: null tensor buffer for MatMul");
+            }
             func_(
-                a.data_read<float>(),
-                b.data_read<float>(),
-                out.data_write<float>(),
+                a_ptr,
+                b_ptr,
+                out_ptr,
                 0, M_, K_, N_
             );
         } else {
+            if (!func_) {
+                ct::c3::throwCompileError("ConcreteCompiledKernel::execute: func_ is null");
+            }
+            const float* a_ptr = a.data_read<float>();
+            const float* b_ptr = b.data_read<float>();
+            float* out_ptr = out.data_write<float>();
+            if (!a_ptr || !b_ptr || !out_ptr) {
+                ct::c3::throwCompileError("ConcreteCompiledKernel::execute: null tensor buffer");
+            }
             func_(
-                a.data_read<float>(),
-                b.data_read<float>(),
-                out.data_write<float>(),
+                a_ptr,
+                b_ptr,
+                out_ptr,
                 n, 0, 0, 0
             );
         }

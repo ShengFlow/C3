@@ -136,7 +136,7 @@ std::optional<Tensor> C3KernelRegistry::tryExecute(
         }
         std::vector<Tensor> inputs = {a, b};
         auto outputs = entry.kernel->execute(inputs);
-        if (outputs.empty()) {
+        if (outputs.empty() || outputs[0].storage().empty()) {
             return std::nullopt;
         }
         Tensor out = outputs[0];
@@ -207,7 +207,7 @@ std::optional<Tensor> C3KernelRegistry::tryExecuteUnary(op op_type, const Tensor
         }
         std::vector<Tensor> inputs = {a};
         auto outputs = entry.kernel->execute(inputs);
-        if (outputs.empty()) {
+        if (outputs.empty() || outputs[0].storage().empty()) {
             return std::nullopt;
         }
         Tensor out = outputs[0];
