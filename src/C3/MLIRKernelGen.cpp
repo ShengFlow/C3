@@ -341,7 +341,7 @@ static void buildFused(mlir::OpBuilder& builder, mlir::Location loc,
                         result = b.create<mlir::arith::NegFOp>(loc, lhs);
                     } else if constexpr (std::is_same_v<T, ReLUNode>) {
                         lhs = getValue(inputs_for_op[0]);
-                        mlir::Value zero = mlir::arith::ConstantFloatOp::create(b, loc, f32, llvm::APFloat(0.0f));
+                        mlir::Value zero = b.create<mlir::arith::ConstantFloatOp>(loc, f32, llvm::APFloat(0.0f));
                         result = b.create<mlir::arith::MaxNumFOp>(loc, lhs, zero);
                     } else if constexpr (std::is_same_v<T, AddNode>) {
                         lhs = getValue(inputs_for_op[0]);
@@ -358,12 +358,12 @@ static void buildFused(mlir::OpBuilder& builder, mlir::Location loc,
                     } else if constexpr (std::is_same_v<T, DivNode>) {
                         lhs = getValue(inputs_for_op[0]);
                         rhs = getValue(inputs_for_op[1]);
-                        mlir::Value zero_c = mlir::arith::ConstantFloatOp::create(b, loc, f32, llvm::APFloat(0.0f));
+                        mlir::Value zero_c = b.create<mlir::arith::ConstantFloatOp>(loc, f32, llvm::APFloat(0.0f));
                         mlir::Value is_zero = b.create<mlir::arith::CmpFOp>(loc, mlir::arith::CmpFPredicate::OEQ, rhs, zero_c);
                         auto div_if = b.create<mlir::scf::IfOp>(loc, f32, is_zero, true);
                         b.setInsertionPointToStart(&div_if.getThenRegion().front());
-                        mlir::Value nan_v = mlir::arith::ConstantFloatOp::create(
-                            b, loc, f32, llvm::APFloat::getNaN(llvm::APFloat::IEEEsingle()));
+                        mlir::Value nan_v = b.create<mlir::arith::ConstantFloatOp>(
+                            loc, f32, llvm::APFloat::getNaN(llvm::APFloat::IEEEsingle()));
                         b.create<mlir::scf::YieldOp>(loc, nan_v);
                         b.setInsertionPointToStart(&div_if.getElseRegion().front());
                         mlir::Value div_r = b.create<mlir::arith::DivFOp>(loc, lhs, rhs);
@@ -375,7 +375,7 @@ static void buildFused(mlir::OpBuilder& builder, mlir::Location loc,
                         mlir::Value neg_x = b.create<mlir::arith::NegFOp>(loc, lhs);
                         auto expf_func = getOrDeclareExpf(b, loc);
                         mlir::Value exp_x = b.create<mlir::LLVM::CallOp>(loc, expf_func, mlir::ValueRange{neg_x}).getResult();
-                        mlir::Value one = mlir::arith::ConstantFloatOp::create(b, loc, f32, llvm::APFloat(1.0f));
+                        mlir::Value one = b.create<mlir::arith::ConstantFloatOp>(loc, f32, llvm::APFloat(1.0f));
                         mlir::Value denom = b.create<mlir::arith::AddFOp>(loc, one, exp_x);
                         result = b.create<mlir::arith::DivFOp>(loc, one, denom);
                     } else if constexpr (std::is_same_v<T, TanhNode>) {
@@ -767,7 +767,7 @@ static void buildFusedMultiNodeVectorized(mlir::OpBuilder& builder, mlir::Locati
                 result_s = builder.create<mlir::arith::NegFOp>(loc, lhs);
             } else if constexpr (std::is_same_v<T, ReLUNode>) {
                 lhs = (op_idx > 0) ? prev_val_s : loadExternalScalar(ext_inputs[0]);
-                mlir::Value zero = mlir::arith::ConstantFloatOp::create(builder, loc, f32, llvm::APFloat(0.0f));
+                mlir::Value zero = builder.create<mlir::arith::ConstantFloatOp>(loc, f32, llvm::APFloat(0.0f));
                 result_s = builder.create<mlir::arith::MaxNumFOp>(loc, lhs, zero);
             } else if constexpr (std::is_same_v<T, AddNode>) {
                 if (op_idx > 0) { lhs = prev_val_s; rhs = loadExternalScalar(ext_inputs[0]); }
@@ -785,15 +785,15 @@ static void buildFusedMultiNodeVectorized(mlir::OpBuilder& builder, mlir::Locati
                 if (op_idx > 0) { lhs = prev_val_s; rhs = loadExternalScalar(ext_inputs[0]); }
                 else { lhs = loadExternalScalar(ext_inputs[0]); rhs = loadExternalScalar(ext_inputs[1]); }
                 mlir::Value cmp = builder.create<mlir::arith::CmpFOp>(loc, mlir::arith::CmpFPredicate::OGT, lhs, rhs);
-                mlir::Value zero_f = mlir::arith::ConstantFloatOp::create(builder, loc, f32, llvm::APFloat(0.0f));
-                mlir::Value one_f = mlir::arith::ConstantFloatOp::create(builder, loc, f32, llvm::APFloat(1.0f));
+                mlir::Value zero_f = builder.create<mlir::arith::ConstantFloatOp>(loc, f32, llvm::APFloat(0.0f));
+                mlir::Value one_f = builder.create<mlir::arith::ConstantFloatOp>(loc, f32, llvm::APFloat(1.0f));
                 // Gt(x, 0) 的标量尾循环必须与向量路径一致：cmp 为真时返回 1。
                 result_s = builder.create<mlir::arith::SelectOp>(loc, cmp, one_f, zero_f);
             } else if constexpr (std::is_same_v<T, SigmoidNode>) {
                 lhs = (op_idx > 0) ? prev_val_s : loadExternalScalar(ext_inputs[0]);
                 mlir::Value neg_x = builder.create<mlir::arith::NegFOp>(loc, lhs);
                 mlir::Value exp_x = builder.create<mlir::math::ExpOp>(loc, neg_x);
-                mlir::Value one = mlir::arith::ConstantFloatOp::create(builder, loc, f32, llvm::APFloat(1.0f));
+                mlir::Value one = builder.create<mlir::arith::ConstantFloatOp>(loc, f32, llvm::APFloat(1.0f));
                 mlir::Value denom = builder.create<mlir::arith::AddFOp>(loc, one, exp_x);
                 result_s = builder.create<mlir::arith::DivFOp>(loc, one, denom);
             } else if constexpr (std::is_same_v<T, TanhNode>) {
@@ -962,13 +962,13 @@ static void buildFusedMultiNode(mlir::OpBuilder& builder, mlir::Location loc,
                     if constexpr (std::is_same_v<T, NegNode>) {
                         result = b.create<mlir::arith::NegFOp>(loc, loadIn(0));
                     } else if constexpr (std::is_same_v<T, ReLUNode>) {
-                        mlir::Value zero = mlir::arith::ConstantFloatOp::create(b, loc, f32, llvm::APFloat(0.0f));
+                        mlir::Value zero = b.create<mlir::arith::ConstantFloatOp>(loc, f32, llvm::APFloat(0.0f));
                         result = b.create<mlir::arith::MaxNumFOp>(loc, loadIn(0), zero);
                     } else if constexpr (std::is_same_v<T, SigmoidNode>) {
                         mlir::Value neg_x = b.create<mlir::arith::NegFOp>(loc, loadIn(0));
                         auto expf_func = getOrDeclareExpf(b, loc);
                         mlir::Value exp_x = b.create<mlir::LLVM::CallOp>(loc, expf_func, mlir::ValueRange{neg_x}).getResult();
-                        mlir::Value one = mlir::arith::ConstantFloatOp::create(b, loc, f32, llvm::APFloat(1.0f));
+                        mlir::Value one = b.create<mlir::arith::ConstantFloatOp>(loc, f32, llvm::APFloat(1.0f));
                         mlir::Value denom = b.create<mlir::arith::AddFOp>(loc, one, exp_x);
                         result = b.create<mlir::arith::DivFOp>(loc, one, denom);
                     } else if constexpr (std::is_same_v<T, TanhNode>) {
@@ -991,12 +991,12 @@ static void buildFusedMultiNode(mlir::OpBuilder& builder, mlir::Location loc,
                         result = b.create<mlir::arith::MulFOp>(loc, lhs, rhs);
                     } else if constexpr (std::is_same_v<T, DivNode>) {
                         lhs = loadIn(0); rhs = loadIn(1);
-                        mlir::Value zero_c = mlir::arith::ConstantFloatOp::create(b, loc, f32, llvm::APFloat(0.0f));
+                        mlir::Value zero_c = b.create<mlir::arith::ConstantFloatOp>(loc, f32, llvm::APFloat(0.0f));
                         mlir::Value is_zero = b.create<mlir::arith::CmpFOp>(loc, mlir::arith::CmpFPredicate::OEQ, rhs, zero_c);
                         auto div_if = b.create<mlir::scf::IfOp>(loc, f32, is_zero, true);
                         b.setInsertionPointToStart(&div_if.getThenRegion().front());
-                        mlir::Value nan_val = mlir::arith::ConstantFloatOp::create(
-                            b, loc, f32, llvm::APFloat::getNaN(llvm::APFloat::IEEEsingle()));
+                        mlir::Value nan_val = b.create<mlir::arith::ConstantFloatOp>(
+                            b.getUnknownLoc(), f32, llvm::APFloat::getNaN(llvm::APFloat::IEEEsingle()));
                         b.create<mlir::scf::YieldOp>(loc, nan_val);
                         b.setInsertionPointToStart(&div_if.getElseRegion().front());
                         mlir::Value div_result = b.create<mlir::arith::DivFOp>(loc, lhs, rhs);
@@ -1005,8 +1005,8 @@ static void buildFusedMultiNode(mlir::OpBuilder& builder, mlir::Location loc,
                         result = div_if.getResult(0);
                     } else if constexpr (std::is_same_v<T, GtNode>) {
                         lhs = loadIn(0); rhs = loadIn(1);
-                        mlir::Value zero_v = mlir::arith::ConstantFloatOp::create(b, loc, f32, llvm::APFloat(0.0f));
-                        mlir::Value one_v = mlir::arith::ConstantFloatOp::create(b, loc, f32, llvm::APFloat(1.0f));
+                        mlir::Value zero_v = b.create<mlir::arith::ConstantFloatOp>(loc, f32, llvm::APFloat(0.0f));
+                        mlir::Value one_v = b.create<mlir::arith::ConstantFloatOp>(loc, f32, llvm::APFloat(1.0f));
                         auto cmp = b.create<mlir::arith::CmpFOp>(loc, mlir::arith::CmpFPredicate::OGT, lhs, rhs);
                         result = b.create<mlir::arith::SelectOp>(loc, cmp, one_v, zero_v);
                     } else if constexpr (std::is_same_v<T, ExpNode>) {

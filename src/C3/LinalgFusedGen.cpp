@@ -213,8 +213,8 @@ void buildLinalgFusedFunc(mlir::OpBuilder& builder, mlir::Location loc,
             }
 
             // 预定义常量
-            auto zero_f = mlir::arith::ConstantFloatOp::create(b, regionLoc, f32Type, llvm::APFloat(0.0f));
-            auto one_f  = mlir::arith::ConstantFloatOp::create(b, regionLoc, f32Type, llvm::APFloat(1.0f));
+            auto zero_f = b.create<mlir::arith::ConstantFloatOp>(regionLoc, f32Type, llvm::APFloat(0.0f));
+            auto one_f  = b.create<mlir::arith::ConstantFloatOp>(regionLoc, f32Type, llvm::APFloat(1.0f));
 
             // 拓扑排序计算节点
             std::vector<const Node*> compute_nodes;
@@ -234,8 +234,8 @@ void buildLinalgFusedFunc(mlir::OpBuilder& builder, mlir::Location loc,
                     using T = std::decay_t<decltype(op_node)>;
                     
                     if constexpr (std::is_same_v<T, ConstNode>) {
-                        result = mlir::arith::ConstantFloatOp::create(
-                            b, regionLoc, f32Type, llvm::APFloat(static_cast<float>(op_node.value)));
+                        result = b.create<mlir::arith::ConstantFloatOp>(
+                            regionLoc, f32Type, llvm::APFloat(static_cast<float>(op_node.value)));
                     }
                     else if constexpr (std::is_same_v<T, NegNode>) {
                         auto in = val_map.at(node->inputs[0]);
@@ -292,12 +292,12 @@ void buildLinalgFusedFunc(mlir::OpBuilder& builder, mlir::Location loc,
                         auto lhs = val_map.at(node->inputs[0]);
                         auto rhs = val_map.at(node->inputs[1]);
                         // [Fix §4.95 P2] 除零语义统一 NaN(与其它编译路径一致)
-                        auto zero_c = mlir::arith::ConstantFloatOp::create(b, regionLoc, f32Type, llvm::APFloat(0.0f));
+                        auto zero_c = b.create<mlir::arith::ConstantFloatOp>(regionLoc, f32Type, llvm::APFloat(0.0f));
                         auto is_zero = b.create<mlir::arith::CmpFOp>(
                             regionLoc, mlir::arith::CmpFPredicate::OEQ, rhs, zero_c);
                         auto raw = b.create<mlir::arith::DivFOp>(regionLoc, lhs, rhs);
-                        auto nan_c = mlir::arith::ConstantFloatOp::create(
-                            b, regionLoc, f32Type, llvm::APFloat::getNaN(llvm::APFloat::IEEEsingle()));
+                        auto nan_c = b.create<mlir::arith::ConstantFloatOp>(
+                            regionLoc, f32Type, llvm::APFloat::getNaN(llvm::APFloat::IEEEsingle()));
                         result = b.create<mlir::arith::SelectOp>(regionLoc, is_zero, nan_c, raw);
                     }
                     else if constexpr (std::is_same_v<T, GtNode>) {
