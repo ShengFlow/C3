@@ -1011,9 +1011,7 @@ static void applyUnifiedTransformPipeline(mlir::ModuleOp module, size_t num_inpu
         options.bufferizeFunctionBoundaries = true;
         pm.addPass(mlir::bufferization::createOneShotBufferizePass(options));
 #else
-        mlir::bufferization::OneShotBufferizeOptions options;
-        options.bufferizeFunctionBoundaries = true;
-        pm.addPass(mlir::bufferization::createOneShotBufferizePass(options));
+        pm.addPass(mlir::bufferization::createOneShotBufferizePass());
 #endif
         if (mlir::failed(pm.run(module))) {
             ct::c3::throwCompileError("One-Shot Bufferization failed");
