@@ -53,6 +53,11 @@
 #include <mlir/Conversion/ReconcileUnrealizedCasts/ReconcileUnrealizedCasts.h>
 #include <mlir/Conversion/Passes.h>
 #include <mlir/ExecutionEngine/ExecutionEngine.h>
+#ifdef __APPLE__
+#include <Accelerate/Accelerate.h>
+#else
+#include <cblas.h>
+#endif
 #include <mlir/ExecutionEngine/OptUtils.h>
 #include <mlir/Target/LLVMIR/Export.h>
 #include <mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h>
@@ -1129,6 +1134,14 @@ static std::unique_ptr<mlir::ExecutionEngine> createEngine(
     std::function<std::unique_ptr<llvm::Module>(mlir::Operation*, llvm::LLVMContext&)>& builder_slot) {
     llvm::InitializeNativeTarget();
     llvm::InitializeNativeTargetAsmPrinter();
+    llvm::sys::DynamicLibrary::LoadLibraryPermanently(nullptr);
+#ifndef __APPLE__
+    llvm::sys::DynamicLibrary::LoadLibraryPermanently("libopenblas.so.0", nullptr);
+    llvm::sys::DynamicLibrary::LoadLibraryPermanently("libopenblas.so", nullptr);
+    llvm::sys::DynamicLibrary::LoadLibraryPermanently("libblas.so.3", nullptr);
+    llvm::sys::DynamicLibrary::LoadLibraryPermanently("libblas.so", nullptr);
+#endif
+    llvm::sys::DynamicLibrary::AddSymbol("cblas_sgemm", reinterpret_cast<void*>(&cblas_sgemm));
 
     // [OpenMP 真多核 2026-08-16] 提前将 OpenMP 运行时加载进进程，
     // 使 ORC JIT 解析 __kmpc_* 符号（omp.parallel 展开为 libomp 运行时调用）。

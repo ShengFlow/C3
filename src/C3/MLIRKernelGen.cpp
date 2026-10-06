@@ -35,6 +35,12 @@
 #include "C3/JITCache.h"
 #include "C3/SIMDTarget.h"
 #include <mlir/Target/LLVMIR/Export.h>
+#include <llvm/Support/DynamicLibrary.h>
+#ifdef __APPLE__
+#include <Accelerate/Accelerate.h>
+#else
+#include <cblas.h>
+#endif
 
 // ======================= Profile timestamps (region fusion 探针) =======================
 // 由 test_region_fusion.cpp 通过 extern "C" 引用。JIT kernel 内部应调用
@@ -2296,6 +2302,14 @@ GeneratedKernel generateFromGraphMLIR(const Graph& graph, int opt_level) {
     std::call_once(llvm_init_flag, []() {
         llvm::InitializeNativeTarget();
         llvm::InitializeNativeTargetAsmPrinter();
+        llvm::sys::DynamicLibrary::LoadLibraryPermanently(nullptr);
+#ifndef __APPLE__
+        llvm::sys::DynamicLibrary::LoadLibraryPermanently("libopenblas.so.0", nullptr);
+        llvm::sys::DynamicLibrary::LoadLibraryPermanently("libopenblas.so", nullptr);
+        llvm::sys::DynamicLibrary::LoadLibraryPermanently("libblas.so.3", nullptr);
+        llvm::sys::DynamicLibrary::LoadLibraryPermanently("libblas.so", nullptr);
+#endif
+        llvm::sys::DynamicLibrary::AddSymbol("cblas_sgemm", reinterpret_cast<void*>(&cblas_sgemm));
     });
 
     // 每次编译创建独立的 MLIRContext，通过 DialectRegistry 集中管理所有 dialect。
