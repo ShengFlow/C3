@@ -33,7 +33,7 @@ namespace mlir {
 namespace ct {
 namespace c3 {
 
-extern std::mutex c3_global_mlir_mutex;
+extern std::recursive_mutex c3_global_mlir_mutex;
 
 /**
  * @brief 从 Graph 生成 MLIR 编译的 kernel（Phase 1 LLVM 后端）

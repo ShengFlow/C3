@@ -89,7 +89,7 @@ extern "C" {
 namespace ct {
 namespace c3 {
 
-std::mutex c3_global_mlir_mutex;
+std::recursive_mutex c3_global_mlir_mutex;
 
 enum class MatMulActivation { None, ReLU, Sigmoid, Tanh, SiLU };
 
@@ -2342,7 +2342,7 @@ GeneratedKernel generateFromGraphMLIR(const Graph& graph, int opt_level) {
     mlir::registerBuiltinDialectTranslation(reg);
     mlir::registerLLVMDialectTranslation(reg);
 
-    std::lock_guard<std::mutex> mlir_lock(ct::c3::c3_global_mlir_mutex);
+    std::lock_guard<std::recursive_mutex> mlir_lock(ct::c3::c3_global_mlir_mutex);
     auto context = std::make_shared<mlir::MLIRContext>(reg);
     context->getOrLoadDialect<mlir::arith::ArithDialect>();
     context->getOrLoadDialect<mlir::math::MathDialect>();

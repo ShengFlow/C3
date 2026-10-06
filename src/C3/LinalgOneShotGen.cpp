@@ -1274,7 +1274,7 @@ struct LinalgOneShotKernel::Impl {
 LinalgOneShotKernel::LinalgOneShotKernel(const Graph& graph, int opt_level) {
     std::unique_ptr<Impl> temp_impl;
     {
-        std::lock_guard<std::mutex> lock(ct::c3::c3_global_mlir_mutex);
+        std::lock_guard<std::recursive_mutex> lock(ct::c3::c3_global_mlir_mutex);
         temp_impl = std::make_unique<Impl>();
     }
 
