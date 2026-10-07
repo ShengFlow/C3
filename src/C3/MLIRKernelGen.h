@@ -27,6 +27,7 @@ namespace mlir {
     class MLIRContext;
     class ModuleOp;
     class PassManager;
+    class DialectRegistry;
     template <typename T> class OwningOpRef;
 }
 
@@ -34,6 +35,16 @@ namespace ct {
 namespace c3 {
 
 extern std::recursive_mutex c3_global_mlir_mutex;
+
+/**
+ * @brief [P1 编译并发优化] 获取全局线程安全的 MLIR DialectRegistry 单例
+ */
+const mlir::DialectRegistry& getGlobalDialectRegistry();
+
+/**
+ * @brief [P1 编译并发优化] 确保全局 LLVM 目标平台与动态符号完成初始化（线程安全）
+ */
+void ensureGlobalLLVMInitialized();
 
 /**
  * @brief 从 Graph 生成 MLIR 编译的 kernel（Phase 1 LLVM 后端）

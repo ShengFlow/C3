@@ -18,6 +18,7 @@
 #include <llvm/Config/llvm-config.h>
 #include <mlir/Transforms/GreedyPatternRewriteDriver.h>
 #include <mlir/Pass/PassManager.h>
+#include <mlir/Pass/Pass.h>
 #include <mlir/Transforms/Passes.h>
 #include <mlir/Dialect/Arith/IR/Arith.h>
 #include <mlir/Dialect/Func/IR/FuncOps.h>
@@ -1043,10 +1044,32 @@ struct MatMulOpLowering : public mlir::OpRewritePattern<mlir::c3::MatMulOp> {
     }
 };
 
+namespace {
+class C3CombinePass : public mlir::PassWrapper<C3CombinePass, mlir::OperationPass<mlir::ModuleOp>> {
+public:
+    MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(C3CombinePass)
+    llvm::StringRef getArgument() const override { return "c3-combine"; }
+    llvm::StringRef getDescription() const override { return "Apply TableGen DRR patterns for C3 dialect graph rewrites"; }
+
+    void runOnOperation() override {
+        auto module = getOperation();
+        mlir::RewritePatternSet patterns(&getContext());
+        populateWithGenerated(patterns);
+        if (mlir::failed(mlir::applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
+            signalPassFailure();
+        }
+    }
+};
+} // anonymous namespace
+
+std::unique_ptr<mlir::Pass> createC3CombinePass() {
+    return std::make_unique<C3CombinePass>();
+}
+
 void runC3Combine(mlir::ModuleOp module) {
-    mlir::RewritePatternSet patterns(module.getContext());
-    populateWithGenerated(patterns);
-    if (mlir::failed(mlir::applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
+    mlir::PassManager pm(module.getContext());
+    pm.addPass(createC3CombinePass());
+    if (mlir::failed(pm.run(module))) {
         ct::c3::throwCompileError("C3DialectLowering: C3Combine pattern rewrite optimization failed");
     }
 }
@@ -1241,79 +1264,93 @@ struct CrossEntropyOpLowering : public mlir::OpRewritePattern<mlir::c3::CrossEnt
     }
 };
 
-static void runC3Lowering(mlir::ModuleOp module) {
-    mlir::RewritePatternSet patterns(module.getContext());
-    patterns.add<TransposeOpLowering, SumReduceOpLowering, MatMulOpLowering,
-                 AddOpLowering, SubOpLowering, MulOpLowering, DivOpLowering,
-                 NegOpLowering, ReLUOpLowering, SigmoidOpLowering, TanhOpLowering,
-                 SiLUOpLowering,
-                 ExpOpLowering, LogOpLowering,
-                 SoftmaxOpLowering, CrossEntropyOpLowering>(module.getContext());  // [P0.2] 加 Softmax + CrossEntropy lowering
-    mlir::populateMathPolynomialApproximationPatterns(patterns);
-    if (mlir::failed(mlir::applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
-        ct::c3::throwCompileError("C3DialectLowering: C3ToLLVM lowering pass failed");
-    }
-    bool has_c3_ops = false;
-    module.walk([&](mlir::Operation* op) {
-        if (op->getName().getDialectNamespace() == "c3") {
-            has_c3_ops = true;
+namespace {
+class C3LoweringPass : public mlir::PassWrapper<C3LoweringPass, mlir::OperationPass<mlir::ModuleOp>> {
+public:
+    MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(C3LoweringPass)
+    llvm::StringRef getArgument() const override { return "c3-lowering"; }
+    llvm::StringRef getDescription() const override { return "Lower C3 dialect operations to LLVM and standard dialect loops"; }
+
+    void runOnOperation() override {
+        auto module = getOperation();
+        mlir::RewritePatternSet patterns(&getContext());
+        patterns.add<TransposeOpLowering, SumReduceOpLowering, MatMulOpLowering,
+                     AddOpLowering, SubOpLowering, MulOpLowering, DivOpLowering,
+                     NegOpLowering, ReLUOpLowering, SigmoidOpLowering, TanhOpLowering,
+                     SiLUOpLowering,
+                     ExpOpLowering, LogOpLowering,
+                     SoftmaxOpLowering, CrossEntropyOpLowering>(&getContext());
+        mlir::populateMathPolynomialApproximationPatterns(patterns);
+        if (mlir::failed(mlir::applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
+            signalPassFailure();
+            return;
         }
-    });
-    if (has_c3_ops) {
-        ct::c3::throwCompileError("C3DialectLowering: unlowered c3 dialect operations remain in module");
+        bool has_c3_ops = false;
+        module.walk([&](mlir::Operation* op) {
+            if (op->getName().getDialectNamespace() == "c3") {
+                has_c3_ops = true;
+            }
+        });
+        if (has_c3_ops) {
+            signalPassFailure();
+        }
     }
+};
+
+class C3MathPolynomialPass : public mlir::PassWrapper<C3MathPolynomialPass, mlir::OperationPass<mlir::ModuleOp>> {
+public:
+    MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(C3MathPolynomialPass)
+    llvm::StringRef getArgument() const override { return "c3-math-polynomial"; }
+    llvm::StringRef getDescription() const override { return "Apply math polynomial approximation patterns"; }
+
+    void runOnOperation() override {
+        auto module = getOperation();
+        mlir::RewritePatternSet patterns(&getContext());
+        mlir::populateMathPolynomialApproximationPatterns(patterns);
+        (void)mlir::applyPatternsAndFoldGreedily(module, std::move(patterns));
+    }
+};
+} // anonymous namespace
+
+std::unique_ptr<mlir::Pass> createC3LoweringPass() {
+    return std::make_unique<C3LoweringPass>();
 }
 
-static void runPass(mlir::ModuleOp module, std::unique_ptr<mlir::Pass> pass, const char* name) {
+std::unique_ptr<mlir::Pass> createC3MathPolynomialPass() {
+    return std::make_unique<C3MathPolynomialPass>();
+}
+
+static void runC3Lowering(mlir::ModuleOp module) {
     mlir::PassManager pm(module.getContext());
-    pm.addPass(std::move(pass));
+    pm.addPass(createC3LoweringPass());
     if (mlir::failed(pm.run(module))) {
-        ct::c3::throwCompileError(std::string("C3DialectLowering: ") + name + " failed");
+        ct::c3::throwCompileError("C3DialectLowering: C3ToLLVM lowering pass failed");
     }
 }
 
 void applyLoweringPipeline(mlir::ModuleOp module, int opt_level) {
-    runPass(module, mlir::createStripDebugInfoPass(), "StripDebugInfo");
-    runPass(module, mlir::createCanonicalizerPass(), "Canonicalizer");
-    runC3Combine(module);  // 1. 运行 JIT 3.0 高层图优化 (DRR)
-    runC3Lowering(module); // 2. 运行 JIT 3.0 高层算子到 LLVM 标量/向量循环 of Lowering Pass
-    runPass(module, mlir::createCSEPass(), "CSE");
-    runPass(module, mlir::createSymbolDCEPass(), "SymbolDCE");
-    runPass(module, mlir::createLoopInvariantCodeMotionPass(), "LICM");
-    runPass(module, mlir::createSCFForLoopCanonicalizationPass(), "SCFForLoopCanonicalization");
-    
+    mlir::PassManager pm(module.getContext());
+    pm.addPass(mlir::createStripDebugInfoPass());
+    pm.addPass(mlir::createCanonicalizerPass());
+    pm.addPass(createC3CombinePass());   // 1. 运行 JIT 3.0 高层图优化 (DRR)
+    pm.addPass(createC3LoweringPass());  // 2. 运行 JIT 3.0 高层算子到 LLVM 标量/向量循环
+    pm.addPass(mlir::createCSEPass());
+    pm.addPass(mlir::createSymbolDCEPass());
+    pm.addPass(mlir::createLoopInvariantCodeMotionPass());
+    pm.addPass(mlir::createSCFForLoopCanonicalizationPass());
+
     // [Extreme JIT - opt_level >= 4] 能上的优化 Pass 尽可能上满，释放硬件级极致性能
     if (opt_level >= 4) {
-        runPass(module, mlir::createControlFlowSinkPass(), "ControlFlowSink");
-        runPass(module, mlir::createRemoveDeadValuesPass(), "RemoveDeadValues");
+        pm.addPass(mlir::createControlFlowSinkPass());
+        pm.addPass(mlir::createRemoveDeadValuesPass());
     }
 
-    // [优化 2026-08-16] 移除 ParallelLoopFusionPass。因为 C3DialectLowering 仅生成顺序 scf.for 循环，
-    // 无 scf.parallel 循环，此 pass 为 100% no-op，移除它以减少编译期 pass 遍历开销。
-#if LLVM_VERSION_MAJOR >= 20
-    runPass(module, mlir::createSCFToControlFlowPass(), "SCFToCF");
-#else
-    runPass(module, mlir::createConvertSCFToCFPass(), "SCFToCF");
-#endif
+    pm.addPass(createC3MathPolynomialPass());
+    appendLLVMLoweringTail(pm);
 
-    {
-        mlir::RewritePatternSet patterns(module.getContext());
-        mlir::populateMathPolynomialApproximationPatterns(patterns);
-        (void)mlir::applyPatternsAndFoldGreedily(module, std::move(patterns));
+    if (mlir::failed(pm.run(module))) {
+        ct::c3::throwCompileError("C3DialectLowering: unified pass pipeline failed");
     }
-
-    runPass(module, mlir::createConvertMathToLLVMPass(), "MathToLLVM");
-    runPass(module, mlir::createArithToLLVMConversionPass(), "ArithToLLVM");
-
-    runPass(module, mlir::createConvertControlFlowToLLVMPass(), "CFToLLVM");
-    runPass(module, mlir::createConvertFuncToLLVMPass(), "FuncToLLVM");
-    runPass(module, mlir::createFinalizeMemRefToLLVMConversionPass(), "MemRefToLLVM");
-
-    runPass(module, mlir::createReconcileUnrealizedCastsPass(), "ReconcileUnrealizedCasts");
-
-    // LLVM 转换收尾后再次运行 Canonicalizer & CSE 清理无效转换、类型强转与死代码，精简 IR
-    runPass(module, mlir::createCanonicalizerPass(), "CanonicalizerPost");
-    runPass(module, mlir::createCSEPass(), "CSEPost");
 }
 
 // [§4.112] linalg codegen 三条路径共用的 lowering 尾段。

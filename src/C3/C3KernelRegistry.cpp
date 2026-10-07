@@ -101,6 +101,32 @@ std::optional<Tensor> C3KernelRegistry::tryExecuteFused(
 // 暴露这个 bug. 改用 entry.kernel->execute() (跟 tryExecuteBackward 一致).
 std::optional<Tensor> C3KernelRegistry::tryExecute(
     op op_type, const Tensor& a, const Tensor& b) {
+    const uint64_t fast_hash = computeFastHash(op_type, a.device(), a.shape(), b.shape());
+
+    // [P2 极速分发] Step 1: L1 无锁快速路径 (< 10ns，零互斥锁争用)
+    CompiledKernel* fast_kernel = lookupFast(fast_hash);
+    if (fast_kernel) {
+        try {
+#ifdef CT_PROFILE_PERF
+            auto t0 = std::chrono::steady_clock::now();
+#endif
+            std::vector<Tensor> inputs = {a, b};
+            auto outputs = fast_kernel->execute(inputs);
+            if (!outputs.empty() && !outputs[0].storage().empty()) {
+#ifdef CT_PROFILE_PERF
+                auto t1 = std::chrono::steady_clock::now();
+                recordPerfC3SingleInvoke(
+                    (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
+#endif
+                hit_count_.fetch_add(1, std::memory_order_relaxed);
+                return outputs[0];
+            }
+        } catch (...) {
+            // L1 执行异常时静默回退至 L2 完备查找
+        }
+    }
+
+    // Step 2: L2 回退路径（加锁查找完整 entries_ 注册表）
     auto key = makeKeyFromShapes(op_type, a.device(), a.shape(), b.shape());
 
     C3Entry entry;
@@ -151,6 +177,9 @@ std::optional<Tensor> C3KernelRegistry::tryExecute(
             return std::nullopt;
         }
 
+        // [P2 极速分发] L2 命中后原子回填 L1 极速槽位，后续同形状调度直通 L1
+        installFast(fast_hash, entry.kernel.get());
+
 #ifdef CT_DEBUG
         {
             const float* out_data = out.data_read<float>();
@@ -176,6 +205,24 @@ std::optional<Tensor> C3KernelRegistry::tryExecute(
 }
 
 std::optional<Tensor> C3KernelRegistry::tryExecuteUnary(op op_type, const Tensor& a) {
+    const uint64_t fast_hash = computeFastHash(op_type, a.device(), a.shape(), {});
+
+    // [P2 极速分发] Step 1: L1 无锁快速路径 (< 10ns，零互斥锁争用)
+    CompiledKernel* fast_kernel = lookupFast(fast_hash);
+    if (fast_kernel) {
+        try {
+            std::vector<Tensor> inputs = {a};
+            auto outputs = fast_kernel->execute(inputs);
+            if (!outputs.empty() && !outputs[0].storage().empty()) {
+                hit_count_.fetch_add(1, std::memory_order_relaxed);
+                return outputs[0];
+            }
+        } catch (...) {
+            // L1 执行异常时静默回退至 L2 完备查找
+        }
+    }
+
+    // Step 2: L2 回退路径（加锁查找完整 entries_ 注册表）
     auto key = makeKeyFromShapes(op_type, a.device(), a.shape(), {});
 
     C3Entry entry;
@@ -216,6 +263,10 @@ std::optional<Tensor> C3KernelRegistry::tryExecuteUnary(op op_type, const Tensor
         if (!validateOutputShape(op_type, a.device(), out, entry.shapes.out_shape)) {
             return std::nullopt;
         }
+
+        // [P2 极速分发] L2 命中后原子回填 L1 极速槽位，后续同形状调度直通 L1
+        installFast(fast_hash, entry.kernel.get());
+
         return out;
     } catch (...) {
         miss_count_.fetch_add(1, std::memory_order_relaxed);
@@ -423,6 +474,7 @@ C3KernelRegistry::findFusedKernelForFirstOp(
 void C3KernelRegistry::install(op op_type, DeviceType dev,
                                std::shared_ptr<CompiledKernel> kernel,
                                const KernelShapeInfo& shapes) {
+    if (!kernel) return;
     std::lock_guard<std::mutex> lock(mutex_);
     auto key = makeKey(op_type, dev, shapes);
     auto it = entries_.find(key);
@@ -432,12 +484,17 @@ void C3KernelRegistry::install(op op_type, DeviceType dev,
             return;
         }
     }
+    CompiledKernel* raw_k = kernel.get();
     C3Entry e;
     e.kernel = std::move(kernel);
     e.shapes = shapes;
     e.active = true;
     entries_[key] = std::move(e);
     install_count_.fetch_add(1, std::memory_order_release);
+
+    // [P2 极速分发] 同步更新到 L1 极速槽位 (< 10ns)
+    const uint64_t fast_hash = computeFastHash(op_type, dev, shapes.lhs_shape, shapes.rhs_shape);
+    installFast(fast_hash, raw_k);
 #ifdef CT_DEBUG
     fprintf(stderr, "[DBG] INSTALL op=%d dev=%d key3=%zu lhs=[%s] rhs=[%s]\n",
             (int)op_type, (int)dev, key.third,

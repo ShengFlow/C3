@@ -23,6 +23,7 @@
 
 #include "Graph.h"
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <functional>
@@ -165,6 +166,63 @@ public:
 #endif
     }
 
+    // ======================= L1 无锁快速分发缓存 (Sub-10ns Seqlock) =======================
+    static constexpr size_t kFastTableSize = 2048; // 2^11
+    static constexpr size_t kFastMask = kFastTableSize - 1;
+
+    struct alignas(64) FastSlot {
+        std::atomic<uint64_t> signature_hash{0};
+        std::atomic<CompiledKernel*> kernel_ptr{nullptr};
+    };
+
+    static inline uint64_t computeFastHash(op op_type, DeviceType dev,
+                                           const std::vector<size_t>& lhs,
+                                           const std::vector<size_t>& rhs) noexcept {
+        uint64_t h = 14695981039346656037ULL; // FNV-1a 64-bit
+        auto mix = [&h](uint64_t v) {
+            h ^= v;
+            h *= 1099511628211ULL;
+        };
+        mix(static_cast<uint64_t>(op_type));
+        mix(static_cast<uint64_t>(dev));
+        mix(lhs.size());
+        for (size_t s : lhs) mix(s);
+        mix(rhs.size());
+        for (size_t s : rhs) mix(s);
+        return (h == 0) ? 1 : h;
+    }
+
+    [[nodiscard]] inline CompiledKernel* lookupFast(uint64_t sig_hash) const noexcept {
+        if (sig_hash == 0) return nullptr;
+        const size_t idx = sig_hash & kFastMask;
+        const auto& slot = fast_slots_[idx];
+        uint64_t h1 = slot.signature_hash.load(std::memory_order_acquire);
+        if (h1 == sig_hash) {
+            auto* k = slot.kernel_ptr.load(std::memory_order_acquire);
+            uint64_t h2 = slot.signature_hash.load(std::memory_order_acquire);
+            if (h2 == sig_hash) {
+                return k;
+            }
+        }
+        return nullptr;
+    }
+
+    inline void installFast(uint64_t sig_hash, CompiledKernel* kernel) noexcept {
+        if (sig_hash == 0 || !kernel) return;
+        const size_t idx = sig_hash & kFastMask;
+        auto& slot = fast_slots_[idx];
+        slot.signature_hash.store(0, std::memory_order_release);
+        slot.kernel_ptr.store(kernel, std::memory_order_release);
+        slot.signature_hash.store(sig_hash, std::memory_order_release);
+    }
+
+    inline void clearFastSlots() noexcept {
+        for (size_t i = 0; i < kFastTableSize; ++i) {
+            fast_slots_[i].signature_hash.store(0, std::memory_order_release);
+            fast_slots_[i].kernel_ptr.store(nullptr, std::memory_order_release);
+        }
+    }
+
     /**
      * @brief 卸载 C3 kernel（回退到 eager）
      */
@@ -183,6 +241,7 @@ public:
         }
         if (removed > 0) {
             uninstall_count_.fetch_add(removed, std::memory_order_release);
+            clearFastSlots();
         }
     }
 
@@ -199,6 +258,7 @@ public:
         // 调用方应在 main() 返回前调用本方法，参见 C3Engine.h 退出序列文档。
         fused_entries_.clear();
         backward_entries_.clear();
+        clearFastSlots();
     }
 
     // ======================= 执行 =======================
@@ -441,7 +501,9 @@ public:
     }
 
 private:
-    C3KernelRegistry() = default;
+    C3KernelRegistry() {
+        clearFastSlots();
+    }
 
     struct C3Entry {
         // [Fix 2026-08-09 用户审查 P0-#4]: 之前只存裸 C3KernelFunc 指针,
@@ -609,6 +671,8 @@ private:
     // [MIMO 深挖] backward::tryExecuteBackward 阶段耗时累加器（relaxed，低成本）
     std::atomic<uint64_t> bw_dispatch_ns_{0};  ///< 查表/校验/组装（不含 kernel 执行）
     std::atomic<uint64_t> bw_exec_ns_{0};      ///< entry.kernel->execute()
+
+    std::array<FastSlot, kFastTableSize> fast_slots_{};
 };
 
 } // namespace c3

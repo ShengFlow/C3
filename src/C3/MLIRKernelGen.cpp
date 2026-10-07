@@ -96,6 +96,40 @@ namespace c3 {
 
 std::recursive_mutex c3_global_mlir_mutex;
 
+void ensureGlobalLLVMInitialized() {
+    static std::once_flag llvm_init_flag;
+    std::call_once(llvm_init_flag, []() {
+        llvm::InitializeNativeTarget();
+        llvm::InitializeNativeTargetAsmPrinter();
+        llvm::sys::DynamicLibrary::LoadLibraryPermanently(nullptr);
+#ifndef __APPLE__
+        llvm::sys::DynamicLibrary::LoadLibraryPermanently("libopenblas.so.0", nullptr);
+        llvm::sys::DynamicLibrary::LoadLibraryPermanently("libopenblas.so", nullptr);
+        llvm::sys::DynamicLibrary::LoadLibraryPermanently("libblas.so.3", nullptr);
+        llvm::sys::DynamicLibrary::LoadLibraryPermanently("libblas.so", nullptr);
+#endif
+        llvm::sys::DynamicLibrary::AddSymbol("cblas_sgemm", reinterpret_cast<void*>(&cblas_sgemm));
+    });
+}
+
+const mlir::DialectRegistry& getGlobalDialectRegistry() {
+    static mlir::DialectRegistry registry;
+    static std::once_flag registry_init_flag;
+    std::call_once(registry_init_flag, []() {
+        registry.insert<mlir::arith::ArithDialect>();
+        registry.insert<mlir::math::MathDialect>();
+        registry.insert<mlir::scf::SCFDialect>();
+        registry.insert<mlir::vector::VectorDialect>();
+        registry.insert<mlir::func::FuncDialect>();
+        registry.insert<mlir::memref::MemRefDialect>();
+        registry.insert<mlir::LLVM::LLVMDialect>();
+        registry.insert<mlir::c3::C3Dialect>();
+        mlir::registerBuiltinDialectTranslation(registry);
+        mlir::registerLLVMDialectTranslation(registry);
+    });
+    return registry;
+}
+
 enum class MatMulActivation { None, ReLU, Sigmoid, Tanh, SiLU };
 
 namespace {
@@ -2349,18 +2383,7 @@ static std::optional<GeneratedKernel> tryLoadFromJITCache(
         : (opt_level == 1) ? llvm::CodeGenOptLevel::Less
         : llvm::CodeGenOptLevel::None);
 
-    static std::once_flag llvm_orc_init_flag;
-    std::call_once(llvm_orc_init_flag, []() {
-        llvm::InitializeNativeTarget();
-        llvm::InitializeNativeTargetAsmPrinter();
-        llvm::sys::DynamicLibrary::LoadLibraryPermanently(nullptr);
-#ifndef __APPLE__
-        llvm::sys::DynamicLibrary::LoadLibraryPermanently("libopenblas.so.0", nullptr);
-        llvm::sys::DynamicLibrary::LoadLibraryPermanently("libopenblas.so", nullptr);
-        llvm::sys::DynamicLibrary::LoadLibraryPermanently("libblas.so.3", nullptr);
-        llvm::sys::DynamicLibrary::LoadLibraryPermanently("libblas.so", nullptr);
-#endif
-    });
+    ensureGlobalLLVMInitialized();
 
     auto jit_exp = llvm::orc::LLJITBuilder().setJITTargetMachineBuilder(std::move(*jtmb)).create();
     if (!jit_exp) {
@@ -2460,37 +2483,11 @@ GeneratedKernel generateFromGraphMLIR(const Graph& graph, int opt_level) {
         }
     }
 
-    static std::once_flag llvm_init_flag;
-    std::call_once(llvm_init_flag, []() {
-        llvm::InitializeNativeTarget();
-        llvm::InitializeNativeTargetAsmPrinter();
-        llvm::sys::DynamicLibrary::LoadLibraryPermanently(nullptr);
-#ifndef __APPLE__
-        llvm::sys::DynamicLibrary::LoadLibraryPermanently("libopenblas.so.0", nullptr);
-        llvm::sys::DynamicLibrary::LoadLibraryPermanently("libopenblas.so", nullptr);
-        llvm::sys::DynamicLibrary::LoadLibraryPermanently("libblas.so.3", nullptr);
-        llvm::sys::DynamicLibrary::LoadLibraryPermanently("libblas.so", nullptr);
-#endif
-        llvm::sys::DynamicLibrary::AddSymbol("cblas_sgemm", reinterpret_cast<void*>(&cblas_sgemm));
-    });
+    ensureGlobalLLVMInitialized();
 
-    // 每次编译创建独立的 MLIRContext，通过 DialectRegistry 集中管理所有 dialect。
-    // LLVMDialect 必须放入 DialectRegistry 以正确初始化类型系统（LLVMPointerType 等）。
-    // 参考 JIT-MLIR-Debug-Experience.md §1: Dialect 注册必须通过 DialectRegistry 集中管理。
-    mlir::DialectRegistry reg;
-    reg.insert<mlir::arith::ArithDialect>();
-    reg.insert<mlir::math::MathDialect>();
-    reg.insert<mlir::scf::SCFDialect>();
-    reg.insert<mlir::vector::VectorDialect>();
-    reg.insert<mlir::func::FuncDialect>();
-    reg.insert<mlir::memref::MemRefDialect>();
-    reg.insert<mlir::LLVM::LLVMDialect>();
-    reg.insert<mlir::c3::C3Dialect>();
-    mlir::registerBuiltinDialectTranslation(reg);
-    mlir::registerLLVMDialectTranslation(reg);
-
-    std::lock_guard<std::recursive_mutex> mlir_lock(ct::c3::c3_global_mlir_mutex);
-    auto context = std::make_shared<mlir::MLIRContext>(reg);
+    // [P1 并发 JIT 优化] 使用全局预注册的只读 DialectRegistry 创建独立的 MLIRContext
+    // 彻底消除 c3_global_mlir_mutex 互斥锁，支持多线程高并发 JIT 编译
+    auto context = std::make_shared<mlir::MLIRContext>(getGlobalDialectRegistry());
     context->getOrLoadDialect<mlir::arith::ArithDialect>();
     context->getOrLoadDialect<mlir::math::MathDialect>();
     context->getOrLoadDialect<mlir::scf::SCFDialect>();
