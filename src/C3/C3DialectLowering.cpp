@@ -1249,7 +1249,7 @@ static void runC3Lowering(mlir::ModuleOp module) {
                  SiLUOpLowering,
                  ExpOpLowering, LogOpLowering,
                  SoftmaxOpLowering, CrossEntropyOpLowering>(module.getContext());  // [P0.2] 加 Softmax + CrossEntropy lowering
-    mlir::populatePolynomialApproximateTanhPattern(patterns);
+    mlir::populateMathPolynomialApproximationPatterns(patterns);
     if (mlir::failed(mlir::applyPatternsAndFoldGreedily(module, std::move(patterns)))) {
         ct::c3::throwCompileError("C3DialectLowering: C3ToLLVM lowering pass failed");
     }
@@ -1298,7 +1298,7 @@ void applyLoweringPipeline(mlir::ModuleOp module, int opt_level) {
 
     {
         mlir::RewritePatternSet patterns(module.getContext());
-        mlir::populatePolynomialApproximateTanhPattern(patterns);
+        mlir::populateMathPolynomialApproximationPatterns(patterns);
         (void)mlir::applyPatternsAndFoldGreedily(module, std::move(patterns));
     }
 
