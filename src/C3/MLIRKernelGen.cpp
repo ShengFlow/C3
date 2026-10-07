@@ -44,6 +44,7 @@
 #include <Accelerate/Accelerate.h>
 #else
 #include <cblas.h>
+#include <dlfcn.h>
 #endif
 
 // ======================= Profile timestamps (region fusion 探针) =======================
@@ -2348,6 +2349,19 @@ static std::optional<GeneratedKernel> tryLoadFromJITCache(
         : (opt_level == 1) ? llvm::CodeGenOptLevel::Less
         : llvm::CodeGenOptLevel::None);
 
+    static std::once_flag llvm_orc_init_flag;
+    std::call_once(llvm_orc_init_flag, []() {
+        llvm::InitializeNativeTarget();
+        llvm::InitializeNativeTargetAsmPrinter();
+        llvm::sys::DynamicLibrary::LoadLibraryPermanently(nullptr);
+#ifndef __APPLE__
+        llvm::sys::DynamicLibrary::LoadLibraryPermanently("libopenblas.so.0", nullptr);
+        llvm::sys::DynamicLibrary::LoadLibraryPermanently("libopenblas.so", nullptr);
+        llvm::sys::DynamicLibrary::LoadLibraryPermanently("libblas.so.3", nullptr);
+        llvm::sys::DynamicLibrary::LoadLibraryPermanently("libblas.so", nullptr);
+#endif
+    });
+
     auto jit_exp = llvm::orc::LLJITBuilder().setJITTargetMachineBuilder(std::move(*jtmb)).create();
     if (!jit_exp) {
         llvm::consumeError(jit_exp.takeError());
@@ -2364,11 +2378,21 @@ static std::optional<GeneratedKernel> tryLoadFromJITCache(
         llvm::consumeError(gen_exp.takeError());
     }
 
-    // 显式符号兜底: 确保 cblas_sgemm 100% 解析
-    auto sym_cblas = jit->mangleAndIntern("cblas_sgemm");
-    (void)main_jd.define(llvm::orc::absoluteSymbols({
-        {sym_cblas, {llvm::orc::ExecutorAddr::fromPtr(reinterpret_cast<void*>(&cblas_sgemm)), llvm::JITSymbolFlags::Exported}}
-    }));
+    // 显式符号兜底: 确保 cblas_sgemm 安全解析 (防空指针悬挂)
+    void* sgemm_ptr = llvm::sys::DynamicLibrary::SearchForAddressOfSymbol("cblas_sgemm");
+    if (!sgemm_ptr) {
+#ifdef __APPLE__
+        sgemm_ptr = reinterpret_cast<void*>(&cblas_sgemm);
+#else
+        sgemm_ptr = dlsym(RTLD_DEFAULT, "cblas_sgemm");
+#endif
+    }
+    if (sgemm_ptr) {
+        auto sym_cblas = jit->mangleAndIntern("cblas_sgemm");
+        (void)main_jd.define(llvm::orc::absoluteSymbols({
+            {sym_cblas, {llvm::orc::ExecutorAddr::fromPtr(sgemm_ptr), llvm::JITSymbolFlags::Exported}}
+        }));
+    }
 
     llvm::orc::ThreadSafeModule tsm(std::move(llvm_mod), std::move(ctx));
     auto err = jit->addIRModule(std::move(tsm));
