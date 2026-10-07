@@ -33,6 +33,19 @@ class LLVMContext;
 namespace ct {
 namespace c3 {
 
+struct JITMetadata {
+    std::string version;
+    bool is_multi_node = false;
+    bool is_fused = false;
+    bool is_matmul = false;
+    size_t num_inputs = 0;
+    size_t M = 0, K = 0, N = 0;
+    size_t elem_n = 0;
+    size_t scratch_size = 0;
+    size_t pool_buf_count = 0;
+    std::vector<size_t> fused_out_shape;
+};
+
 /**
  * @class JITCache
  * @brief MLIR JIT bitcode 磁盘缓存
@@ -67,6 +80,23 @@ public:
      * @return 成功返回最终 cache 路径，失败返回空字符串
      */
     [[nodiscard]] std::string store(const std::string& cache_key, llvm::Module& module);
+
+    /**
+     * @brief 将 LLVM 模块以 bitcode 形式写入磁盘并附加元数据 (JITCache 2.0)
+     * @param cache_key 同 lookup
+     * @param module LLVM 模块（已 lowering 完成）
+     * @param meta 结构化内核元数据
+     * @return 成功返回最终 cache 路径，失败返回空字符串
+     */
+    [[nodiscard]] std::string store(const std::string& cache_key, llvm::Module& module, const JITMetadata& meta);
+
+    /**
+     * @brief 从磁盘读取指定 cache key 的元数据文件
+     * @param cache_key 缓存键
+     * @param meta 载入的元数据
+     * @return 成功且版本匹配返回 true，否则返回 false
+     */
+    [[nodiscard]] bool loadMetadata(const std::string& cache_key, JITMetadata& meta);
 
     /**
      * @brief 从磁盘加载 bitcode 文件并反序列化为 LLVM 模块

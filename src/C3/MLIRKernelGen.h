@@ -70,6 +70,7 @@ mlir::OwningOpRef<mlir::ModuleOp> buildMLIRModule(mlir::MLIRContext& context, co
  *       C3DialectLowering.cpp), 已于 §4.112 更正。
  */
 void applyLoweringPipeline(mlir::ModuleOp module, int opt_level = 3);
+void runC3Combine(mlir::ModuleOp module);
 
 /**
  * @brief [§4.112] 追加「MLIR → LLVM」公共 lowering 尾段(linalg codegen 三条路径共用)

@@ -915,8 +915,10 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildTensorMLIRModule(mlir::MLIRContext
 
 static void applyUnifiedTransformPipeline(mlir::ModuleOp module, size_t num_inputs, size_t num_outputs, size_t base_numel) {
     bool is_verbose = isVerboseDebugEnabled();
+    // 1.0 高层 DRR 图优化 (TableGen 声明式代数规约与结构折叠)
+    runC3Combine(module);
     if (is_verbose) {
-        dumpPhaseIR(module, "Phase 1.0", "原始 Tensor-based C3 Dialect IR");
+        dumpPhaseIR(module, "Phase 1.5", "应用 C3Combine (DRR 代数与结构折叠) 后的 Tensor IR");
     }
 
     // 1. C3-to-Linalg Lowering

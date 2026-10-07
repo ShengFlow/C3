@@ -1043,7 +1043,7 @@ struct MatMulOpLowering : public mlir::OpRewritePattern<mlir::c3::MatMulOp> {
     }
 };
 
-static void runC3Combine(mlir::ModuleOp module) {
+void runC3Combine(mlir::ModuleOp module) {
     mlir::RewritePatternSet patterns(module.getContext());
     populateWithGenerated(patterns);
     if (mlir::failed(mlir::applyPatternsAndFoldGreedily(module, std::move(patterns)))) {

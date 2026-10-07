@@ -36,6 +36,10 @@
 #include "C3/SIMDTarget.h"
 #include <mlir/Target/LLVMIR/Export.h>
 #include <llvm/Support/DynamicLibrary.h>
+#include <llvm/ExecutionEngine/Orc/LLJIT.h>
+#include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
+#include <llvm/ExecutionEngine/Orc/ExecutionUtils.h>
+#include <llvm/ExecutionEngine/Orc/Core.h>
 #ifdef __APPLE__
 #include <Accelerate/Accelerate.h>
 #else
@@ -2316,9 +2320,111 @@ mlir::OwningOpRef<mlir::ModuleOp> buildMLIRModule(
     return module;
 }
 
+// [JITCache 2.0]: 完整 bitcode 反序列化与 ORC JIT 直接挂载路径
+static std::optional<GeneratedKernel> tryLoadFromJITCache(
+    const Graph& graph, const std::string& jit_key, int opt_level)
+{
+    std::string bc_path = JITCache::getInstance().lookup(jit_key);
+    if (bc_path.empty()) return std::nullopt;
+
+    JITMetadata meta;
+    if (!JITCache::getInstance().loadMetadata(jit_key, meta)) {
+        return std::nullopt;
+    }
+
+    auto ctx = std::make_unique<llvm::LLVMContext>();
+    auto llvm_mod = JITCache::getInstance().loadBitcode(bc_path, *ctx);
+    if (!llvm_mod) {
+        return std::nullopt;
+    }
+
+    auto jtmb = llvm::orc::JITTargetMachineBuilder::detectHost();
+    if (!jtmb) {
+        return std::nullopt;
+    }
+    jtmb->setCodeGenOptLevel(
+        (opt_level >= 3) ? llvm::CodeGenOptLevel::Aggressive
+        : (opt_level == 2) ? llvm::CodeGenOptLevel::Default
+        : (opt_level == 1) ? llvm::CodeGenOptLevel::Less
+        : llvm::CodeGenOptLevel::None);
+
+    auto jit_exp = llvm::orc::LLJITBuilder().setJITTargetMachineBuilder(std::move(*jtmb)).create();
+    if (!jit_exp) {
+        llvm::consumeError(jit_exp.takeError());
+        return std::nullopt;
+    }
+    auto jit = std::move(*jit_exp);
+
+    auto& main_jd = jit->getMainJITDylib();
+    auto gen_exp = llvm::orc::DynamicLibrarySearchGenerator::GetForCurrentProcess(
+        jit->getDataLayout().getGlobalPrefix());
+    if (gen_exp) {
+        main_jd.addGenerator(std::move(*gen_exp));
+    } else {
+        llvm::consumeError(gen_exp.takeError());
+    }
+
+    // 显式符号兜底: 确保 cblas_sgemm 100% 解析
+    auto sym_cblas = jit->mangleAndIntern("cblas_sgemm");
+    (void)main_jd.define(llvm::orc::absoluteSymbols({
+        {sym_cblas, {llvm::orc::ExecutorAddr::fromPtr(reinterpret_cast<void*>(&cblas_sgemm)), llvm::JITSymbolFlags::Exported}}
+    }));
+
+    llvm::orc::ThreadSafeModule tsm(std::move(llvm_mod), std::move(ctx));
+    auto err = jit->addIRModule(std::move(tsm));
+    if (err) {
+        llvm::consumeError(std::move(err));
+        return std::nullopt;
+    }
+
+    auto sym = jit->lookup("c3_kernel");
+    if (!sym) {
+        llvm::consumeError(sym.takeError());
+        return std::nullopt;
+    }
+
+    void* raw_ptr = sym->toPtr<void*>();
+    if (!raw_ptr) return std::nullopt;
+
+    GeneratedKernel result;
+    result.is_multi_node = meta.is_multi_node;
+    result.is_fused = meta.is_fused;
+    result.is_matmul = meta.is_matmul;
+    result.num_inputs = meta.num_inputs;
+    result.M = meta.M;
+    result.K = meta.K;
+    result.N = meta.N;
+    result.elem_n = meta.elem_n;
+    result.scratch_size = meta.scratch_size;
+    result.fused_out_shape = meta.fused_out_shape;
+
+    if (result.is_multi_node) {
+        result.multi_func = reinterpret_cast<MultiNodeKernelFunc>(raw_ptr);
+    } else if (result.is_fused) {
+        result.fused_func = reinterpret_cast<FusedKernelFunc>(raw_ptr);
+    } else {
+        result.func = reinterpret_cast<C3KernelFunc>(raw_ptr);
+    }
+
+    auto jit_holder = std::shared_ptr<llvm::orc::LLJIT>(std::move(jit));
+    result.handle = nullptr;
+    result.deleter = [jit_holder]() {};
+
+    return result;
+}
+
 // [CGO 2027 重构]: C3ToLLVM 降低模式、DRR 图合并规则及 applyLoweringPipeline 已完全解耦移入 C3DialectLowering.cpp。
 // MLIRKernelGen.cpp 仅保留单节点与多节点方言图构建入口。
 GeneratedKernel generateFromGraphMLIR(const Graph& graph, int opt_level) {
+    std::string jit_key;
+    if (JITCache::isEnabled()) {
+        jit_key = JITCache::makeKey(graph.toString(), opt_level);
+        auto cached = tryLoadFromJITCache(graph, jit_key, opt_level);
+        if (cached) {
+            return *cached;
+        }
+    }
+
     // [2026-08-15] linalg.generic 声明式逐元素路线（JIT 3.0 声明式大一统 接入）：
     // 单节点逐元素算子（无广播）直接走 LinalgElementwiseKernel（自带 ExecutionEngine，
     // func_any 捕获 shared_ptr 保证生命周期），跳过下方手写 if-else 标量 IR 构建。
@@ -2413,33 +2519,7 @@ GeneratedKernel generateFromGraphMLIR(const Graph& graph, int opt_level) {
         : (opt_level == 1) ? llvm::CodeGenOptLevel::Less
         : llvm::CodeGenOptLevel::None;
 
-    // [Dev] v0.5.2 (4) JITCache 1.0 store-only (2026-08-09):
-    // 在 ExecutionEngine::create 之前,翻译 MLIR module → LLVM module → 写 bitcode 落盘
-    // 1.0 实装: store 完整 (写 .bc + .meta), lookup 走 disk check 但不实际反序列化
-    // read path (loadBitcode → ExecutionEngine) 留 v0.5.2 follow-up (需要 ExecutionEngine 重建 hook)
-    // 用户测试注意 (per 洛锦 2026-08-09):
-    //   - 性能测试前必须 JITCache::evict() (避免命中作弊)
-    //   - MLIR backend 改动后必须 evict() (旧 .bc 跟新 MLIR IR 不兼容)
-    //   - 正确性测试允许 warm cache (cache deterministic)
-    if (JITCache::isEnabled()) {
-        try {
-            std::string jit_key = JITCache::makeKey(graph.toString(), opt_level);
-            std::string bc_path = JITCache::getInstance().lookup(jit_key);
-            if (bc_path.empty()) {
-                // miss: 翻译 + 写 bitcode
-                llvm::LLVMContext bc_ctx;
-                auto llvm_module = mlir::translateModuleToLLVMIR(*module, bc_ctx);
-                if (llvm_module) {
-                    JITCache::getInstance().store(jit_key, *llvm_module);
-                }
-            } else {
-                // 命中 (有 .bc 文件),但 1.0 不实际反序列化,直接走正常 ExecutionEngine
-                JITCache::getInstance().recordHit();
-            }
-        } catch (...) {
-            // 静默失败,不影响正常 ExecutionEngine 编译
-        }
-    }
+    // [JITCache 2.0]: 编译产物持久化已移至 kernel 构建完成后的元数据统一存储点
 
     auto maybeEngine = mlir::ExecutionEngine::create(*module, engineOpts);
     if (!maybeEngine)
@@ -2542,6 +2622,31 @@ GeneratedKernel generateFromGraphMLIR(const Graph& graph, int opt_level) {
                 }
                 break;
             }
+        }
+    }
+
+    // [JITCache 2.0]: 写入编译后的 LLVM Bitcode 与完整结构化元数据到磁盘
+    if (JITCache::isEnabled() && !jit_key.empty()) {
+        try {
+            llvm::LLVMContext bc_ctx;
+            auto llvm_module = mlir::translateModuleToLLVMIR(module_holder->get(), bc_ctx);
+            if (llvm_module) {
+                JITMetadata meta;
+                meta.is_multi_node = result.is_multi_node;
+                meta.is_fused = result.is_fused;
+                meta.is_matmul = result.is_matmul;
+                meta.num_inputs = result.num_inputs;
+                meta.M = result.M;
+                meta.K = result.K;
+                meta.N = result.N;
+                meta.elem_n = result.elem_n;
+                meta.scratch_size = result.scratch_size;
+                meta.pool_buf_count = pool_buf_count;
+                meta.fused_out_shape = result.fused_out_shape;
+                (void)JITCache::getInstance().store(jit_key, *llvm_module, meta);
+            }
+        } catch (...) {
+            // 静默降级，不阻断执行
         }
     }
 

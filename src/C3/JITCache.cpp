@@ -305,13 +305,18 @@ std::string JITCache::lookup(const std::string& cache_key) {
 // ======================= Store =======================
 
 std::string JITCache::store(const std::string& cache_key, llvm::Module& module) {
+    JITMetadata meta;
+    return store(cache_key, module, meta);
+}
+
+std::string JITCache::store(const std::string& cache_key, llvm::Module& module, const JITMetadata& meta) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     std::string dir = resolveCacheDir();
     std::string bc_path = dir + "/c3_jit_" + cache_key + ".bc";
     std::string meta_path = dir + "/c3_jit_" + cache_key + ".meta";
 
-    #ifdef CT_DEBUG
+#ifdef CT_DEBUG
     fprintf(stderr, "[JITCache] store: key=%s, bc_path=%s\n", cache_key.c_str(), bc_path.c_str());
 #endif
 
@@ -332,15 +337,27 @@ std::string JITCache::store(const std::string& cache_key, llvm::Module& module) 
         os.flush();
     }
 
-    // 写入 .meta 文件
+    // 写入 .meta 文件 (JITCache 2.0 序列化)
     {
-        std::ofstream meta(tmp_meta);
-        if (!meta.is_open()) {
+        std::ofstream mf(tmp_meta);
+        if (!mf.is_open()) {
             unlink(tmp_bc.c_str());
             return "";
         }
-        meta << currentJITVersion() << "\n";
-        meta.close();
+        mf << currentJITVersion() << "\n";
+        mf << (meta.is_multi_node ? 1 : 0) << " "
+           << (meta.is_fused ? 1 : 0) << " "
+           << (meta.is_matmul ? 1 : 0) << " "
+           << meta.num_inputs << " "
+           << meta.M << " " << meta.K << " " << meta.N << " "
+           << meta.elem_n << " " << meta.scratch_size << " "
+           << meta.pool_buf_count << "\n";
+        mf << meta.fused_out_shape.size();
+        for (size_t d : meta.fused_out_shape) {
+            mf << " " << d;
+        }
+        mf << "\n";
+        mf.close();
     }
 
     // 原子 rename
@@ -355,9 +372,44 @@ std::string JITCache::store(const std::string& cache_key, llvm::Module& module) 
         return "";
     }
 
-    // [Dev] v0.5.2 (4) 1.0 store-only 计数器 (2026-08-09)
     stores_.fetch_add(1, std::memory_order_relaxed);
     return bc_path;
+}
+
+bool JITCache::loadMetadata(const std::string& cache_key, JITMetadata& meta) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    std::string dir = resolveCacheDir();
+    std::string meta_path = dir + "/c3_jit_" + cache_key + ".meta";
+
+    std::ifstream mf(meta_path);
+    if (!mf.is_open()) return false;
+
+    std::string ver;
+    if (!std::getline(mf, ver) || ver != currentJITVersion()) {
+        return false;
+    }
+    meta.version = ver;
+
+    int mn = 0, fu = 0, mm = 0;
+    if (!(mf >> mn >> fu >> mm
+             >> meta.num_inputs
+             >> meta.M >> meta.K >> meta.N
+             >> meta.elem_n >> meta.scratch_size
+             >> meta.pool_buf_count)) {
+        return false;
+    }
+    meta.is_multi_node = (mn != 0);
+    meta.is_fused = (fu != 0);
+    meta.is_matmul = (mm != 0);
+
+    size_t shape_sz = 0;
+    if (mf >> shape_sz) {
+        meta.fused_out_shape.resize(shape_sz);
+        for (size_t i = 0; i < shape_sz; ++i) {
+            mf >> meta.fused_out_shape[i];
+        }
+    }
+    return true;
 }
 
 // ======================= Load =======================
