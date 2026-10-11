@@ -37,6 +37,18 @@
 #include <cstring>
 #include <stdexcept>
 
+#if defined(__APPLE__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#include <Accelerate/Accelerate.h>
+#define C3_HAS_BLAS 1
+#elif defined(__has_include)
+#if __has_include(<cblas.h>)
+#include <cblas.h>
+#define C3_HAS_BLAS 1
+#endif
+#endif
+
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
@@ -296,6 +308,24 @@ public:
                 }
 
                 // Consumer: GEMM-1 (S_tile = Q @ K^T * scale_factor)
+#if defined(C3_HAS_BLAS)
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                            static_cast<int>(cur_br), static_cast<int>(cur_bc), static_cast<int>(d),
+                            scale_factor, q_quant, static_cast<int>(d),
+                            sK_buf[curr_buf], static_cast<int>(d),
+                            0.0f, S_tile, static_cast<int>(cur_bc));
+
+                if (cfg.is_causal && (c_end > r_start)) {
+                    for (size_t i = 0; i < cur_br; ++i) {
+                        const size_t row_idx = r_start + i;
+                        for (size_t j = 0; j < cur_bc; ++j) {
+                            if (c_start + j > row_idx) {
+                                S_tile[i * cur_bc + j] = -1.0e9f;
+                            }
+                        }
+                    }
+                }
+#else
                 for (size_t i = 0; i < cur_br; ++i) {
                     for (size_t j = 0; j < cur_bc; ++j) {
                         float dot = 0.0f;
@@ -324,6 +354,7 @@ public:
                         S_tile[i * cur_bc + j] = score;
                     }
                 }
+#endif
 
                 // Overlapped Online Softmax Rescaling
                 for (size_t i = 0; i < cur_br; ++i) {
@@ -371,6 +402,13 @@ public:
                 }
 
                 // Consumer: GEMM-2 (acc_O += P @ V)
+#if defined(C3_HAS_BLAS)
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            static_cast<int>(cur_br), static_cast<int>(d), static_cast<int>(cur_bc),
+                            1.0f, P_tile, static_cast<int>(cur_bc),
+                            sV_buf[curr_buf], static_cast<int>(d),
+                            1.0f, acc_O, static_cast<int>(d));
+#else
                 for (size_t i = 0; i < cur_br; ++i) {
                     for (size_t j = 0; j < cur_bc; ++j) {
                         float p_val = P_tile[i * cur_bc + j];
@@ -395,6 +433,7 @@ public:
 #endif
                     }
                 }
+#endif
             }
 
             // Normalization Epilogue: write out O
@@ -422,3 +461,7 @@ public:
 };
 
 } // namespace ct::c3
+
+#if defined(__APPLE__)
+#pragma clang diagnostic pop
+#endif

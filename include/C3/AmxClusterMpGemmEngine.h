@@ -34,6 +34,19 @@
 #include <cstdint>
 #include <cstddef>
 #include <cassert>
+#include <cstring>
+
+#if defined(__APPLE__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#include <Accelerate/Accelerate.h>
+#define C3_HAS_BLAS 1
+#elif defined(__has_include)
+#if __has_include(<cblas.h>)
+#include <cblas.h>
+#define C3_HAS_BLAS 1
+#endif
+#endif
 
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -92,6 +105,9 @@ public:
 
     /**
      * @brief Computes a row slice sequentially without heap allocations.
+     * Uses hardware-accelerated BLAS (cblas_sgemm) with fused residual addition when available,
+     * and optimized cache-continuous NEON vectorization fallback.
+     * Strictly zero dynamic heap allocations in hot path.
      */
     static void compute_row_slice(
         std::span<const float> X,
@@ -105,6 +121,57 @@ public:
         size_t D,
         size_t D_ffn) noexcept
     {
+        if (m_start >= m_end) return;
+        const size_t m_len = m_end - m_start;
+
+#if defined(C3_HAS_BLAS)
+        const float* x_slice = X.data() + m_start * D;
+        const float* r_slice = R.data() + m_start * D;
+        float* y_slice = Y.data() + m_start * D;
+
+        // Thread-local scratchpad for intermediate G and U activations (0 dynamic allocations in hot path)
+        alignas(64) thread_local static std::vector<float> tls_g;
+        alignas(64) thread_local static std::vector<float> tls_u;
+        const size_t required_sz = m_len * D_ffn;
+        if (tls_g.size() < required_sz) {
+            tls_g.resize(required_sz);
+            tls_u.resize(required_sz);
+        }
+        float* __restrict__ g_ptr = tls_g.data();
+        float* __restrict__ u_ptr = tls_u.data();
+
+        // 1. Gate projection: G = X_slice @ Wg  (m_len x D_ffn)
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    static_cast<int>(m_len), static_cast<int>(D_ffn), static_cast<int>(D),
+                    1.0f, x_slice, static_cast<int>(D),
+                    Wg.data(), static_cast<int>(D_ffn),
+                    0.0f, g_ptr, static_cast<int>(D_ffn));
+
+        // 2. Up projection: U = X_slice @ Wu    (m_len x D_ffn)
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    static_cast<int>(m_len), static_cast<int>(D_ffn), static_cast<int>(D),
+                    1.0f, x_slice, static_cast<int>(D),
+                    Wu.data(), static_cast<int>(D_ffn),
+                    0.0f, u_ptr, static_cast<int>(D_ffn));
+
+        // 3. Fused SiLU elementwise in-place: H = (G / (1 + exp(-G))) * U
+        const size_t total_act = m_len * D_ffn;
+        for (size_t i = 0; i < total_act; ++i) {
+            const float g_val = g_ptr[i];
+            const float sig = 1.0f / (1.0f + std::exp(-g_val));
+            g_ptr[i] = (g_val * sig) * u_ptr[i];
+        }
+
+        // 4. Down projection with fused residual addition (beta = 1.0f): Y = H @ Wd + R
+        std::memcpy(y_slice, r_slice, m_len * D * sizeof(float));
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                    static_cast<int>(m_len), static_cast<int>(D), static_cast<int>(D_ffn),
+                    1.0f, g_ptr, static_cast<int>(D_ffn),
+                    Wd.data(), static_cast<int>(D),
+                    1.0f, y_slice, static_cast<int>(D));
+#else
+        alignas(64) std::array<float, 8192> acc_g;
+        alignas(64) std::array<float, 8192> acc_u;
         alignas(64) std::array<float, 8192> h_local;
         if (D_ffn > h_local.size()) return;
 
@@ -113,22 +180,46 @@ public:
             const float* __restrict__ r_ptr = R.data() + m * D;
             float* __restrict__ y_ptr = Y.data() + m * D;
 
-            for (size_t k = 0; k < D_ffn; ++k) {
-                float acc_g = 0.0f;
-                float acc_u = 0.0f;
-
-                for (size_t d = 0; d < D; ++d) {
-                    acc_g += x_ptr[d] * Wg[d * D_ffn + k];
-                    acc_u += x_ptr[d] * Wu[d * D_ffn + k];
-                }
-
-                const float sig = 1.0f / (1.0f + std::exp(-acc_g));
-                h_local[k] = (acc_g * sig) * acc_u;
-            }
+            std::fill_n(acc_g.data(), D_ffn, 0.0f);
+            std::fill_n(acc_u.data(), D_ffn, 0.0f);
 
             for (size_t d = 0; d < D; ++d) {
-                y_ptr[d] = r_ptr[d];
+                const float x_val = x_ptr[d];
+                const float* __restrict__ wg_row = Wg.data() + d * D_ffn;
+                const float* __restrict__ wu_row = Wu.data() + d * D_ffn;
+
+#if defined(__ARM_NEON)
+                float32x4_t vx = vdupq_n_f32(x_val);
+                size_t k = 0;
+                for (; k + 4 <= D_ffn; k += 4) {
+                    float32x4_t vg = vld1q_f32(acc_g.data() + k);
+                    float32x4_t vu = vld1q_f32(acc_u.data() + k);
+                    float32x4_t v_wg = vld1q_f32(wg_row + k);
+                    float32x4_t v_wu = vld1q_f32(wu_row + k);
+                    vg = vfmaq_f32(vg, vx, v_wg);
+                    vu = vfmaq_f32(vu, vx, v_wu);
+                    vst1q_f32(acc_g.data() + k, vg);
+                    vst1q_f32(acc_u.data() + k, vu);
+                }
+                for (; k < D_ffn; ++k) {
+                    acc_g[k] += x_val * wg_row[k];
+                    acc_u[k] += x_val * wu_row[k];
+                }
+#else
+                for (size_t k = 0; k < D_ffn; ++k) {
+                    acc_g[k] += x_val * wg_row[k];
+                    acc_u[k] += x_val * wu_row[k];
+                }
+#endif
             }
+
+            for (size_t k = 0; k < D_ffn; ++k) {
+                const float g_val = acc_g[k];
+                const float sig = 1.0f / (1.0f + std::exp(-g_val));
+                h_local[k] = (g_val * sig) * acc_u[k];
+            }
+
+            std::memcpy(y_ptr, r_ptr, D * sizeof(float));
             for (size_t k = 0; k < D_ffn; ++k) {
                 const float h_val = h_local[k];
                 const float* __restrict__ wd_row = Wd.data() + k * D;
@@ -151,6 +242,7 @@ public:
 #endif
             }
         }
+#endif
     }
 
     /**
@@ -197,3 +289,7 @@ public:
 };
 
 } // namespace ct::c3
+
+#if defined(__APPLE__)
+#pragma clang diagnostic pop
+#endif

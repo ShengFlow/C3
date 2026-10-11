@@ -38,6 +38,18 @@
 #include <cstddef>
 #include <cassert>
 
+#if defined(__APPLE__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#include <Accelerate/Accelerate.h>
+#define C3_HAS_BLAS 1
+#elif defined(__has_include)
+#if __has_include(<cblas.h>)
+#include <cblas.h>
+#define C3_HAS_BLAS 1
+#endif
+#endif
+
 #if defined(__ARM_NEON)
 #include <arm_neon.h>
 #endif
@@ -176,6 +188,24 @@ public:
                 }
 
                 // Step 1: GEMM-1 (S_tile = Q_tile @ K_tile.T * scale)
+#if defined(C3_HAS_BLAS)
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                            static_cast<int>(cur_br), static_cast<int>(cur_bc), static_cast<int>(d),
+                            scale, Q.data() + r_start * d, static_cast<int>(d),
+                            K.data() + c_start * d, static_cast<int>(d),
+                            0.0f, S_tile.data(), static_cast<int>(Bc));
+
+                if (is_causal && (c_end > r_start)) {
+                    for (size_t i = 0; i < cur_br; ++i) {
+                        const size_t row_idx = r_start + i;
+                        for (size_t j = 0; j < cur_bc; ++j) {
+                            if (c_start + j > row_idx) {
+                                S_tile[i * Bc + j] = -1.0e9f;
+                            }
+                        }
+                    }
+                }
+#else
                 for (size_t i = 0; i < cur_br; ++i) {
                     const float* q_ptr = Q.data() + (r_start + i) * d;
                     for (size_t j = 0; j < cur_bc; ++j) {
@@ -206,6 +236,7 @@ public:
                         S_tile[i * Bc + j] = score;
                     }
                 }
+#endif
 
                 // Step 2: Online Softmax Rescaling
                 for (size_t i = 0; i < cur_br; ++i) {
@@ -252,6 +283,13 @@ public:
                 }
 
                 // Step 3: GEMM-2 (acc_O += P_tile @ V_tile)
+#if defined(C3_HAS_BLAS)
+                cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                            static_cast<int>(cur_br), static_cast<int>(d), static_cast<int>(cur_bc),
+                            1.0f, P_tile.data(), static_cast<int>(Bc),
+                            V.data() + c_start * d, static_cast<int>(d),
+                            1.0f, acc_O.data(), static_cast<int>(d));
+#else
                 for (size_t i = 0; i < cur_br; ++i) {
                     for (size_t j = 0; j < cur_bc; ++j) {
                         const float p_val = P_tile[i * Bc + j];
@@ -277,6 +315,7 @@ public:
 #endif
                     }
                 }
+#endif
             }
 
             // Epilogue: Vector division by normalizer and write out to O
@@ -305,3 +344,7 @@ public:
 };
 
 } // namespace ct::c3
+
+#if defined(__APPLE__)
+#pragma clang diagnostic pop
+#endif
