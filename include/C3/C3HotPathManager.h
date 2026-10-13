@@ -150,27 +150,33 @@ public:
         // 1. 设置关闭标志，阻止新任务提交
         shutting_down_.store(true, std::memory_order_release);
 
-        // 2. 取出所有待完成的 future
-        std::vector<std::future<void>> futures;
-        {
-            std::lock_guard<std::mutex> lk(futures_mutex_);
-            futures = std::move(pending_futures_);
-        }
-
-        // 3. 逐个等待，超时 30s（与 C3Engine/PGOManager 保持一致）
-        for (auto& f : futures) {
-            if (f.valid()) {
-                auto st = f.wait_for(std::chrono::seconds(30));
-                if (st == std::future_status::ready) {
-                    try { f.get(); } catch (...) {}
+        // 2. 循环排空所有待完成的 future，直到所有后台任务结束
+        while (true) {
+            std::vector<std::future<void>> futures;
+            {
+                std::lock_guard<std::mutex> lk(futures_mutex_);
+                if (pending_futures_.empty()) {
+                    if (pending_compiles_.load(std::memory_order_acquire) == 0) {
+                        break;
+                    }
                 } else {
-                    // 30s 超时仍未完成，静默放弃（避免阻塞退出）
-                    // 注意：超时后 future 被销毁但其线程可能仍在运行，
-                    // 这是已知的 trade-off —— 总比 detach 后完全失控好。
-                    CtorchError::log(ErrorLevel::WARN, ErrorPlatform::kGENERAL,
-                        ErrorType::UNKNOWN,
-                        "C3HotPathManager::shutdown: background compile did not finish in 30s, "
-                        "future abandoned (may cause UAF if main exits before thread finishes)");
+                    futures = std::move(pending_futures_);
+                }
+            }
+            if (futures.empty()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                continue;
+            }
+            for (auto& f : futures) {
+                if (f.valid()) {
+                    auto st = f.wait_for(std::chrono::seconds(30));
+                    if (st == std::future_status::ready) {
+                        try { f.get(); } catch (...) {}
+                    } else {
+                        CtorchError::log(ErrorLevel::WARN, ErrorPlatform::kGENERAL,
+                            ErrorType::UNKNOWN,
+                            "C3HotPathManager::shutdown: background compile did not finish in 30s");
+                    }
                 }
             }
         }

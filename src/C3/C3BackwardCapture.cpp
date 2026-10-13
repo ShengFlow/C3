@@ -1305,8 +1305,8 @@ C3BackwardCapture::BackwardGraph C3BackwardCapture::buildAddBackwardGraph(
     const TensorDesc& target = (input_index == 0) ? lhs_desc : rhs_desc;
     if (needsSumReduce(grad_desc.shape, target.shape)) {
         int axis = computeReduceAxis(grad_desc.shape, target.shape);
-        if (axis == -2) {
-            // [Fix §4.95 P2] 多轴广播 reduce 不支持 → 空图回退 eager
+        if (axis < 0) {
+            // [C2 修复] 全 reduce 或多轴广播 reduce 无法由单轴 SumReduce 安全表达 → 空图回退 eager
             return {Graph{}, {}};
         }
         size_t reduced = g.addNode(
@@ -1335,6 +1335,12 @@ C3BackwardCapture::BackwardGraph C3BackwardCapture::buildMulBackwardGraph(
     // DCE 无可剪，图输入顺序稳定，配合 fwd_input_map 精确喂入。
     // grad 输入始终是图输入 0；后续图输入按 fwd_input_map 对应 forward_inputs。
     size_t grad_in = g.addInput(grad_desc);
+
+    const TensorDesc& target = (input_index == 0) ? a_desc : b_desc;
+    if (needsSumReduce(grad_desc.shape, target.shape)) {
+        // [C1 修复] 广播乘法反向需要对广播维求和，JIT 图降级暂时不支持广播侧，回退 eager 保证梯度绝对正确
+        return {Graph{}, {}};
+    }
 
     if (input_index == 0) {
         // grad_a = grad * B → 只需 B，B 是 forward_inputs[1]
@@ -1455,6 +1461,12 @@ C3BackwardCapture::BackwardGraph C3BackwardCapture::buildDivBackwardGraph(
     // [Fix 2026-08-11 最小集 build] 只加实际用到的 forward 输入，DCE 无可剪。
     // grad 输入始终是图输入 0；后续图输入按 fwd_input_map 对应 forward_inputs。
     size_t grad_in = g.addInput(grad_desc);
+
+    const TensorDesc& target = (input_index == 0) ? a_desc : b_desc;
+    if (needsSumReduce(grad_desc.shape, target.shape)) {
+        // [C1 修复] 广播除法反向需要对广播维求和，回退 eager 保证梯度绝对正确
+        return {Graph{}, {}};
+    }
 
     if (input_index == 0) {
         // grad_a = grad / B → 只需 B（forward_inputs[1]）
@@ -2135,10 +2147,10 @@ int C3BackwardCapture::computeReduceAxis(
     const std::vector<size_t>& target_shape)
 {
     if (grad_shape == target_shape) return -1;
-    if (grad_shape.empty()) return -1;
-    if (target_shape.empty()) {
-        // 全 reduce
-        return -1;
+    if (grad_shape.empty()) return -2;
+    if (target_shape.empty() || target_shape == std::vector<size_t>{1}) {
+        // [C2 修复] 全 reduce 或标量目标：单轴 SumReduceNode 无法安全表达，返回 -2 回退 eager
+        return -2;
     }
 
     // 找到第一个维度不同的位置（从左边开始）

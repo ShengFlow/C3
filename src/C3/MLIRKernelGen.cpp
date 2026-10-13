@@ -1766,43 +1766,59 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
             mlir::Value fused_bias_ptr = nullptr;
             MatMulActivation fused_act = MatMulActivation::None;
             int64_t fused_skip = 0; // 跳过的后续节点数
-            size_t fused_bias_numel = 0; // DEBT-NEW-5: bias 张量元素数 (0=无 bias)
+            int64_t fused_bias_numel = 0; // bias 张量元素数 (0=无 bias, 负数=行广播, 正数=列广播/标量)
 
             // 检查下一个节点是否为 Add（偏置加法）
             if (ci + 1 < compute_nodes.size()) {
                 const Node* next_node = compute_nodes[ci + 1];
                 if (std::holds_alternative<AddNode>(next_node->op) &&
                     next_node->inputs.size() == 2 &&
-                    next_node->inputs[0] == node->id) {
-                    // 匹配：MatMul 的输出作为 Add 的第一个输入
-                    size_t bias_node_id = next_node->inputs[1];
-                    fused_bias_ptr = getInputPtr(bias_node_id);
-                    fused_skip = 1;
-                    // DEBT-NEW-5: 记录 bias 形状 numel, 供 epilogue 选择行/列广播索引
-                    fused_bias_numel = 1;
-                    for (size_t d : std::get<AddNode>(next_node->op).rhs_desc.shape)
-                        fused_bias_numel *= d;
+                    (next_node->inputs[0] == node->id || next_node->inputs[1] == node->id)) {
+                    bool mm_is_in0 = (next_node->inputs[0] == node->id);
+                    size_t bias_node_id = mm_is_in0 ? next_node->inputs[1] : next_node->inputs[0];
+                    const auto& add_op = std::get<AddNode>(next_node->op);
+                    const auto& bshape = mm_is_in0 ? add_op.rhs_desc.shape : add_op.lhs_desc.shape;
+                    size_t b_numel = mm_is_in0 ? add_op.rhs_desc.numel : add_op.lhs_desc.numel;
 
-                    // 检查再下一个节点是否为激活函数
-                    if (ci + 2 < compute_nodes.size()) {
-                        const Node* act_node = compute_nodes[ci + 2];
-                        if (act_node->inputs.size() == 1 &&
-                            act_node->inputs[0] == next_node->id) {
-                            if (std::holds_alternative<ReLUNode>(act_node->op)) {
-                                fused_act = MatMulActivation::ReLU;
-                                fused_skip = 2;
-                            } else if (std::holds_alternative<SigmoidNode>(act_node->op)) {
-                                fused_act = MatMulActivation::Sigmoid;
-                                fused_skip = 2;
-                            } else if (std::holds_alternative<TanhNode>(act_node->op)) {
-                                fused_act = MatMulActivation::Tanh;
-                                fused_skip = 2;
-                            } else if (std::holds_alternative<SiLUNode>(act_node->op)) {
-                                fused_act = MatMulActivation::SiLU;
-                                fused_skip = 2;
+                    // [D6 修复] 仅当 Add 为合法的 1D/标量偏置广播时才融合为 epilogue；
+                    // 若为 [M, N] 全矩阵残差加法 (M>1, N>1)，绝不融为 1D 偏置，防止越界或截断。
+                    bool is_scalar = (b_numel == 1);
+                    bool is_col_broadcast = (b_numel == (size_t)matN && (bshape.size() <= 1 || (bshape.size() == 2 && bshape[0] == 1)));
+                    bool is_row_broadcast = (b_numel == (size_t)matM && bshape.size() == 2 && bshape[1] == 1 && matM != 1);
+
+                    if (is_scalar || is_col_broadcast || is_row_broadcast) {
+                        fused_bias_ptr = getInputPtr(bias_node_id);
+                        fused_skip = 1;
+                        if (is_row_broadcast) {
+                            fused_bias_numel = -matM; // 负数编码行广播
+                        } else if (is_scalar) {
+                            fused_bias_numel = 1;
+                        } else {
+                            fused_bias_numel = matN; // 正数编码列广播
+                        }
+
+                        // 检查再下一个节点是否为激活函数
+                        if (ci + 2 < compute_nodes.size()) {
+                            const Node* act_node = compute_nodes[ci + 2];
+                            if (act_node->inputs.size() == 1 &&
+                                act_node->inputs[0] == next_node->id) {
+                                if (std::holds_alternative<ReLUNode>(act_node->op)) {
+                                    fused_act = MatMulActivation::ReLU;
+                                    fused_skip = 2;
+                                } else if (std::holds_alternative<SigmoidNode>(act_node->op)) {
+                                    fused_act = MatMulActivation::Sigmoid;
+                                    fused_skip = 2;
+                                } else if (std::holds_alternative<TanhNode>(act_node->op)) {
+                                    fused_act = MatMulActivation::Tanh;
+                                    fused_skip = 2;
+                                } else if (std::holds_alternative<SiLUNode>(act_node->op)) {
+                                    fused_act = MatMulActivation::SiLU;
+                                    fused_skip = 2;
+                                }
                             }
                         }
                     }
+                }
 
                     // 当融合发生时，计算正确的输出 buffer（使用最后一个融合节点的 buffer）
                     if (fused_skip > 0) {
@@ -1824,7 +1840,6 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
                         }
                     }
                 }
-            }
 
             // === 创建 c3.matmul op（JIT 3.0 三 op 收口 2026-08-15）===
             // 策略选择（small_inline / tiled / cblas）下沉到 MatMulOpLowering，

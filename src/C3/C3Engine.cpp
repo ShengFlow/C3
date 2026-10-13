@@ -442,11 +442,19 @@ public:
                 }));
             }
             
-            // [Fix 2026-09-10 §4.95 P1-07] 等待并传播 worker 异常:
-            // 此前只 f.wait() 不 f.get(), func_ 抛异常时被静默存入 future,
-            // 输出 buffer 未写完即返回垃圾数据。get() 会把首个异常抛给调用方。
+            // 等待并传播 worker 异常（确保收割全部 future，防止后台线程写已释放输出）
+            std::exception_ptr first_ex = nullptr;
             for (auto& f : futures) {
-                f.get();
+                try {
+                    f.get();
+                } catch (...) {
+                    if (!first_ex) {
+                        first_ex = std::current_exception();
+                    }
+                }
+            }
+            if (first_ex) {
+                std::rethrow_exception(first_ex);
             }
         } else {
             // 单核串行执行路径 (包括小张量或 MatMul)

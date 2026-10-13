@@ -242,32 +242,37 @@ void PGOCompiledKernel::triggerCompilationChain() {
         return;
     }
     if (!pgo.canAcceptCompilation()) {
-        // 编译队列背压触发：将任务推入优先级队列，按热度评分排序
-        double heat = computeHeatScore();
-        std::string desc = "PGO: " + cache_key_;
-
-        // 创建编译任务 lambda
-        auto compile_task = [self, &pgo]() {
-            pgo.notifyCompilationStarted();
-            self->compileO2();
-            self->compileOfast();
-            pgo.notifyCompilationCompleted();
-        };
-
-        // 推入优先级队列
-        {
-            std::lock_guard<std::mutex> lock(pgo.queue_mutex());
-            pgo.task_queue().push(CompilationTask{
-                heat, std::move(compile_task),
-                std::chrono::steady_clock::now(), std::move(desc)
-            });
-        }
-
         // 记录背压拒绝
         pgo.recordQueueRejection();
 
-        // 下次调用时尝试从队列中取出
-        compilation_triggered_.store(false, std::memory_order_release);
+        // [F4 修复] 检查队列长度（Anti-Windup 背压）：如果队列未满，才推入优先级队列
+        bool pushed = false;
+        {
+            std::lock_guard<std::mutex> lock(pgo.queue_mutex());
+            if (pgo.task_queue().size() < pgo.config().queue_backpressure_threshold) {
+                double heat = computeHeatScore();
+                std::string desc = "PGO: " + cache_key_;
+
+                // 创建编译任务 lambda
+                auto compile_task = [self, &pgo]() {
+                    pgo.notifyCompilationStarted();
+                    self->compileO2();
+                    self->compileOfast();
+                    pgo.notifyCompilationCompleted();
+                };
+
+                pgo.task_queue().push(CompilationTask{
+                    heat, std::move(compile_task),
+                    std::chrono::steady_clock::now(), std::move(desc)
+                });
+                pushed = true;
+            }
+        }
+
+        // 队列未满入队时允许未来再次调度；队列已满时保持 compilation_triggered_ 为 true，防止每次调用无限重复压入
+        if (pushed) {
+            compilation_triggered_.store(false, std::memory_order_release);
+        }
         return;
     }
 
@@ -684,22 +689,30 @@ void PGOManager::notifyCompilationCompleted() {
 }
 
 void PGOManager::processQueue() {
-    CompilationTask task;
-    {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        if (task_queue_.empty()) return;
-        task = std::move(const_cast<CompilationTask&>(task_queue_.top()));
-        task_queue_.pop();
-    }
+    // [F4 修复] 避免重入和调用者栈递归（task.task() 内部会再次触发 notifyCompilationCompleted -> processQueue）
+    static thread_local bool in_process = false;
+    if (in_process) return;
+    in_process = true;
 
-    // 执行编译任务（在当前线程中，不额外启动新线程）
-    try {
-        if (task.task) {
-            task.task();
+    while (active_compilations_.load(std::memory_order_acquire) < config_.max_concurrent_compilations) {
+        CompilationTask task;
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            if (task_queue_.empty()) break;
+            task = std::move(const_cast<CompilationTask&>(task_queue_.top()));
+            task_queue_.pop();
         }
-    } catch (const std::exception&) {
-        // 队列任务执行失败，静默处理
+
+        // 执行编译任务（在当前线程中，不额外启动新线程）
+        try {
+            if (task.task) {
+                task.task();
+            }
+        } catch (const std::exception&) {
+            // 队列任务执行失败，静默处理
+        }
     }
+    in_process = false;
 }
 
 PGOManager::Stats PGOManager::getStats() const {

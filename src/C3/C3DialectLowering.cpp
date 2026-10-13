@@ -148,7 +148,7 @@ static void buildSmallMatMul(mlir::OpBuilder& builder, mlir::Location loc,
                              mlir::Value preAct,   // [Prewalk A] 可选 pre-activation 输出（可为 nullptr）
                              size_t M, size_t K, size_t N,
                              int transA, int transB, int act,
-                             size_t bias_numel) {
+                             int64_t bias_numel) {
     auto f32 = builder.getF32Type();
     auto ptr_type = mlir::LLVM::LLVMPointerType::get(builder.getContext());
     mlir::Value c1_i64 = builder.create<mlir::arith::ConstantIntOp>(loc, 1, 64);
@@ -176,10 +176,12 @@ static void buildSmallMatMul(mlir::OpBuilder& builder, mlir::Location loc,
 
     mlir::Value init_val = builder.create<mlir::arith::ConstantOp>(loc, builder.getF32FloatAttr(0.0f));
     if (bias) {
+        bool is_row_broadcast = (bias_numel < 0);
+        int64_t actual_bias_numel = is_row_broadcast ? -bias_numel : bias_numel;
         mlir::Value bias_idx = j_i64;
-        if (bias_numel == M) {
+        if (is_row_broadcast) {
             bias_idx = i_i64;
-        } else if (bias_numel == 1) {
+        } else if (actual_bias_numel == 1) {
             bias_idx = builder.create<mlir::arith::ConstantIntOp>(loc, 0, 64);
         }
         mlir::Value bias_ptr = builder.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, bias, mlir::ValueRange{bias_idx});
@@ -904,10 +906,11 @@ struct MatMulOpLowering : public mlir::OpRewritePattern<mlir::c3::MatMulOp> {
                 mlir::Value i_i64 = indexToI64(b, loc, i_idx);
                 mlir::Value row_base = b.create<mlir::arith::MulIOp>(loc, i_i64, N_i64);
 
-                // 仅当 bias_numel == M (按行广播) 时才需要 row-specific bias_idx
-                // bias_numel == N 时每行 bias 都是 [0..N)，bias_numel == 1 都是 0，可在 inner 内直接算
+                // [D6 修复] bias_numel < 0 编码行广播，> 0 编码列广播/标量，彻底解决 M==N 歧义
+                bool is_row_broadcast = (bias_numel < 0);
+                int64_t actual_bias_numel = is_row_broadcast ? -bias_numel : bias_numel;
                 mlir::Value bias_row_idx;
-                if (bias && bias_numel == M) bias_row_idx = i_i64;
+                if (bias && is_row_broadcast) bias_row_idx = i_i64;
 
                 auto vec_body = [&](mlir::OpBuilder& vb, mlir::Location vloc, mlir::Value col_base_i64) {
                     mlir::Value out_row_off = vb.create<mlir::arith::AddIOp>(vloc, row_base, col_base_i64);
@@ -916,18 +919,18 @@ struct MatMulOpLowering : public mlir::OpRewritePattern<mlir::c3::MatMulOp> {
 
                     if (bias) {
                         mlir::Value b_vec;
-                        if (bias_numel == M) {
+                        if (is_row_broadcast) {
                             // row broadcast: 同一块 bias_val 广播 VL 次（undef+insertelement splat, 与 MLIRKernelGen 一致）
                             mlir::Value bias_ptr = vb.create<mlir::LLVM::GEPOp>(vloc, ptr_type, f32, bias, mlir::ValueRange{bias_row_idx});
                             mlir::Value b_s = vb.create<mlir::LLVM::LoadOp>(vloc, f32, bias_ptr);
                             b_vec = buildScalarSplatVec(vb, vloc, b_s, vec_ty);
-                        } else if (bias_numel == 1) {
+                        } else if (actual_bias_numel == 1) {
                             mlir::Value bias_0 = vb.create<mlir::arith::ConstantIntOp>(vloc, 0, 64);
                             mlir::Value bias_ptr = vb.create<mlir::LLVM::GEPOp>(vloc, ptr_type, f32, bias, mlir::ValueRange{bias_0});
                             mlir::Value b_s = vb.create<mlir::LLVM::LoadOp>(vloc, f32, bias_ptr);
                             b_vec = buildScalarSplatVec(vb, vloc, b_s, vec_ty);
                         } else {
-                            // bias_numel == N (按列广播，最常见): bias[col..col+VL-1] 连续 VL 个 LD
+                            // actual_bias_numel == N (按列广播，最常见): bias[col..col+VL-1] 连续 VL 个 LD
                             mlir::Value bias_ptr = vb.create<mlir::LLVM::GEPOp>(vloc, ptr_type, f32, bias, mlir::ValueRange{col_base_i64});
                             b_vec = createVectorLoad(vb, vloc, vec_ty, bias_ptr);
                         }
@@ -983,8 +986,8 @@ struct MatMulOpLowering : public mlir::OpRewritePattern<mlir::c3::MatMulOp> {
                     mlir::Value val = sb.create<mlir::LLVM::LoadOp>(sloc, f32, out_cell_ptr);
                     if (bias) {
                         mlir::Value bias_idx = j_i64;
-                        if (bias_numel == M) bias_idx = bias_row_idx;
-                        else if (bias_numel == 1) bias_idx = sb.create<mlir::arith::ConstantIntOp>(sloc, 0, 64);
+                        if (is_row_broadcast) bias_idx = bias_row_idx;
+                        else if (actual_bias_numel == 1) bias_idx = sb.create<mlir::arith::ConstantIntOp>(sloc, 0, 64);
                         mlir::Value bias_ptr = sb.create<mlir::LLVM::GEPOp>(sloc, ptr_type, f32, bias, mlir::ValueRange{bias_idx});
                         mlir::Value bias_val = sb.create<mlir::LLVM::LoadOp>(sloc, f32, bias_ptr);
                         val = sb.create<mlir::arith::AddFOp>(sloc, val, bias_val);
@@ -1036,7 +1039,7 @@ struct MatMulOpLowering : public mlir::OpRewritePattern<mlir::c3::MatMulOp> {
         if (fallback_to_small) {
             buildSmallMatMul(rewriter, loc, lhs, rhs, out, bias, preAct,
                              (size_t)M, (size_t)K, (size_t)N,
-                             transA, transB, act, (size_t)bias_numel);
+                             transA, transB, act, bias_numel);
         }
 
         rewriter.eraseOp(op);
