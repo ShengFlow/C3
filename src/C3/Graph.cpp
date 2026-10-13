@@ -891,6 +891,42 @@ bool Graph::isValid() const {
 
 // ======================= 调试输出 =======================
 
+static void serializeNodeOp(std::ostringstream& ss, const NodeVariant& op) {
+    std::visit([&ss](const auto& n) {
+        using T = std::decay_t<decltype(n)>;
+        if constexpr (std::is_same_v<T, SumReduceNode>) {
+            ss << "SumReduce(axis=" << n.axis << ",keepdim=" << (n.keepdim ? "1" : "0") << ")";
+        } else if constexpr (std::is_same_v<T, SoftmaxNode>) {
+            ss << "Softmax(axis=" << n.axis << ")";
+        } else if constexpr (std::is_same_v<T, TransposeNode>) {
+            ss << "Transpose(dim0=" << n.dim0 << ",dim1=" << n.dim1 << ")";
+        } else if constexpr (std::is_same_v<T, ConstNode>) {
+            ss << "Const(" << n.value << ")";
+        } else if constexpr (std::is_same_v<T, FusedNode>) {
+            ss << "Fused(";
+            for (size_t j = 0; j < n.ops.size(); ++j) {
+                if (j > 0) ss << " -> ";
+                serializeNodeOp(ss, n.ops[j]);
+            }
+            ss << ")";
+            if (!n.arg_descs.empty()) {
+                ss << " args:[";
+                for (size_t j = 0; j < n.arg_descs.size(); ++j) {
+                    if (j > 0) ss << ",";
+                    for (size_t k = 0; k < n.arg_descs[j].shape.size(); ++k) {
+                        if (k > 0) ss << "x";
+                        ss << n.arg_descs[j].shape[k];
+                    }
+                    ss << ":dt" << static_cast<int>(n.arg_descs[j].dtype);
+                }
+                ss << "]";
+            }
+        } else {
+            ss << T::name;
+        }
+    }, op);
+}
+
 std::string Graph::toString() const {
     std::ostringstream ss;
     ss << "Graph (" << nodes_.size() << " nodes, "
@@ -906,32 +942,7 @@ std::string Graph::toString() const {
         ss << "  [" << i << "] ";
         if (is_input) ss << "INPUT ";
 
-        if (std::holds_alternative<FusedNode>(node.op)) {
-            const auto& fnode = std::get<FusedNode>(node.op);
-            ss << "Fused(";
-            for (size_t j = 0; j < fnode.ops.size(); ++j) {
-                if (j > 0) ss << " -> ";
-                ss << nodeName(fnode.ops[j]);
-            }
-            ss << ")";
-            // 添加 arg_descs 形状到 cache key，确保不同形状的融合图区分
-            if (!fnode.arg_descs.empty()) {
-                ss << " args:[";
-                for (size_t j = 0; j < fnode.arg_descs.size(); ++j) {
-                    if (j > 0) ss << ",";
-                    for (size_t k = 0; k < fnode.arg_descs[j].shape.size(); ++k) {
-                        if (k > 0) ss << "x";
-                        ss << fnode.arg_descs[j].shape[k];
-                    }
-                }
-                ss << "]";
-            }
-        } else if (std::holds_alternative<ConstNode>(node.op)) {
-            auto cn = std::get<ConstNode>(node.op);
-            ss << "Const(" << cn.value << ")";
-        } else {
-            ss << nodeName(node.op);
-        }
+        serializeNodeOp(ss, node.op);
 
         if (!node.inputs.empty()) {
             ss << " (";
@@ -953,6 +964,7 @@ std::string Graph::toString() const {
             }
             ss << "]";
         }
+        ss << ":dt" << static_cast<int>(node.out_desc.dtype);
 
         if (is_output) ss << " *OUTPUT*";
         ss << "\n";

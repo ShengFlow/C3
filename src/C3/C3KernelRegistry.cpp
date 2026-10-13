@@ -104,7 +104,7 @@ std::optional<Tensor> C3KernelRegistry::tryExecute(
     const uint64_t fast_hash = computeFastHash(op_type, a.device(), a.shape(), b.shape());
 
     // [P2 极速分发] Step 1: L1 无锁快速路径 (< 10ns，零互斥锁争用)
-    CompiledKernel* fast_kernel = lookupFast(fast_hash);
+    std::shared_ptr<CompiledKernel> fast_kernel = lookupFast(fast_hash);
     if (fast_kernel) {
         try {
 #ifdef CT_PROFILE_PERF
@@ -129,6 +129,7 @@ std::optional<Tensor> C3KernelRegistry::tryExecute(
     // Step 2: L2 回退路径（加锁查找完整 entries_ 注册表）
     auto key = makeKeyFromShapes(op_type, a.device(), a.shape(), b.shape());
 
+    const uint64_t epoch = registry_epoch_.load(std::memory_order_acquire);
     C3Entry entry;
     bool found = false;
     {
@@ -178,7 +179,9 @@ std::optional<Tensor> C3KernelRegistry::tryExecute(
         }
 
         // [P2 极速分发] L2 命中后原子回填 L1 极速槽位，后续同形状调度直通 L1
-        installFast(fast_hash, entry.kernel.get());
+        if (registry_epoch_.load(std::memory_order_acquire) == epoch) {
+            installFast(fast_hash, entry.kernel);
+        }
 
 #ifdef CT_DEBUG
         {
@@ -208,7 +211,7 @@ std::optional<Tensor> C3KernelRegistry::tryExecuteUnary(op op_type, const Tensor
     const uint64_t fast_hash = computeFastHash(op_type, a.device(), a.shape(), {});
 
     // [P2 极速分发] Step 1: L1 无锁快速路径 (< 10ns，零互斥锁争用)
-    CompiledKernel* fast_kernel = lookupFast(fast_hash);
+    std::shared_ptr<CompiledKernel> fast_kernel = lookupFast(fast_hash);
     if (fast_kernel) {
         try {
             std::vector<Tensor> inputs = {a};
@@ -225,6 +228,7 @@ std::optional<Tensor> C3KernelRegistry::tryExecuteUnary(op op_type, const Tensor
     // Step 2: L2 回退路径（加锁查找完整 entries_ 注册表）
     auto key = makeKeyFromShapes(op_type, a.device(), a.shape(), {});
 
+    const uint64_t epoch = registry_epoch_.load(std::memory_order_acquire);
     C3Entry entry;
     bool found = false;
     {
@@ -265,7 +269,9 @@ std::optional<Tensor> C3KernelRegistry::tryExecuteUnary(op op_type, const Tensor
         }
 
         // [P2 极速分发] L2 命中后原子回填 L1 极速槽位，后续同形状调度直通 L1
-        installFast(fast_hash, entry.kernel.get());
+        if (registry_epoch_.load(std::memory_order_acquire) == epoch) {
+            installFast(fast_hash, entry.kernel);
+        }
 
         return out;
     } catch (...) {
@@ -484,17 +490,17 @@ void C3KernelRegistry::install(op op_type, DeviceType dev,
             return;
         }
     }
-    CompiledKernel* raw_k = kernel.get();
     C3Entry e;
-    e.kernel = std::move(kernel);
+    e.kernel = kernel;
     e.shapes = shapes;
     e.active = true;
-    entries_[key] = std::move(e);
+    entries_[key] = e;
     install_count_.fetch_add(1, std::memory_order_release);
+    registry_epoch_.fetch_add(1, std::memory_order_release);
 
     // [P2 极速分发] 同步更新到 L1 极速槽位 (< 10ns)
     const uint64_t fast_hash = computeFastHash(op_type, dev, shapes.lhs_shape, shapes.rhs_shape);
-    installFast(fast_hash, raw_k);
+    installFast(fast_hash, e.kernel);
 #ifdef CT_DEBUG
     fprintf(stderr, "[DBG] INSTALL op=%d dev=%d key3=%zu lhs=[%s] rhs=[%s]\n",
             (int)op_type, (int)dev, key.third,

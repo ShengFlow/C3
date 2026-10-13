@@ -66,7 +66,7 @@ const char* JITCache::currentJITVersion() {
     //   - "neon" / "avx2" / "avx512" : 指令集
     // 字段变化 → key 变化 → 旧 cache 自动失效（不需要额外清理）
     static const std::string v = []() {
-        std::string s = "jit_v2";
+        std::string s = "jit_v3";
 #if defined(__APPLE__)
         s += "_macos";
 #elif defined(__linux__)

@@ -166,13 +166,15 @@ public:
 #endif
     }
 
-    // ======================= L1 无锁快速分发缓存 (Sub-10ns Seqlock) =======================
+    // ======================= L1 无锁快速分发缓存 (Versioned Seqlock) =======================
     static constexpr size_t kFastTableSize = 2048; // 2^11
     static constexpr size_t kFastMask = kFastTableSize - 1;
 
     struct alignas(64) FastSlot {
+        std::atomic<uint32_t> seq{0}; // 偶数表示稳定，奇数表示正在更新
+        uint32_t padding{0};
         std::atomic<uint64_t> signature_hash{0};
-        std::atomic<CompiledKernel*> kernel_ptr{nullptr};
+        std::shared_ptr<CompiledKernel> kernel{nullptr};
     };
 
     static inline uint64_t computeFastHash(op op_type, DeviceType dev,
@@ -192,34 +194,67 @@ public:
         return (h == 0) ? 1 : h;
     }
 
-    [[nodiscard]] inline CompiledKernel* lookupFast(uint64_t sig_hash) const noexcept {
+    [[nodiscard]] inline std::shared_ptr<CompiledKernel> lookupFast(uint64_t sig_hash) const noexcept {
         if (sig_hash == 0) return nullptr;
         const size_t idx = sig_hash & kFastMask;
         const auto& slot = fast_slots_[idx];
-        uint64_t h1 = slot.signature_hash.load(std::memory_order_acquire);
-        if (h1 == sig_hash) {
-            auto* k = slot.kernel_ptr.load(std::memory_order_acquire);
-            uint64_t h2 = slot.signature_hash.load(std::memory_order_acquire);
-            if (h2 == sig_hash) {
-                return k;
-            }
+
+        uint32_t s1 = slot.seq.load(std::memory_order_acquire);
+        if (s1 & 1) return nullptr; // 正在被后台写，安全回退 L2
+
+        if (slot.signature_hash.load(std::memory_order_relaxed) != sig_hash) {
+            return nullptr;
         }
-        return nullptr;
+
+        auto k = std::atomic_load_explicit(&slot.kernel, std::memory_order_acquire);
+
+        uint32_t s2 = slot.seq.load(std::memory_order_acquire);
+        if (s1 != s2 || slot.signature_hash.load(std::memory_order_relaxed) != sig_hash) {
+            return nullptr; // 发生 ABA / 冲突更新，放弃快表直接回退 L2
+        }
+        return k;
     }
 
-    inline void installFast(uint64_t sig_hash, CompiledKernel* kernel) noexcept {
+    inline void installFast(uint64_t sig_hash, std::shared_ptr<CompiledKernel> kernel) noexcept {
         if (sig_hash == 0 || !kernel) return;
         const size_t idx = sig_hash & kFastMask;
         auto& slot = fast_slots_[idx];
-        slot.signature_hash.store(0, std::memory_order_release);
-        slot.kernel_ptr.store(kernel, std::memory_order_release);
+
+        uint32_t expected = slot.seq.load(std::memory_order_relaxed);
+        while (true) {
+            while (expected & 1) {
+                expected = slot.seq.load(std::memory_order_relaxed);
+            }
+            if (slot.seq.compare_exchange_weak(expected, expected + 1,
+                                               std::memory_order_acquire,
+                                               std::memory_order_relaxed)) {
+                break;
+            }
+        }
+
+        slot.signature_hash.store(0, std::memory_order_relaxed);
+        std::atomic_store_explicit(&slot.kernel, std::move(kernel), std::memory_order_release);
         slot.signature_hash.store(sig_hash, std::memory_order_release);
+        slot.seq.store(expected + 2, std::memory_order_release);
     }
 
     inline void clearFastSlots() noexcept {
         for (size_t i = 0; i < kFastTableSize; ++i) {
-            fast_slots_[i].signature_hash.store(0, std::memory_order_release);
-            fast_slots_[i].kernel_ptr.store(nullptr, std::memory_order_release);
+            auto& slot = fast_slots_[i];
+            uint32_t expected = slot.seq.load(std::memory_order_relaxed);
+            while (true) {
+                while (expected & 1) {
+                    expected = slot.seq.load(std::memory_order_relaxed);
+                }
+                if (slot.seq.compare_exchange_weak(expected, expected + 1,
+                                                   std::memory_order_acquire,
+                                                   std::memory_order_relaxed)) {
+                    break;
+                }
+            }
+            slot.signature_hash.store(0, std::memory_order_relaxed);
+            std::atomic_store_explicit(&slot.kernel, std::shared_ptr<CompiledKernel>{nullptr}, std::memory_order_release);
+            slot.seq.store(expected + 2, std::memory_order_release);
         }
     }
 
@@ -241,6 +276,7 @@ public:
         }
         if (removed > 0) {
             uninstall_count_.fetch_add(removed, std::memory_order_release);
+            registry_epoch_.fetch_add(1, std::memory_order_release);
             clearFastSlots();
         }
     }
@@ -258,6 +294,7 @@ public:
         // 调用方应在 main() 返回前调用本方法，参见 C3Engine.h 退出序列文档。
         fused_entries_.clear();
         backward_entries_.clear();
+        registry_epoch_.fetch_add(1, std::memory_order_release);
         clearFastSlots();
     }
 
@@ -671,6 +708,9 @@ private:
     // [MIMO 深挖] backward::tryExecuteBackward 阶段耗时累加器（relaxed，低成本）
     std::atomic<uint64_t> bw_dispatch_ns_{0};  ///< 查表/校验/组装（不含 kernel 执行）
     std::atomic<uint64_t> bw_exec_ns_{0};      ///< entry.kernel->execute()
+
+    // 注册表代数，用于检测 uninstall 与 L1 回填之间的并发竞争
+    std::atomic<uint64_t> registry_epoch_{0};
 
     std::array<FastSlot, kFastTableSize> fast_slots_{};
 };
