@@ -404,9 +404,14 @@ bool JITCache::loadMetadata(const std::string& cache_key, JITMetadata& meta) {
 
     size_t shape_sz = 0;
     if (mf >> shape_sz) {
+        if (shape_sz > 16) {
+            return false; // 元数据损坏防御（最大合理张量秩限制）
+        }
         meta.fused_out_shape.resize(shape_sz);
         for (size_t i = 0; i < shape_sz; ++i) {
-            mf >> meta.fused_out_shape[i];
+            if (!(mf >> meta.fused_out_shape[i])) {
+                return false;
+            }
         }
     }
     return true;

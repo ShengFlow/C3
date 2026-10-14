@@ -94,7 +94,7 @@ bool MachineFingerprint::loaded() const {
     return loaded_;
 }
 
-const FingerprintData& MachineFingerprint::data() const {
+FingerprintData MachineFingerprint::data() const {
     std::lock_guard<std::mutex> lk(mutex_);
     return data_;
 }

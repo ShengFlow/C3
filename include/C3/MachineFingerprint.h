@@ -47,7 +47,7 @@ public:
     /// 当前是否已成功加载过一份指纹。
     bool loaded() const;
 
-    const FingerprintData& data() const;
+    FingerprintData data() const;
 
     /// O(1): launch 税等价字节(未校准回退 400KB 保守默认)
     uint64_t launchUnitBytes() const;
