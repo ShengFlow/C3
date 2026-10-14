@@ -730,7 +730,26 @@ struct SumReduceOpLowering : public mlir::OpRewritePattern<mlir::c3::SumReduceOp
         auto f32 = rewriter.getF32Type();
         auto ptr_type = mlir::LLVM::LLVMPointerType::get(rewriter.getContext());
 
-        if (axis == 0) {
+        if (axis == -1) {
+            // [方向二 2026-10-14 苏璃珞] 全量归约求和: 将整个输入 [M*N] 累加到标量 out[0]
+            mlir::Value c0 = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 0);
+            mlir::Value c1 = rewriter.create<mlir::arith::ConstantIndexOp>(loc, 1);
+            int64_t total = M * N;
+            mlir::Value total_v = rewriter.create<mlir::arith::ConstantIndexOp>(loc, total);
+            auto mk_zero = rewriter.create<mlir::arith::ConstantOp>(loc, rewriter.getF32FloatAttr(0.0f));
+            auto out_zero_ptr = rewriter.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, out,
+                mlir::ValueRange{rewriter.create<mlir::arith::ConstantIntOp>(loc, 0, 64)});
+            rewriter.create<mlir::LLVM::StoreOp>(loc, mk_zero, out_zero_ptr);
+            auto loop = rewriter.create<mlir::scf::ForOp>(loc, c0, total_v, c1);
+            rewriter.setInsertionPointToStart(loop.getBody());
+            auto k_idx = indexToI64(rewriter, loc, loop.getInductionVar());
+            auto in_ptr = rewriter.create<mlir::LLVM::GEPOp>(loc, ptr_type, f32, input, mlir::ValueRange{k_idx});
+            auto val = rewriter.create<mlir::LLVM::LoadOp>(loc, f32, in_ptr);
+            auto old_sum = rewriter.create<mlir::LLVM::LoadOp>(loc, f32, out_zero_ptr);
+            auto new_sum = rewriter.create<mlir::arith::AddFOp>(loc, old_sum, val);
+            rewriter.create<mlir::LLVM::StoreOp>(loc, new_sum, out_zero_ptr);
+            rewriter.setInsertionPointAfter(loop);
+        } else if (axis == 0) {
             // [MIMO epilogue 优化] 原实现「外 j 内 i」：input[i*N+j] 沿 i 跨 N*4=1KB stride，
             // cache 极差 + 标量。改为「外 i 内 j」行优先：input 行连续读、out 连续累积，
             // LLVM 可向量化内层 for-j。同一列 j 的累加仍按 i 升序，浮点次序不变，数值等价。

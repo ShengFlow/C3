@@ -1912,8 +1912,18 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildMultiNodeMLIR(
             builder.create<mlir::c3::LogOp>(loc, in_ptrs[0], out_buf, node_n);
         } else if (std::holds_alternative<SumReduceNode>(op)) {
             const auto& sr = std::get<SumReduceNode>(op);
-            int64_t M = sr.in_desc.shape.size() > 0 ? sr.in_desc.shape[0] : 1;
-            int64_t N = sr.in_desc.shape.size() > 1 ? sr.in_desc.shape[1] : 1;
+            int64_t M = 1;
+            int64_t N = 1;
+            if (sr.axis == -1) {
+                M = 1;
+                N = sr.in_desc.numel;
+            } else if (sr.in_desc.shape.size() == 1) {
+                M = sr.in_desc.shape[0];
+                N = 1;
+            } else {
+                M = sr.in_desc.shape.size() > 0 ? sr.in_desc.shape[0] : 1;
+                N = sr.in_desc.shape.size() > 1 ? sr.in_desc.shape[1] : 1;
+            }
             builder.create<mlir::c3::SumReduceOp>(loc, in_ptrs[0], out_buf, M, N, sr.axis, sr.keepdim);
         } else if (std::holds_alternative<SoftmaxNode>(op)) {
             // [P0.2 2026-08-30 苏璃珞] Softmax forward kernel generation
@@ -2345,8 +2355,18 @@ mlir::OwningOpRef<mlir::ModuleOp> buildMLIRModule(
         }
         else if (std::holds_alternative<SumReduceNode>(op)) {
             const auto& sr = std::get<SumReduceNode>(op);
-            int64_t M = sr.in_desc.shape.size() > 0 ? sr.in_desc.shape[0] : 1;
-            int64_t N = sr.in_desc.shape.size() > 1 ? sr.in_desc.shape[1] : 1;
+            int64_t M = 1;
+            int64_t N = 1;
+            if (sr.axis == -1) {
+                M = 1;
+                N = sr.in_desc.numel;
+            } else if (sr.in_desc.shape.size() == 1) {
+                M = sr.in_desc.shape[0];
+                N = 1;
+            } else {
+                M = sr.in_desc.shape.size() > 0 ? sr.in_desc.shape[0] : 1;
+                N = sr.in_desc.shape.size() > 1 ? sr.in_desc.shape[1] : 1;
+            }
             builder.create<mlir::c3::SumReduceOp>(loc, a, out, M, N, sr.axis, sr.keepdim);
         }
         else if (std::holds_alternative<TransposeNode>(op)) {

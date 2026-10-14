@@ -566,6 +566,13 @@ struct SumReduceTensorOpLowering : public OpRewritePattern<mlir::c3::SumReduceTe
         if (axis == 0) {
             map_out = AffineMap::get(2, 0, {d1}, ctx);
             iterTypes = {utils::IteratorType::reduction, utils::IteratorType::parallel};
+        } else if (axis == -1) {
+            if (tensorTy.getRank() == 0) {
+                map_out = AffineMap::get(2, 0, {}, ctx);
+            } else {
+                map_out = AffineMap::get(2, 0, {rewriter.getAffineConstantExpr(0)}, ctx);
+            }
+            iterTypes = {utils::IteratorType::reduction, utils::IteratorType::reduction};
         } else {
             map_out = AffineMap::get(2, 0, {d0}, ctx);
             iterTypes = {utils::IteratorType::parallel, utils::IteratorType::reduction};
@@ -797,8 +804,18 @@ static mlir::OwningOpRef<mlir::ModuleOp> buildTensorMLIRModule(mlir::MLIRContext
             }
             else if constexpr (std::is_same_v<T, SumReduceNode>) {
                 mlir::Value input = val_map.at(node->inputs[0]);
-                int64_t M = op_node.in_desc.shape.size() > 0 ? op_node.in_desc.shape[0] : 1;
-                int64_t N = op_node.in_desc.shape.size() > 1 ? op_node.in_desc.shape[1] : 1;
+                int64_t M = 1;
+                int64_t N = 1;
+                if (op_node.axis == -1) {
+                    M = 1;
+                    N = op_node.in_desc.numel;
+                } else if (op_node.in_desc.shape.size() == 1) {
+                    M = op_node.in_desc.shape[0];
+                    N = 1;
+                } else {
+                    M = op_node.in_desc.shape.size() > 0 ? op_node.in_desc.shape[0] : 1;
+                    N = op_node.in_desc.shape.size() > 1 ? op_node.in_desc.shape[1] : 1;
+                }
                 result = builder.create<mlir::c3::SumReduceTensorOp>(
                     loc, tensorType, input, dest,
                     M, N, op_node.axis

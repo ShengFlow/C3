@@ -407,6 +407,7 @@ private:
     void runPartitionABTest(const Graph& fused_graph, const RegionFusionPolicy& rpol,
                             const char* label);
 
+public:
     // ======================= 反向 Graph 构建助手 =======================
 
     /**
@@ -513,6 +514,10 @@ private:
      * @return C3 Graph: grad 或 Neg(grad)
      */
     BackwardGraph buildSubBackwardGraph(const TensorDesc& grad_desc,
+                                 size_t input_index);
+    BackwardGraph buildSubBackwardGraph(const TensorDesc& grad_desc,
+                                 const TensorDesc& a_desc,
+                                 const TensorDesc& b_desc,
                                  size_t input_index);
 
     /**

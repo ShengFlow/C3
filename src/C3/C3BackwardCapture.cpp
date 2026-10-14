@@ -784,6 +784,9 @@ std::optional<C3BackwardCapture::BackwardGraph> C3BackwardCapture::buildBackward
 
     } else if (node_type.find("SubNode") != std::string::npos) {
         if (input_index >= input_descs.size()) return std::nullopt;
+        if (input_descs.size() >= 2) {
+            return buildSubBackwardGraph(grad_desc, input_descs[0], input_descs[1], input_index);
+        }
         return buildSubBackwardGraph(grad_desc, input_index);
 
     } else if (node_type.find("DivNode") != std::string::npos) {
@@ -1305,12 +1308,13 @@ C3BackwardCapture::BackwardGraph C3BackwardCapture::buildAddBackwardGraph(
     const TensorDesc& target = (input_index == 0) ? lhs_desc : rhs_desc;
     if (needsSumReduce(grad_desc.shape, target.shape)) {
         int axis = computeReduceAxis(grad_desc.shape, target.shape);
-        if (axis < 0) {
-            // [C2 修复] 全 reduce 或多轴广播 reduce 无法由单轴 SumReduce 安全表达 → 空图回退 eager
+        if (axis < -1) {
+            // [C2 修复] 多轴广播 reduce 无法由单轴 SumReduce 安全表达 → 空图回退 eager
             return {Graph{}, {}};
         }
+        bool keepdim = (target.shape.size() == grad_desc.shape.size());
         size_t reduced = g.addNode(
-            SumReduceNode{grad_desc, axis},
+            SumReduceNode{grad_desc, axis, keepdim},
             {grad_in},
             TensorDesc::fromShape(target.shape));
         g.markOutput(reduced);
@@ -1330,35 +1334,55 @@ C3BackwardCapture::BackwardGraph C3BackwardCapture::buildMulBackwardGraph(
 {
     Graph g;
 
-    // [Fix 2026-08-11 最小集 build] 以前总是加 [grad, A, B]，未用输入被 DCE 剪枝 →
-    // ext_map 索引平移 → 运行时喂错张量。现在只加实际用到的 forward 输入，
-    // DCE 无可剪，图输入顺序稳定，配合 fwd_input_map 精确喂入。
+    // [Fix 2026-08-11 最小集 build] 只加实际用到的 forward 输入，DCE 无可剪。
     // grad 输入始终是图输入 0；后续图输入按 fwd_input_map 对应 forward_inputs。
     size_t grad_in = g.addInput(grad_desc);
 
     const TensorDesc& target = (input_index == 0) ? a_desc : b_desc;
-    if (needsSumReduce(grad_desc.shape, target.shape)) {
-        // [C1 修复] 广播乘法反向需要对广播维求和，JIT 图降级暂时不支持广播侧，回退 eager 保证梯度绝对正确
-        return {Graph{}, {}};
+    bool need_reduce = needsSumReduce(grad_desc.shape, target.shape);
+    int axis = -1;
+    if (need_reduce) {
+        axis = computeReduceAxis(grad_desc.shape, target.shape);
+        if (axis < -1) {
+            return {Graph{}, {}};
+        }
     }
 
     if (input_index == 0) {
         // grad_a = grad * B → 只需 B，B 是 forward_inputs[1]
         size_t b_in = g.addInput(b_desc);
-        size_t o = g.addNode(
+        size_t mul_out = g.addNode(
             MulNode{grad_desc, b_desc},
             {grad_in, b_in},
-            TensorDesc::fromShape(a_desc.shape));
-        g.markOutput(o);
+            grad_desc);
+        if (need_reduce) {
+            bool keepdim = (target.shape.size() == grad_desc.shape.size());
+            size_t reduced = g.addNode(
+                SumReduceNode{grad_desc, axis, keepdim},
+                {mul_out},
+                TensorDesc::fromShape(target.shape));
+            g.markOutput(reduced);
+        } else {
+            g.markOutput(mul_out);
+        }
         return {std::move(g), {1}};
     } else {
         // grad_b = A * grad → 只需 A，A 是 forward_inputs[0]
         size_t a_in = g.addInput(a_desc);
-        size_t o = g.addNode(
+        size_t mul_out = g.addNode(
             MulNode{a_desc, grad_desc},
             {a_in, grad_in},
-            TensorDesc::fromShape(b_desc.shape));
-        g.markOutput(o);
+            grad_desc);
+        if (need_reduce) {
+            bool keepdim = (target.shape.size() == grad_desc.shape.size());
+            size_t reduced = g.addNode(
+                SumReduceNode{grad_desc, axis, keepdim},
+                {mul_out},
+                TensorDesc::fromShape(target.shape));
+            g.markOutput(reduced);
+        } else {
+            g.markOutput(mul_out);
+        }
         return {std::move(g), {0}};
     }
 }
@@ -1430,22 +1454,53 @@ C3BackwardCapture::BackwardGraph C3BackwardCapture::buildSubBackwardGraph(
     const TensorDesc& grad_desc,
     size_t input_index)
 {
+    return buildSubBackwardGraph(grad_desc, grad_desc, grad_desc, input_index);
+}
+
+C3BackwardCapture::BackwardGraph C3BackwardCapture::buildSubBackwardGraph(
+    const TensorDesc& grad_desc,
+    const TensorDesc& a_desc,
+    const TensorDesc& b_desc,
+    size_t input_index)
+{
     Graph g;
 
     // 输入: grad
     size_t grad_in = g.addInput(grad_desc);
 
+    const TensorDesc& target = (input_index == 0) ? a_desc : b_desc;
+    bool need_reduce = needsSumReduce(grad_desc.shape, target.shape);
+    int axis = -1;
+    if (need_reduce) {
+        axis = computeReduceAxis(grad_desc.shape, target.shape);
+        if (axis < -1) {
+            return {Graph{}, {}};
+        }
+    }
+
+    size_t out_node;
     if (input_index == 0) {
-        // grad_a = grad（直接输出 grad_in）
-        g.markOutput(grad_in);
+        // grad_a = grad
+        out_node = grad_in;
     } else {
         // grad_b = -grad
-        size_t grad_b = g.addNode(
+        out_node = g.addNode(
             NegNode{grad_desc},
             {grad_in},
             grad_desc);
-        g.markOutput(grad_b);
     }
+
+    if (need_reduce) {
+        bool keepdim = (target.shape.size() == grad_desc.shape.size());
+        size_t reduced = g.addNode(
+            SumReduceNode{grad_desc, axis, keepdim},
+            {out_node},
+            TensorDesc::fromShape(target.shape));
+        g.markOutput(reduced);
+    } else {
+        g.markOutput(out_node);
+    }
+
     // 图只有 grad 输入，无 forward 输入 → 空索引表
     return {std::move(g), {}};
 }
@@ -1463,19 +1518,32 @@ C3BackwardCapture::BackwardGraph C3BackwardCapture::buildDivBackwardGraph(
     size_t grad_in = g.addInput(grad_desc);
 
     const TensorDesc& target = (input_index == 0) ? a_desc : b_desc;
-    if (needsSumReduce(grad_desc.shape, target.shape)) {
-        // [C1 修复] 广播除法反向需要对广播维求和，回退 eager 保证梯度绝对正确
-        return {Graph{}, {}};
+    bool need_reduce = needsSumReduce(grad_desc.shape, target.shape);
+    int axis = -1;
+    if (need_reduce) {
+        axis = computeReduceAxis(grad_desc.shape, target.shape);
+        if (axis < -1) {
+            return {Graph{}, {}};
+        }
     }
 
     if (input_index == 0) {
         // grad_a = grad / B → 只需 B（forward_inputs[1]）
         size_t b_in = g.addInput(b_desc);
-        size_t o = g.addNode(
+        size_t div_out = g.addNode(
             DivNode{grad_desc, b_desc},
             {grad_in, b_in},
-            TensorDesc::fromShape(a_desc.shape));
-        g.markOutput(o);
+            grad_desc);
+        if (need_reduce) {
+            bool keepdim = (target.shape.size() == grad_desc.shape.size());
+            size_t reduced = g.addNode(
+                SumReduceNode{grad_desc, axis, keepdim},
+                {div_out},
+                TensorDesc::fromShape(target.shape));
+            g.markOutput(reduced);
+        } else {
+            g.markOutput(div_out);
+        }
         return {std::move(g), {1}};
     } else {
         // grad_b = -(A / (B * B)) * grad → 需 A、B（forward_inputs[0], forward_inputs[1]）
@@ -1492,21 +1560,30 @@ C3BackwardCapture::BackwardGraph C3BackwardCapture::buildDivBackwardGraph(
         size_t a_div_b_sq = g.addNode(
             DivNode{a_desc, b_desc},
             {a_in, b_sq},
-            a_desc);
+            grad_desc);
 
         // (A / (B * B)) * grad
         size_t mul_grad = g.addNode(
-            MulNode{a_desc, grad_desc},
+            MulNode{grad_desc, grad_desc},
             {a_div_b_sq, grad_in},
-            TensorDesc::fromShape(b_desc.shape));
+            grad_desc);
 
         // -(A / (B * B)) * grad
-        size_t grad_b = g.addNode(
-            NegNode{TensorDesc::fromShape(b_desc.shape)},
+        size_t neg_grad = g.addNode(
+            NegNode{grad_desc},
             {mul_grad},
-            TensorDesc::fromShape(b_desc.shape));
+            grad_desc);
 
-        g.markOutput(grad_b);
+        if (need_reduce) {
+            bool keepdim = (target.shape.size() == grad_desc.shape.size());
+            size_t reduced = g.addNode(
+                SumReduceNode{grad_desc, axis, keepdim},
+                {neg_grad},
+                TensorDesc::fromShape(target.shape));
+            g.markOutput(reduced);
+        } else {
+            g.markOutput(neg_grad);
+        }
         return {std::move(g), {0, 1}};
     }
 }
@@ -2148,38 +2225,46 @@ int C3BackwardCapture::computeReduceAxis(
 {
     if (grad_shape == target_shape) return -1;
     if (grad_shape.empty()) return -2;
-    if (target_shape.empty() || target_shape == std::vector<size_t>{1}) {
-        // [C2 修复] 全 reduce 或标量目标：单轴 SumReduceNode 无法安全表达，返回 -2 回退 eager
-        return -2;
+
+    // [方向二 2026-10-14 苏璃珞] 全量归约: target 为标量或单元素(numel==1)时返回 -1
+    size_t target_numel = 1;
+    for (size_t d : target_shape) target_numel *= d;
+    if (target_shape.empty() || target_numel == 1) {
+        return -1;
     }
 
-    // 找到第一个维度不同的位置（从左边开始）
-    // 如果 grad 比 target 多维度，reduce 多余的维度
     size_t grad_rank = grad_shape.size();
     size_t target_rank = target_shape.size();
+    if (grad_rank < target_rank) return -2;
 
-    if (grad_rank > target_rank) {
-        // [Fix §4.95 P2] 多轴多余维度仅 reduce 轴 0 会产出错误形状; 多轴时返回 -2
-        // 哨兵, 调用方回退 eager(此前靠 registry 形状校验护栏兜底)
-        if (grad_rank - target_rank > 1) return -2;
-        // 多余的维度需要 reduce
-        return 0; // reduce 第 0 维（第一个多余维度）
+    std::vector<int> reduce_axes;
+    size_t offset = grad_rank - target_rank;
+
+    // 1. 前导多余的维度必须全部归约
+    for (size_t i = 0; i < offset; ++i) {
+        reduce_axes.push_back(static_cast<int>(i));
     }
 
-    // 右对齐，从左到右找到第一个不匹配的维度
-    for (size_t i = 0; i < grad_rank; ++i) {
-        size_t offset = grad_rank - target_rank;
-        if (i < offset) {
-            return static_cast<int>(i); // 这个维度在 target 中没有对应
-        }
-        size_t gd = grad_shape[i];
-        size_t td = target_shape[i - offset];
-        if (gd != td && td == 1) {
-            return static_cast<int>(i); // 这个维度需要 reduce
+    // 2. 右对齐比对后续维度
+    for (size_t i = 0; i < target_rank; ++i) {
+        size_t gd = grad_shape[offset + i];
+        size_t td = target_shape[i];
+        if (gd != td) {
+            if (td == 1) {
+                reduce_axes.push_back(static_cast<int>(offset + i));
+            } else {
+                return -2; // 不合法的广播形状
+            }
         }
     }
 
-    return -1; // 全 reduce
+    if (reduce_axes.empty()) {
+        return -1;
+    }
+    if (reduce_axes.size() == 1) {
+        return reduce_axes[0];
+    }
+    return -2; // 多轴归约目前无法用单轴 SumReduceOp 表达，安全回退 eager
 }
 
 void C3BackwardCapture::clear() {
