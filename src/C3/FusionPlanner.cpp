@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <functional>
+#include <queue>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -28,27 +29,19 @@ size_t nodeNumel(const Node& n) {
 
 /// 结构性 / 物化边界（默认策略）：不并入逐元素 / GEMM 尾链融合
 bool isStructuralDefault(const Node& n) {
-    return std::visit([](auto&& op) -> bool {
-        using T = std::decay_t<decltype(op)>;
-        return std::is_same_v<T, ConstNode> ||      // 常量 / 图输入占位
-               std::is_same_v<T, SumReduceNode> ||  // 降维
-               std::is_same_v<T, TransposeNode> ||  // 默认：转置独立 kernel
-               std::is_same_v<T, SoftmaxNode> ||
-               std::is_same_v<T, CrossEntropyNode> ||
-               std::is_same_v<T, FusedNode>;        // 已融合单元（不透明）
-    }, n.op);
+    const auto trait = n.trait();
+    return trait.domain == IterationDomainKind::OpaqueBarrier ||
+           trait.domain == IterationDomainKind::Reduction ||
+           trait.domain == IterationDomainKind::CoordinateMap ||
+           std::holds_alternative<FusedNode>(n.op);
 }
 
 /// region 策略硬边界：连 region 也切开的 op（保留各自独立 kernel）
 bool isRegionSeparator(const Node& n) {
-    return std::visit([](auto&& op) -> bool {
-        using T = std::decay_t<decltype(op)>;
-        return std::is_same_v<T, ConstNode> ||
-               std::is_same_v<T, SumReduceNode> ||
-               std::is_same_v<T, SoftmaxNode> ||
-               std::is_same_v<T, CrossEntropyNode> ||
-               std::is_same_v<T, FusedNode>;
-    }, n.op);
+    const auto trait = n.trait();
+    return trait.domain == IterationDomainKind::OpaqueBarrier ||
+           trait.domain == IterationDomainKind::Reduction ||
+           std::holds_alternative<FusedNode>(n.op);
 }
 
 /// 由已构造好的单元集生成最终 FusionPlan（node_unit + 边界信息 + compute 计数）
@@ -375,26 +368,242 @@ FusionPlan planRegionKernel(const Graph& graph, const RegionFusionPolicy& policy
     return plan;
 }
 
+// ======================= Autonomous Trait-Driven 策略 =======================
+
+bool hasIndirectPath(size_t c_src, size_t c_dst,
+                     const std::unordered_map<size_t, std::unordered_set<size_t>>& adj) {
+    auto it = adj.find(c_src);
+    if (it == adj.end()) return false;
+    std::unordered_set<size_t> visited;
+    std::queue<size_t> q;
+    for (size_t nxt : it->second) {
+        if (nxt != c_dst) {
+            q.push(nxt);
+            visited.insert(nxt);
+        }
+    }
+    while (!q.empty()) {
+        size_t curr = q.front();
+        q.pop();
+        if (curr == c_dst) return true;
+        auto cit = adj.find(curr);
+        if (cit != adj.end()) {
+            for (size_t nxt : cit->second) {
+                if (!visited.contains(nxt)) {
+                    visited.insert(nxt);
+                    q.push(nxt);
+                }
+            }
+        }
+    }
+    return false;
+}
+
+FusionPlan planAutonomousTraitDriven(const Graph& graph, const RegionFusionPolicy& /*policy*/) {
+    const size_t n = graph.nodeCount();
+    const auto& nodes = graph.nodes();
+    const auto& graph_inputs = graph.inputs();
+
+    std::vector<bool> is_input(n, false);
+    for (size_t id : graph_inputs) if (id < n) is_input[id] = true;
+
+    std::vector<OpFusibilityTrait> traits(n);
+    std::vector<FusionUnitKind> cat(n, FusionUnitKind::LEAF);
+    std::vector<bool> compute(n, false);
+    std::vector<size_t> node_numels(n, 0);
+
+    for (size_t i = 0; i < n; ++i) {
+        traits[i] = nodes[i].trait();
+        node_numels[i] = nodeNumel(nodes[i]);
+        if (is_input[i] || traits[i].domain == IterationDomainKind::OpaqueBarrier) {
+            cat[i] = FusionUnitKind::LEAF;
+            compute[i] = false;
+        } else if (traits[i].domain == IterationDomainKind::Contracting) {
+            cat[i] = FusionUnitKind::GEMM;
+            compute[i] = true;
+        } else if (traits[i].domain == IterationDomainKind::Pointwise ||
+                   traits[i].domain == IterationDomainKind::Broadcastable) {
+            cat[i] = FusionUnitKind::ELEMENTWISE;
+            compute[i] = true;
+        } else {
+            cat[i] = FusionUnitKind::LEAF;
+            compute[i] = false;
+        }
+    }
+
+    // Initialize clusters
+    std::unordered_map<size_t, std::vector<size_t>> cluster_members;
+    std::unordered_map<size_t, size_t> node_to_cluster;
+    std::unordered_map<size_t, std::unordered_set<size_t>> cluster_adj;
+    std::unordered_map<size_t, bool> cluster_has_gemm;
+    std::unordered_map<size_t, size_t> cluster_numel;
+
+    for (size_t i = 0; i < n; ++i) {
+        if (!compute[i]) continue;
+        cluster_members[i] = {i};
+        node_to_cluster[i] = i;
+        cluster_adj[i] = {};
+        cluster_has_gemm[i] = (cat[i] == FusionUnitKind::GEMM);
+        cluster_numel[i] = node_numels[i];
+    }
+
+    for (size_t u = 0; u < n; ++u) {
+        if (!compute[u]) continue;
+        for (size_t v : nodes[u].outputs) {
+            if (v < n && compute[v] && u != v) {
+                cluster_adj[u].insert(v);
+            }
+        }
+    }
+
+    // Trait-driven merge check
+    auto canMerge = [&](size_t cu, size_t cv, size_t u, size_t v) -> bool {
+        if (cu == cv) return false;
+        const auto& tu = traits[u];
+        const auto& tv = traits[v];
+
+        // Barrier check
+        if (tu.domain == IterationDomainKind::OpaqueBarrier || tv.domain == IterationDomainKind::OpaqueBarrier) {
+            return false;
+        }
+
+        // Sequential GEMM check
+        if (cluster_has_gemm[cu] && cluster_has_gemm[cv]) {
+            return false;
+        }
+
+        // Multi-consumer fan-out cut (unless recomputation allowed)
+        if (nodes[u].outputs.size() > 1 && !tu.allow_recomputation) {
+            return false;
+        }
+
+        // Domain compatibility:
+        // Case 1: Pointwise + Pointwise
+        if ((tu.domain == IterationDomainKind::Pointwise || tu.domain == IterationDomainKind::Broadcastable) &&
+            (tv.domain == IterationDomainKind::Pointwise || tv.domain == IterationDomainKind::Broadcastable)) {
+            if (cluster_numel[cu] != cluster_numel[cv]) return false;
+        }
+        // Case 2: Contracting + Pointwise (GEMM Epilogue)
+        else if (tu.domain == IterationDomainKind::Contracting &&
+                 (tv.domain == IterationDomainKind::Pointwise || tv.domain == IterationDomainKind::Broadcastable)) {
+            if (!tu.allows_epilogue_fusion) return false;
+            if (cluster_numel[cu] != cluster_numel[cv]) return false;
+        } else {
+            return false;
+        }
+
+        // Cycle Prevention (Strict DAG Acyclicity Invariant)
+        if (hasIndirectPath(cu, cv, cluster_adj)) {
+            return false;
+        }
+
+        return true;
+    };
+
+    auto mergeClusters = [&](size_t cu, size_t cv) {
+        // Merge cv into cu
+        for (size_t nid : cluster_members[cv]) {
+            cluster_members[cu].push_back(nid);
+            node_to_cluster[nid] = cu;
+        }
+        cluster_has_gemm[cu] = cluster_has_gemm[cu] || cluster_has_gemm[cv];
+
+        // Redirect edges
+        cluster_adj[cu].erase(cv);
+        for (size_t target : cluster_adj[cv]) {
+            if (target != cu) {
+                cluster_adj[cu].insert(target);
+            }
+        }
+
+        for (auto& [src, targets] : cluster_adj) {
+            if (targets.contains(cv)) {
+                targets.erase(cv);
+                if (src != cu) {
+                    targets.insert(cu);
+                }
+            }
+        }
+
+        cluster_adj.erase(cv);
+        cluster_members.erase(cv);
+    };
+
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (size_t u = 0; u < n; ++u) {
+            if (!compute[u]) continue;
+            size_t cu = node_to_cluster[u];
+            for (size_t v : nodes[u].outputs) {
+                if (v >= n || !compute[v]) continue;
+                size_t cv = node_to_cluster[v];
+                if (cu != cv && canMerge(cu, cv, u, v)) {
+                    mergeClusters(cu, cv);
+                    changed = true;
+                    break;
+                }
+            }
+            if (changed) break;
+        }
+    }
+
+    // Assemble fusion units
+    std::vector<std::pair<size_t, size_t>> ordered;
+    for (const auto& [cid, members] : cluster_members) {
+        size_t min_id = members.empty() ? cid : *std::min_element(members.begin(), members.end());
+        ordered.emplace_back(min_id, cid);
+    }
+    std::sort(ordered.begin(), ordered.end());
+
+    std::vector<FusionUnit> units;
+    for (auto& [min_id, cid] : ordered) {
+        auto& members = cluster_members[cid];
+        std::sort(members.begin(), members.end());
+        bool has_gemm = cluster_has_gemm[cid];
+        bool has_elem = false;
+        for (size_t nid : members) {
+            if (cat[nid] == FusionUnitKind::ELEMENTWISE) {
+                has_elem = true;
+                break;
+            }
+        }
+        FusionUnitKind kind = has_gemm
+            ? (has_elem ? FusionUnitKind::GEMM_EPILOGUE : FusionUnitKind::GEMM)
+            : FusionUnitKind::ELEMENTWISE;
+
+        FusionUnit u;
+        u.kind = kind;
+        u.numel = cluster_numel[cid];
+        u.node_ids = std::move(members);
+        units.push_back(std::move(u));
+    }
+
+    for (size_t i = 0; i < n; ++i) {
+        if (compute[i]) continue;
+        FusionUnit u;
+        u.kind = FusionUnitKind::LEAF;
+        u.numel = node_numels[i];
+        u.node_ids.push_back(i);
+        units.push_back(std::move(u));
+    }
+
+    return assemble(graph, std::move(units));
+}
+
 } // namespace
 
 FusionUnitKind FusionPlanner::nodeKind(const Node& node) {
     if (isStructuralDefault(node)) return FusionUnitKind::LEAF;
-    return std::visit([](auto&& op) -> FusionUnitKind {
-        using T = std::decay_t<decltype(op)>;
-        if constexpr (std::is_same_v<T, MatMulNode>) {
-            return FusionUnitKind::GEMM;
-        }
-        if constexpr (std::is_same_v<T, AddNode> || std::is_same_v<T, SubNode> ||
-                      std::is_same_v<T, MulNode> || std::is_same_v<T, DivNode> ||
-                      std::is_same_v<T, NegNode> || std::is_same_v<T, ReLUNode> ||
-                      std::is_same_v<T, SigmoidNode> || std::is_same_v<T, TanhNode> ||
-                      std::is_same_v<T, SiLUNode> ||
-                      std::is_same_v<T, GtNode> || std::is_same_v<T, ExpNode> ||
-                      std::is_same_v<T, LogNode>) {
-            return FusionUnitKind::ELEMENTWISE;
-        }
-        return FusionUnitKind::LEAF;
-    }, node.op);
+    const auto trait = node.trait();
+    if (trait.domain == IterationDomainKind::Contracting) {
+        return FusionUnitKind::GEMM;
+    }
+    if (trait.domain == IterationDomainKind::Pointwise ||
+        trait.domain == IterationDomainKind::Broadcastable) {
+        return FusionUnitKind::ELEMENTWISE;
+    }
+    return FusionUnitKind::LEAF;
 }
 
 FusionPlan FusionPlanner::planUnits(const Graph& graph) {
@@ -403,6 +612,9 @@ FusionPlan FusionPlanner::planUnits(const Graph& graph) {
 
 FusionPlan FusionPlanner::planUnits(const Graph& graph, FusionStrategy strategy,
                                     const RegionFusionPolicy& policy) {
+    if (strategy == FusionStrategy::AutonomousTraitDriven) {
+        return planAutonomousTraitDriven(graph, policy);
+    }
     if (strategy == FusionStrategy::RegionKernel) {
         return planRegionKernel(graph, policy);
     }

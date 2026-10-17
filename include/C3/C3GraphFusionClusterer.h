@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <cassert>
+#include "C3/Graph.h"
 
 namespace ct::c3 {
 
@@ -38,6 +39,20 @@ enum class OpKind : uint8_t {
     REDUCTION = 2,
     BARRIER = 3
 };
+
+inline OpKind domainToOpKind(IterationDomainKind domain) {
+    switch (domain) {
+        case IterationDomainKind::Pointwise:
+        case IterationDomainKind::Broadcastable:
+            return OpKind::ELEMENTWISE;
+        case IterationDomainKind::Contracting:
+            return OpKind::GEMM;
+        case IterationDomainKind::Reduction:
+            return OpKind::REDUCTION;
+        default:
+            return OpKind::BARRIER;
+    }
+}
 #endif
 
 struct GraphNode {
@@ -60,6 +75,21 @@ public:
         for (uint32_t inp : inputs) {
             edges_[inp].push_back(id);
         }
+    }
+
+    /// 从 C3 Graph 自动提取算子 Trait 并构造 ComputationGraph
+    static ComputationGraph fromC3Graph(const Graph& c3_graph) {
+        ComputationGraph cg;
+        const auto& nodes = c3_graph.nodes();
+        for (const auto& n : nodes) {
+            std::vector<uint32_t> inps;
+            for (size_t in : n.inputs) inps.push_back(static_cast<uint32_t>(in));
+            size_t bytes = n.out_desc.numel * sizeof(float);
+            if (bytes == 0) bytes = 1024;
+            cg.add_node(static_cast<uint32_t>(n.id), std::to_string(n.id),
+                        domainToOpKind(n.trait().domain), std::move(inps), bytes);
+        }
+        return cg;
     }
 
     [[nodiscard]] const std::unordered_map<uint32_t, GraphNode>& nodes() const noexcept { return nodes_; }

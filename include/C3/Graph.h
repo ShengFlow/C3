@@ -290,6 +290,84 @@ struct FusedNode {
     TensorDesc out_desc;                  ///< 输出张量描述符
 };
 
+// ======================= 算子特征与融合属性 (Trait System) =======================
+
+/**
+ * @enum IterationDomainKind
+ * @brief 算子的迭代域与数据流空间特征（用于属性驱动的全自动图融合）
+ */
+enum class IterationDomainKind : uint8_t {
+    Pointwise = 0,      ///< 1:1 逐元素映射，无跨空间线程依赖（Add, Mul, SiLU, GELU...）
+    Broadcastable = 1,  ///< 具有广播维度的仿射投影（[M, 1] -> [M, N]）
+    Reduction = 2,      ///< 沿特定轴的归约，具备结合律/交换律（SumReduce, MaxReduce...）
+    Contracting = 3,    ///< 矩阵乘 / 张量收缩计算密集型算子，需分块 Tiling 循环（MatMul, GEMM...）
+    CoordinateMap = 4,  ///< 纯坐标重映射元数据操作，零计算（Transpose, Reshape, View...）
+    OpaqueBarrier = 5   ///< 跨硬件同步、外部黑盒库调用（不可跨越边界）
+};
+
+/**
+ * @struct OpFusibilityTrait
+ * @brief 算子内在融合契约元数据（不依赖特定算子序列规则）
+ */
+struct OpFusibilityTrait {
+    IterationDomainKind domain = IterationDomainKind::Pointwise;
+    bool allows_prologue_fusion = true;   ///< 能否在读取阶段内联前驱算子
+    bool allows_epilogue_fusion = true;   ///< 能否在寄存器/写回阶段内联后继算子
+    bool is_associative = false;          ///< 是否满足结合律
+    bool is_commutative = false;          ///< 是否满足交换律
+    bool is_memory_bound = true;          ///< 是否为内存带宽受限（强烈倾向融合）
+    bool allow_recomputation = false;     ///< 是否可在多消费者分支中轻量重算以避免物化
+};
+
+/**
+ * @brief 获取任意 NodeVariant 算子的只读融合特征（编译期常量级查询）
+ */
+inline OpFusibilityTrait getOpFusibilityTrait(const NodeVariant& op) {
+    return std::visit([](auto&& n) -> OpFusibilityTrait {
+        using T = std::decay_t<decltype(n)>;
+        if constexpr (std::is_same_v<T, AddNode>) {
+            return {IterationDomainKind::Pointwise, true, true, true, true, true, false};
+        } else if constexpr (std::is_same_v<T, SubNode>) {
+            return {IterationDomainKind::Pointwise, true, true, false, false, true, false};
+        } else if constexpr (std::is_same_v<T, MulNode>) {
+            return {IterationDomainKind::Pointwise, true, true, true, true, true, false};
+        } else if constexpr (std::is_same_v<T, DivNode>) {
+            return {IterationDomainKind::Pointwise, true, true, false, false, true, false};
+        } else if constexpr (std::is_same_v<T, MatMulNode>) {
+            return {IterationDomainKind::Contracting, false, true, true, false, false, false};
+        } else if constexpr (std::is_same_v<T, NegNode>) {
+            return {IterationDomainKind::Pointwise, true, true, false, false, true, true};
+        } else if constexpr (std::is_same_v<T, ReLUNode>) {
+            return {IterationDomainKind::Pointwise, true, true, false, false, true, true};
+        } else if constexpr (std::is_same_v<T, SigmoidNode>) {
+            return {IterationDomainKind::Pointwise, true, true, false, false, true, false};
+        } else if constexpr (std::is_same_v<T, TanhNode>) {
+            return {IterationDomainKind::Pointwise, true, true, false, false, true, false};
+        } else if constexpr (std::is_same_v<T, SiLUNode>) {
+            return {IterationDomainKind::Pointwise, true, true, false, false, true, false};
+        } else if constexpr (std::is_same_v<T, GtNode>) {
+            return {IterationDomainKind::Pointwise, true, true, false, false, true, false};
+        } else if constexpr (std::is_same_v<T, SumReduceNode>) {
+            return {IterationDomainKind::Reduction, true, true, true, true, true, false};
+        } else if constexpr (std::is_same_v<T, TransposeNode>) {
+            return {IterationDomainKind::CoordinateMap, true, true, false, false, false, true};
+        } else if constexpr (std::is_same_v<T, ExpNode>) {
+            return {IterationDomainKind::Pointwise, true, true, false, false, true, false};
+        } else if constexpr (std::is_same_v<T, LogNode>) {
+            return {IterationDomainKind::Pointwise, true, true, false, false, true, false};
+        } else if constexpr (std::is_same_v<T, ConstNode>) {
+            return {IterationDomainKind::OpaqueBarrier, false, false, false, false, false, false};
+        } else if constexpr (std::is_same_v<T, SoftmaxNode>) {
+            return {IterationDomainKind::Reduction, false, true, false, false, true, false};
+        } else if constexpr (std::is_same_v<T, CrossEntropyNode>) {
+            return {IterationDomainKind::Reduction, false, false, false, false, true, false};
+        } else if constexpr (std::is_same_v<T, FusedNode>) {
+            return {IterationDomainKind::Pointwise, false, false, false, false, true, false};
+        }
+        return {IterationDomainKind::OpaqueBarrier, false, false, false, false, false, false};
+    }, op);
+}
+
 // ======================= 图节点 =======================
 
 /**
@@ -302,6 +380,9 @@ struct Node {
     std::vector<size_t> inputs;  ///< 输入节点的 ID（按拓扑顺序）
     std::vector<size_t> outputs; ///< 输出节点（被哪些节点引用）的 ID
     TensorDesc out_desc;         ///< 输出张量的元数据
+
+    /// 获取该节点的融合特征
+    [[nodiscard]] OpFusibilityTrait trait() const { return getOpFusibilityTrait(op); }
 };
 
 // ======================= 化简规则（catamorphism — ctfp #24） =======================

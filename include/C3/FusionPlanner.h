@@ -38,8 +38,9 @@ enum class FusionUnitKind : uint8_t {
 /// 融合策略（判据粒度，均数据驱动、非按结构名特判）
 enum class FusionStrategy : uint8_t {
     Default = 0,   ///< 前向单 GEMM / 逐元素单元：多消费者中间量物化，双 GEMM 不并
-    RegionKernel = 1 ///< 多输出 region：连通区段(共享中间量仅区段内复用)可并单内核；
+    RegionKernel = 1, ///< 多输出 region：连通区段(共享中间量仅区段内复用)可并单内核；
                      ///<   Transpose 并入 GEMM；SumReduce/Softmax/CrossEntropy/Fused 仍为边界
+    AutonomousTraitDriven = 2 ///< 全自动算子属性驱动融合：基于算子 Trait + 间接路径无环检测的任意拓扑最大化聚类
 };
 
 /**
